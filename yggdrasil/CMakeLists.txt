@@ -18,6 +18,7 @@ find_package(OpenVDB REQUIRED)
 add_library(yggdrasil
     core/ResolutionSolver.cpp
     core/BilletBuilder.cpp
+    core/ToolSweepSDF.cpp
 )
 target_include_directories(yggdrasil PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(yggdrasil PUBLIC OpenVDB::openvdb)
@@ -36,6 +37,7 @@ enable_testing()
 add_executable(ygg_tests
     tests/test_resolution.cpp
     tests/test_billet.cpp
+    tests/test_toolsdf.cpp
 )
 target_link_libraries(ygg_tests PRIVATE yggdrasil GTest::gtest_main)
 
