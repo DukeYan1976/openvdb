@@ -1,21 +1,12 @@
 #pragma once
 
+#include <openvdb/openvdb.h>
+#include <openvdb/tools/LevelSetSphere.h>
 #include <cstdint>
-#include <algorithm>
-#include <cmath>
-#include <array>
 
 namespace ygg {
 
-/// 简单3D向量（第一阶段不强制依赖OpenVDB头文件）
-struct Vec3d {
-    double v[3] = {0, 0, 0};
-    Vec3d() = default;
-    Vec3d(double x, double y, double z) : v{x, y, z} {}
-    double x() const { return v[0]; }
-    double y() const { return v[1]; }
-    double z() const { return v[2]; }
-};
+using Vec3d = openvdb::Vec3d;
 
 enum class ToolType : uint8_t {
     BALL_END,
@@ -33,6 +24,15 @@ struct ResolutionConfig {
     Mode mode = SINGLE_TRACK;
 
     int atlas_divisions = 0;
+};
+
+struct BilletModel {
+    openvdb::FloatGrid::Ptr sdfGrid;
+    ResolutionConfig config;
+    Vec3d origin;
+    Vec3d dims;
+
+    bool isSingleTrack() const { return config.mode == ResolutionConfig::SINGLE_TRACK; }
 };
 
 } // namespace ygg
