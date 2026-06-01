@@ -68,7 +68,7 @@ Vec3d ToolSweepSDF::gradient(const Vec3d& p) const {
 openvdb::BBoxd ToolSweepSDF::getBoundingBox() const {
     Vec3d minPt(std::min(mA.x(), mB.x()) - mR,
                 std::min(mA.y(), mB.y()) - mR,
-                std::min(mA.z(), mB.z()));
+                std::min(mA.z(), mB.z()) - mR);
     Vec3d maxPt(std::max(mA.x(), mB.x()) + mR,
                 std::max(mA.y(), mB.y()) + mR,
                 std::max(mA.z(), mB.z()) + mH);
