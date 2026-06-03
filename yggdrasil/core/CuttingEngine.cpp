@@ -12,14 +12,15 @@
 namespace ygg {
 
 // ═══════════════════════════════════════════════════════════════════════
-// 单轨切削策略评估代码（3种方案，精度一致，比较效率和内存）
-// 选择方式：修改 CUT_STRATEGY 宏 (A / B / C)
-// A: 暴力包围盒遍历（基线，当前实现）
-// B: 仅遍历活跃体素 + 包围盒过滤（零额外内存）
-// C: 光栅化刀具SDF为Grid + csgDifferenceSDF（OpenVDB原生优化，需临时Grid）
+// 单轨切削策略评估代码（4种方案，精度一致，比较效率和内存）
+// 选择方式：修改 CUT_STRATEGY 宏 (A / B / C / D)
+// A: 暴力包围盒遍历（基线）
+// B: 仅遍历活跃体素 + 包围盒过滤（零额外内存，串行）
+// C: 光栅化刀具SDF为Grid + csgDifference（OpenVDB原生优化，需临时Grid）
+// D: 方案B的TBB并行版本（LeafManager + parallel_for）
 // ═══════════════════════════════════════════════════════════════════════
 #ifndef CUT_STRATEGY
-#define CUT_STRATEGY B  // B全面胜出(见bench_strategies结果)
+#define CUT_STRATEGY D  // 默认使用方案D(并行B)
 #endif
 
 // 方案A: 暴力包围盒三重循环（基线）
@@ -84,6 +85,55 @@ static void cutSingleTrack_B(BilletModel& billet, const ToolSweepSDF& toolSDF) {
     openvdb::tools::pruneLevelSet(grid->tree());
 }
 
+// 方案B_parallel: 方案B的TBB并行版本（LeafManager + parallel_for）
+#include <openvdb/tree/LeafManager.h>
+#include <tbb/parallel_for.h>
+
+static void cutSingleTrack_B_parallel(BilletModel& billet, const ToolSweepSDF& toolSDF) {
+    auto& grid = billet.sdfGrid;
+    auto& xform = grid->transform();
+    double voxelSize = xform.voxelSize()[0];
+    float bandWidth = 3.0f * static_cast<float>(voxelSize);
+
+    auto bbox = toolSDF.getBoundingBox();
+    auto minIdx = xform.worldToIndexCellCentered(bbox.min());
+    auto maxIdx = xform.worldToIndexCellCentered(bbox.max());
+
+    using TreeT = openvdb::FloatGrid::TreeType;
+    openvdb::tree::LeafManager<TreeT> leafMgr(grid->tree());
+
+    tbb::parallel_for(leafMgr.leafRange(),
+        [&](const openvdb::tree::LeafManager<TreeT>::LeafRange& range) {
+            for (auto leafIter = range.begin(); leafIter; ++leafIter) {
+                auto& leaf = *leafIter;
+                // 快速跳过：叶节点包围盒与刀具包围盒不相交
+                auto leafOrigin = leaf.origin();
+                if (leafOrigin.x() + 8 < minIdx.x() || leafOrigin.x() > maxIdx.x() ||
+                    leafOrigin.y() + 8 < minIdx.y() || leafOrigin.y() > maxIdx.y() ||
+                    leafOrigin.z() + 8 < minIdx.z() || leafOrigin.z() > maxIdx.z())
+                    continue;
+
+                for (auto it = leaf.beginValueOn(); it; ++it) {
+                    auto coord = it.getCoord();
+                    if (coord.x() < minIdx.x() || coord.x() > maxIdx.x() ||
+                        coord.y() < minIdx.y() || coord.y() > maxIdx.y() ||
+                        coord.z() < minIdx.z() || coord.z() > maxIdx.z())
+                        continue;
+
+                    Vec3d worldPos = xform.indexToWorld(coord);
+                    double toolDist = toolSDF.eval(worldPos);
+                    if (toolDist < bandWidth) {
+                        float billetVal = it.getValue();
+                        float newVal = std::max(billetVal, static_cast<float>(-toolDist));
+                        if (newVal != billetVal)
+                            it.setValue(newVal);
+                    }
+                }
+            }
+        });
+    openvdb::tools::pruneLevelSet(grid->tree());
+}
+
 // 方案C: 光栅化刀具SDF为临时Grid + csgDifferenceSDF
 // 优势：OpenVDB内部拓扑级优化；劣势：临时Grid内存开销
 static void cutSingleTrack_C(BilletModel& billet, const ToolSweepSDF& toolSDF) {
@@ -123,8 +173,10 @@ static void cutSingleTrack(BilletModel& billet, const ToolSweepSDF& toolSDF) {
     cutSingleTrack_A(billet, toolSDF);
 #elif CUT_STRATEGY == C
     cutSingleTrack_C(billet, toolSDF);
+#elif CUT_STRATEGY == D
+    cutSingleTrack_B_parallel(billet, toolSDF);
 #else
-    cutSingleTrack_B(billet, toolSDF);  // 默认方案B
+    cutSingleTrack_B(billet, toolSDF);  // 方案B串行
 #endif
 }
 
