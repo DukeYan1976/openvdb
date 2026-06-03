@@ -132,11 +132,12 @@ BilletModel buildBillet(const ResolutionConfig& config,
 
         // Step 2: 逐体素注入 IPW₀ 粗面元
         double D_v = config.D_v;
-        double minDim = std::min({dims.x(), dims.y(), dims.z()});
-        double d_v_init = std::min(minDim / 4.0, std::max(10.0 * config.d_v, D_v));
+        double d_v_init = std::max(10.0 * config.d_v, D_v); // ≥ 10×d_v
+        int N_init = std::max(2, static_cast<int>(std::floor(D_v / d_v_init)));
+        // 如果 d_v_init ≥ D_v, N_init=1 → 强制至少 2
+        // 实际每体素面元数 = N_init²
         float bandWidth = 3.0f * static_cast<float>(D_v);
 
-        // 收集点（按体素分组，确保每个点落在正确的体素中）
         std::vector<openvdb::Vec3R> allPoints;
         std::vector<openvdb::Vec3f> allNormals;
         std::vector<uint8_t> allPrecision;
@@ -147,12 +148,11 @@ BilletModel buildBillet(const ResolutionConfig& config,
         // 遍历 FloatGrid 窄带表面体素
         for (auto iter = model.sdfGrid->cbeginValueOn(); iter; ++iter) {
             float sdfVal = *iter;
-            // 表面体素判定：SDF 接近零（-D_v < SDF < D_v）
             if (sdfVal >= -static_cast<float>(D_v) && sdfVal <= static_cast<float>(D_v)) {
                 openvdb::Coord voxelCoord = iter.getCoord();
                 Vec3d voxelCenter = xform.indexToWorld(voxelCoord);
 
-                // 估算表面法向（从 SDF 梯度，中心差分）
+                // SDF 梯度 → 法向量
                 float gx = sdfAcc.getValue(voxelCoord.offsetBy(1,0,0)) -
                            sdfAcc.getValue(voxelCoord.offsetBy(-1,0,0));
                 float gy = sdfAcc.getValue(voxelCoord.offsetBy(0,1,0)) -
@@ -164,13 +164,29 @@ BilletModel buildBillet(const ResolutionConfig& config,
                 if (nlen > 1e-6f) normal /= nlen;
                 else normal = openvdb::Vec3f(0, 0, 1);
 
-                // 在该体素表面放 1 个面元（粗精度 IPW₀）
-                // 投影到零等值面：沿法向偏移 -sdfVal
-                Vec3d surfelPos = voxelCenter - Vec3d(normal.x(), normal.y(), normal.z()) * sdfVal;
+                // 构建局部切平面坐标系
+                Vec3d n(normal.x(), normal.y(), normal.z());
+                Vec3d u, v;
+                if (std::abs(n.x()) < 0.9) u = Vec3d(1,0,0).cross(n);
+                else u = Vec3d(0,1,0).cross(n);
+                u.normalize();
+                v = n.cross(u);
 
-                allPoints.push_back(surfelPos);
-                allNormals.push_back(normal);
-                allPrecision.push_back(0); // COARSE
+                // 在切平面上做 N_init × N_init 采样
+                double step = D_v / N_init;
+                for (int i = 0; i < N_init; ++i) {
+                    for (int j = 0; j < N_init; ++j) {
+                        Vec3d offset = ((i + 0.5 - N_init/2.0) * step) * u +
+                                       ((j + 0.5 - N_init/2.0) * step) * v;
+                        Vec3d candidate = voxelCenter + offset;
+                        // 投影到零等值面
+                        candidate = candidate - n * (double)sdfVal;
+
+                        allPoints.push_back(candidate);
+                        allNormals.push_back(normal);
+                        allPrecision.push_back(0); // COARSE
+                    }
+                }
             }
         }
 

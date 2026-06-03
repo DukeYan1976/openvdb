@@ -93,7 +93,7 @@ TEST_F(BilletBuilderTest, DualGrid_IPW0_SurfelsInjected) {
     size_t leafCount = billet.microGrid->tree().leafCount();
     ASSERT_GT(leafCount, 0u);
     double avgPerLeaf = static_cast<double>(ptCount) / leafCount;
-    EXPECT_LT(avgPerLeaf, 500.0);  // 粗精度，不会有 N²=4096 级密度
+    EXPECT_LT(avgPerLeaf, 2000.0);  // 粗精度 N_init²=4 per voxel, ~240 voxels/leaf → ~960
 }
 
 TEST_F(BilletBuilderTest, DualGrid_MemoryStats_Reported) {
