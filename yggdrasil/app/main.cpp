@@ -19,6 +19,7 @@
 #include <cmath>
 #include <vector>
 #include <cstdint>
+#include <chrono>
 
 // --- Shader sources ---
 static const char* vertSrc = R"(
@@ -296,22 +297,29 @@ int main() {
                 }
                 ImGui::Separator();
                 ImGui::Text("Precision Control:");
-                float prevTol = tolerance;
-                ImGui::SliderFloat("Tolerance t (mm)", &tolerance, 0.001f, 2.0f, "%.4f", ImGuiSliderFlags_Logarithmic);
+                ImGui::SliderFloat("##tol_slider", &tolerance, 0.001f, 2.0f, "%.4f", ImGuiSliderFlags_Logarithmic);
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(80);
+                ImGui::InputFloat("t (mm)", &tolerance, 0, 0, "%.4f");
+                if (tolerance < 0.001f) tolerance = 0.001f;
                 ImGui::Text("d_v = %.4f mm (= t/2)", tolerance * 0.5f);
 
-                // 自动计算模式
-                auto newCfg = ygg::solveResolution(
+                // 预览模式（不重建，仅显示将会切换到的模式）
+                auto previewCfg = ygg::solveResolution(
                     (double)tolerance, (double)cutR, 2.0, {30, 30, 15});
-                const char* autoMode = newCfg.mode == ygg::ResolutionConfig::SINGLE_TRACK ? "SINGLE_TRACK" :
-                                       newCfg.mode == ygg::ResolutionConfig::DUAL_TRACK ? "DUAL_TRACK" : "ATLAS";
-                ImVec4 modeColor = newCfg.mode == ygg::ResolutionConfig::SINGLE_TRACK ?
+                const char* autoMode = previewCfg.mode == ygg::ResolutionConfig::SINGLE_TRACK ? "SINGLE_TRACK" :
+                                       previewCfg.mode == ygg::ResolutionConfig::DUAL_TRACK ? "DUAL_TRACK" : "ATLAS";
+                ImVec4 modeColor = previewCfg.mode == ygg::ResolutionConfig::SINGLE_TRACK ?
                     ImVec4(0.3f,1.0f,0.3f,1.0f) : ImVec4(1.0f,0.8f,0.2f,1.0f);
-                ImGui::TextColored(modeColor, "Auto Mode: %s (D_v=%.3f N=%d)",
-                                   autoMode, newCfg.D_v, newCfg.N);
+                ImGui::TextColored(modeColor, "Target: %s (D_v=%.3f N=%d)",
+                                   autoMode, previewCfg.D_v, previewCfg.N);
 
-                if (tolerance != prevTol || needRebuild) {
-                    cfg = newCfg;
+                // Apply 按钮
+                static double buildTimeMs = 0;
+                ImGui::SameLine(0, 20);
+                if (ImGui::Button("Apply")) {
+                    auto t0 = std::chrono::high_resolution_clock::now();
+                    cfg = previewCfg;
                     billet = ygg::buildBillet(cfg, {0,0,0}, {30, 30, 15});
                     mesh = ygg::vdbToMesh(billet.sdfGrid);
                     uploadMesh(mesh.vertices.data(), mesh.vertices.size()*sizeof(float),
@@ -320,9 +328,18 @@ int main() {
                     volume = ygg::computeVolume(billet.sdfGrid);
                     cutCount = 0;
                     ptDirty = true;
-                    needRebuild = false;
                     useDualTrack = (cfg.mode == ygg::ResolutionConfig::DUAL_TRACK);
+                    auto t1 = std::chrono::high_resolution_clock::now();
+                    buildTimeMs = std::chrono::duration<double, std::milli>(t1-t0).count();
                 }
+
+                // 当前状态 vs 预览状态
+                const char* curMode = cfg.mode == ygg::ResolutionConfig::SINGLE_TRACK ? "SINGLE_TRACK" :
+                                      cfg.mode == ygg::ResolutionConfig::DUAL_TRACK ? "DUAL_TRACK" : "ATLAS";
+                ImGui::Text("Current: %s (d_v=%.4f D_v=%.3f)", curMode, cfg.d_v, cfg.D_v);
+                if (buildTimeMs > 0)
+                    ImGui::Text("Last build: %.1f ms | Mesh: %zu verts",
+                                buildTimeMs, mesh.vertices.size()/6);
                 ImGui::Separator();
                 if (ImGui::Button("Execute Cut")) {
                     ygg::CuttingEngine engine;
