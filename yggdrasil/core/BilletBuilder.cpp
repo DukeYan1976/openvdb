@@ -3,6 +3,8 @@
 #include <openvdb/points/PointConversion.h>
 #include <openvdb/points/PointCount.h>
 #include <openvdb/points/PointAttribute.h>
+#include <tbb/parallel_for.h>
+#include <tbb/blocked_range.h>
 #include <cmath>
 #include <vector>
 
@@ -18,7 +20,6 @@ static openvdb::FloatGrid::Ptr buildBoxSDF(double voxelSize, const Vec3d& origin
     grid->setGridClass(openvdb::GRID_LEVEL_SET);
     grid->setName("billet");
 
-    auto accessor = grid->getAccessor();
     Vec3d boxMin = origin, boxMax = origin + dims;
 
     // 只遍历窄带区域：距六面 ±halfWidth 范围内的体素
@@ -34,11 +35,12 @@ static openvdb::FloatGrid::Ptr buildBoxSDF(double voxelSize, const Vec3d& origin
     }
 
     // 只遍历窄带层（6 个面的薄壳区域）
+    auto accessor = grid->getAccessor();
     openvdb::Coord ijk;
-    for (ijk[0] = outerMin[0]; ijk[0] <= outerMax[0]; ++ijk[0]) {
+    int xMin = outerMin[0], xMax = outerMax[0];
+    for (ijk[0] = xMin; ijk[0] <= xMax; ++ijk[0]) {
         for (ijk[1] = outerMin[1]; ijk[1] <= outerMax[1]; ++ijk[1]) {
             for (ijk[2] = outerMin[2]; ijk[2] <= outerMax[2]; ++ijk[2]) {
-                // 跳过深内部（已经 fill 了）
                 if (ijk[0] > innerMin[0] && ijk[0] < innerMax[0] &&
                     ijk[1] > innerMin[1] && ijk[1] < innerMax[1] &&
                     ijk[2] > innerMin[2] && ijk[2] < innerMax[2])
