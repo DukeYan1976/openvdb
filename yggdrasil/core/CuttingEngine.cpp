@@ -1,6 +1,7 @@
 #include "core/CuttingEngine.h"
 #include <openvdb/tools/Prune.h>
 #include <openvdb/tools/Composite.h>
+#include <openvdb/tools/Interpolation.h>
 #include <openvdb/tools/LevelSetMeasure.h>
 #include <openvdb/points/PointCount.h>
 #include <openvdb/points/PointAttribute.h>
@@ -451,6 +452,44 @@ void CuttingEngine::cut(BilletModel& billet, const ToolSweepSDF& toolSDF) {
 double computeVolume(const openvdb::FloatGrid::Ptr& grid) {
     openvdb::tools::LevelSetMeasure<openvdb::FloatGrid> measure(*grid);
     return measure.volume();
+}
+
+openvdb::FloatGrid::Ptr buildLocalCutSurface(
+    const BilletModel& billet, const ToolSweepSDF& lastTool) {
+    double displayVs = std::max(billet.config.d_v, 0.05);
+    float bandWidth = 3.0f * static_cast<float>(displayVs);
+
+    auto xform = openvdb::math::Transform::createLinearTransform(displayVs);
+    auto grid = openvdb::FloatGrid::create(bandWidth);
+    grid->setTransform(xform);
+    grid->setGridClass(openvdb::GRID_LEVEL_SET);
+
+    auto bbox = lastTool.getBoundingBox();
+    bbox.expand(displayVs * 3);
+    auto minIdx = xform->worldToIndexCellCentered(bbox.min());
+    auto maxIdx = xform->worldToIndexCellCentered(bbox.max());
+
+    auto& billetXform = billet.sdfGrid->transform();
+    auto billetAcc = billet.sdfGrid->getConstAccessor();
+    auto acc = grid->getAccessor();
+
+    openvdb::Coord ijk;
+    for (ijk[0] = minIdx[0]; ijk[0] <= maxIdx[0]; ++ijk[0]) {
+        for (ijk[1] = minIdx[1]; ijk[1] <= maxIdx[1]; ++ijk[1]) {
+            for (ijk[2] = minIdx[2]; ijk[2] <= maxIdx[2]; ++ijk[2]) {
+                Vec3d wp = xform->indexToWorld(ijk);
+                // 从粗毛坯 Grid 插值采样
+                Vec3d billetIdx = billetXform.worldToIndex(wp);
+                float billetVal = openvdb::tools::BoxSampler::sample(
+                    billet.sdfGrid->tree(), billetIdx);
+                float toolVal = -static_cast<float>(lastTool.eval(wp));
+                float sdf = std::max(billetVal, toolVal);
+                if (std::abs(sdf) < bandWidth)
+                    acc.setValue(ijk, sdf);
+            }
+        }
+    }
+    return grid;
 }
 
 } // namespace ygg

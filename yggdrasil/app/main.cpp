@@ -232,6 +232,10 @@ int main() {
     // ── Debug Viz State ──
     static int renderMode = 0; // 0=Solid, 1=Wireframe, 2=Solid+Wire
     static bool showMicroGrid = false;
+    static bool showCutSurface = false;
+    static float cutSurfaceColor[3] = {0.2f, 0.85f, 0.35f};
+    static GLuint csVAO = 0, csVBO = 0, csEBO = 0;
+    static int csIdxCount = 0;
     static float pointSize = 4.0f;
     static float wireWidth = 1.5f;
     static bool clipEnabled = false;
@@ -320,6 +324,9 @@ int main() {
                 ImGui::RadioButton("Solid+Wire", &renderMode, 2);
 
                 ImGui::Checkbox("Show MicroGrid Points", &showMicroGrid);
+                ImGui::Checkbox("Show Cut Surface (d_v precision)", &showCutSurface);
+                if (showCutSurface)
+                    ImGui::ColorEdit3("Cut Surface Color", cutSurfaceColor);
                 ImGui::SliderFloat("Point Size", &pointSize, 1.0f, 10.0f);
                 ImGui::SliderFloat("Wire Width", &wireWidth, 0.5f, 5.0f);
                 ImGui::ColorEdit3("Macro Color", macroColor);
@@ -428,6 +435,25 @@ int main() {
                     volume = ygg::computeVolume(billet.sdfGrid);
                     cutCount++;
                     ptDirty = true;
+
+                    // 构建精确切削面 mesh（d_v 精度）
+                    if (showCutSurface && billet.isDualTrack()) {
+                        ygg::ToolSweepSDF lastTool(ygg::ToolType::BALL_END, cutR, 0, 20,
+                            {2,(double)cutY,(double)cutZ}, {28,(double)cutY,(double)cutZ});
+                        auto csGrid = ygg::buildLocalCutSurface(billet, lastTool);
+                        auto csMesh = ygg::vdbToMesh(csGrid);
+                        if (!csVAO) { glGenVertexArrays(1,&csVAO); glGenBuffers(1,&csVBO); glGenBuffers(1,&csEBO); }
+                        glBindVertexArray(csVAO);
+                        glBindBuffer(GL_ARRAY_BUFFER, csVBO);
+                        glBufferData(GL_ARRAY_BUFFER, csMesh.vertices.size()*sizeof(float), csMesh.vertices.data(), GL_DYNAMIC_DRAW);
+                        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, csEBO);
+                        glBufferData(GL_ELEMENT_ARRAY_BUFFER, csMesh.indices.size()*sizeof(uint32_t), csMesh.indices.data(), GL_DYNAMIC_DRAW);
+                        glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,6*sizeof(float),(void*)0);
+                        glEnableVertexAttribArray(0);
+                        glVertexAttribPointer(1,3,GL_FLOAT,GL_FALSE,6*sizeof(float),(void*)(3*sizeof(float)));
+                        glEnableVertexAttribArray(1);
+                        csIdxCount = (int)csMesh.indices.size();
+                    }
                     cutTimeMs = std::chrono::duration<double,std::milli>(tc1-tc0).count();
                     meshTimeMs = std::chrono::duration<double,std::milli>(tc2-tc1).count();
                     uploadTimeMs = std::chrono::duration<double,std::milli>(tc3-tc2).count();
@@ -533,6 +559,22 @@ int main() {
         }
 
 #if YGG_HAS_OPENVDB
+        // ── Cut Surface (high-res) rendering ──
+        if (showCutSurface && csIdxCount > 0) {
+            float mvp2[16], nm2[9];
+            buildMVP(cam, w, h, mvp2, nm2);
+            glUseProgram(g_prog);
+            glUniformMatrix4fv(glGetUniformLocation(g_prog,"uMVP"),1,GL_FALSE,mvp2);
+            glUniformMatrix3fv(glGetUniformLocation(g_prog,"uNormalMat"),1,GL_FALSE,nm2);
+            glUniform3f(glGetUniformLocation(g_prog,"uLightDir"),0.30f,0.51f,0.81f);
+            glUniform3f(glGetUniformLocation(g_prog,"uColor"),
+                        cutSurfaceColor[0], cutSurfaceColor[1], cutSurfaceColor[2]);
+            float noClip[4] = {0,0,0,0};
+            glUniform4f(glGetUniformLocation(g_prog,"uClipPlane"),0,0,0,0);
+            glBindVertexArray(csVAO);
+            glDrawElements(GL_TRIANGLES, csIdxCount, GL_UNSIGNED_INT, nullptr);
+        }
+
         // ── Tool visualization ──
         if (showTool) {
             // 生成刀具胶囊体的简化表示（两端球 + 中间线）
