@@ -12,6 +12,7 @@
 #include "core/CuttingEngine.h"
 #include <openvdb/points/PointCount.h>
 #include <openvdb/points/PointAttribute.h>
+#include <openvdb/tools/LevelSetSphere.h>
 #endif
 
 #include <cstdio>
@@ -197,6 +198,12 @@ int main() {
     printf("Initial volume: %.1f mm3\n", volume);
     int cutCount = 0;
     static float cutY = 15.0f, cutR = 3.0f;
+    static float cutZ = 16.0f;  // 球心Z位置（顶面=15，切入深度=15+R-cutZ）
+    static bool showTool = true;
+    static float toolColor[3] = {1.0f, 0.3f, 0.1f};
+    static float toolCutColor[3] = {0.2f, 0.6f, 1.0f};
+    static bool useDualTrack = false;
+    static bool needRebuild = false;
 #endif
 
     glfwSetWindowUserPointer(win, &cam);
@@ -277,12 +284,43 @@ int main() {
             // ── Tab: 切削控制 ──
             if (ImGui::BeginTabItem("Cutting")) {
                 ImGui::SliderFloat("Cut Y", &cutY, 2.0f, 28.0f);
+                ImGui::SliderFloat("Cut Z (sphere center)", &cutZ, 10.0f, 20.0f);
                 ImGui::SliderFloat("Tool R", &cutR, 1.0f, 8.0f);
+                ImGui::Text("Cut depth: %.1f mm", 15.0f + cutR - cutZ);
+                ImGui::Separator();
+                ImGui::Checkbox("Show Tool", &showTool);
+                if (showTool) {
+                    ImGui::ColorEdit3("Tool Color", toolColor);
+                    ImGui::ColorEdit3("Cut Zone Color", toolCutColor);
+                }
+                ImGui::Separator();
+                if (ImGui::Checkbox("Dual Track Mode", &useDualTrack)) {
+                    needRebuild = true;
+                }
+                if (needRebuild) {
+                    if (useDualTrack) {
+                        cfg.mode = ygg::ResolutionConfig::DUAL_TRACK;
+                        cfg.d_v = 0.5; cfg.D_v = 4.0; cfg.N = 8;
+                    } else {
+                        cfg.mode = ygg::ResolutionConfig::SINGLE_TRACK;
+                        cfg.d_v = 0.5; cfg.D_v = 0.5; cfg.N = 1;
+                    }
+                    billet = ygg::buildBillet(cfg, {0,0,0}, {30, 30, 15});
+                    mesh = ygg::vdbToMesh(billet.sdfGrid);
+                    uploadMesh(mesh.vertices.data(), mesh.vertices.size()*sizeof(float),
+                               mesh.indices.data(), mesh.indices.size()*sizeof(uint32_t),
+                               (int)mesh.indices.size());
+                    volume = ygg::computeVolume(billet.sdfGrid);
+                    cutCount = 0;
+                    ptDirty = true;
+                    needRebuild = false;
+                }
+                ImGui::Separator();
                 if (ImGui::Button("Execute Cut")) {
                     ygg::CuttingEngine engine;
                     engine.cut(billet, ygg::ToolSweepSDF(
                         ygg::ToolType::BALL_END, cutR, 0, 20,
-                        {2,(double)cutY,0}, {28,(double)cutY,0}));
+                        {2,(double)cutY,(double)cutZ}, {28,(double)cutY,(double)cutZ}));
                     mesh = ygg::vdbToMesh(billet.sdfGrid);
                     uploadMesh(mesh.vertices.data(), mesh.vertices.size()*sizeof(float),
                                mesh.indices.data(), mesh.indices.size()*sizeof(uint32_t),
@@ -387,6 +425,52 @@ int main() {
 
             glDisable(GL_CLIP_DISTANCE0);
         }
+
+#if YGG_HAS_OPENVDB
+        // ── Tool visualization ──
+        if (showTool) {
+            // 生成刀具胶囊体的简化表示（两端球 + 中间线）
+            // 简化：只画一个球体代表刀具当前位置（中点）
+            static GLuint toolVAO=0, toolVBO=0, toolEBO=0;
+            static int toolIdxCount=0;
+            static float lastToolR=0, lastToolZ=0, lastToolY=0;
+            if (cutR != lastToolR || cutZ != lastToolZ || cutY != lastToolY) {
+                // 重建刀具 mesh（用 SDF 球体光栅化 + volumeToMesh）
+                auto toolXform = openvdb::math::Transform::createLinearTransform(0.3);
+                auto toolSphere = openvdb::tools::createLevelSetSphere<openvdb::FloatGrid>(
+                    float(cutR), openvdb::Vec3f(15.0f, cutY, cutZ), float(0.5), float(3.0));
+                auto toolMesh = ygg::vdbToMesh(toolSphere);
+                if (!toolVAO) { glGenVertexArrays(1,&toolVAO); glGenBuffers(1,&toolVBO); glGenBuffers(1,&toolEBO); }
+                glBindVertexArray(toolVAO);
+                glBindBuffer(GL_ARRAY_BUFFER, toolVBO);
+                glBufferData(GL_ARRAY_BUFFER, toolMesh.vertices.size()*sizeof(float), toolMesh.vertices.data(), GL_DYNAMIC_DRAW);
+                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, toolEBO);
+                glBufferData(GL_ELEMENT_ARRAY_BUFFER, toolMesh.indices.size()*sizeof(uint32_t), toolMesh.indices.data(), GL_DYNAMIC_DRAW);
+                glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,6*sizeof(float),(void*)0);
+                glEnableVertexAttribArray(0);
+                glVertexAttribPointer(1,3,GL_FLOAT,GL_FALSE,6*sizeof(float),(void*)(3*sizeof(float)));
+                glEnableVertexAttribArray(1);
+                toolIdxCount = (int)toolMesh.indices.size();
+                lastToolR=cutR; lastToolZ=cutZ; lastToolY=cutY;
+            }
+            if (toolIdxCount > 0) {
+                float mvp[16], nm[9];
+                buildMVP(cam, w, h, mvp, nm);
+                glUseProgram(g_prog);
+                glUniformMatrix4fv(glGetUniformLocation(g_prog,"uMVP"),1,GL_FALSE,mvp);
+                glUniformMatrix3fv(glGetUniformLocation(g_prog,"uNormalMat"),1,GL_FALSE,nm);
+                glUniform3f(glGetUniformLocation(g_prog,"uLightDir"),0.30f,0.51f,0.81f);
+                // 底部半球（切削区）用 cutColor，上半用 toolColor
+                // 简化：整个球用 toolColor，半透明
+                glEnable(GL_BLEND);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                glUniform3f(glGetUniformLocation(g_prog,"uColor"),toolColor[0],toolColor[1],toolColor[2]);
+                glBindVertexArray(toolVAO);
+                glDrawElements(GL_TRIANGLES, toolIdxCount, GL_UNSIGNED_INT, nullptr);
+                glDisable(GL_BLEND);
+            }
+        }
+#endif
 
 #if YGG_HAS_OPENVDB
         // ── MicroGrid point cloud rendering ──
