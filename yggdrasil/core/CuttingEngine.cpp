@@ -106,13 +106,13 @@ static void cutSingleTrack_B_parallel(BilletModel& billet, const ToolSweepSDF& t
         [&](const openvdb::tree::LeafManager<TreeT>::LeafRange& range) {
             for (auto leafIter = range.begin(); leafIter; ++leafIter) {
                 auto& leaf = *leafIter;
-                // 快速跳过：叶节点包围盒与刀具包围盒不相交
                 auto leafOrigin = leaf.origin();
                 if (leafOrigin.x() + 8 < minIdx.x() || leafOrigin.x() > maxIdx.x() ||
                     leafOrigin.y() + 8 < minIdx.y() || leafOrigin.y() > maxIdx.y() ||
                     leafOrigin.z() + 8 < minIdx.z() || leafOrigin.z() > maxIdx.z())
                     continue;
 
+                // 遍历叶节点内所有活跃体素（用 offset 安全写入）
                 for (auto it = leaf.beginValueOn(); it; ++it) {
                     auto coord = it.getCoord();
                     if (coord.x() < minIdx.x() || coord.x() > maxIdx.x() ||
@@ -126,7 +126,7 @@ static void cutSingleTrack_B_parallel(BilletModel& billet, const ToolSweepSDF& t
                         float billetVal = it.getValue();
                         float newVal = std::max(billetVal, static_cast<float>(-toolDist));
                         if (newVal != billetVal)
-                            it.setValue(newVal);
+                            leaf.setValueOn(it.pos(), newVal);
                     }
                 }
             }
