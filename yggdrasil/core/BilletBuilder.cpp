@@ -116,7 +116,9 @@ BilletModel buildBillet(const ResolutionConfig& config,
         model.sdfGrid = buildBoxSDF(config.D_v, origin, dims);
 
         // Step 2: 生成 IPW₀ 粗面元
-        double d_v_init = std::max(10.0 * config.d_v, config.D_v);
+        // 自适应 d_v_init：确保每面至少 4×4 个面元，同时不过密
+        double minDim = std::min({dims.x(), dims.y(), dims.z()});
+        double d_v_init = std::min(minDim / 4.0, std::max(10.0 * config.d_v, config.D_v));
         std::vector<openvdb::Vec3R> points;
         std::vector<openvdb::Vec3f> normals;
         std::vector<uint8_t> precision;
