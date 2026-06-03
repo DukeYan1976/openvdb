@@ -212,7 +212,15 @@ int main() {
     glfwSetWindowUserPointer(win, &cam);
     glfwSetScrollCallback(win, [](GLFWwindow* w, double, double y){
         auto* c=(Camera*)glfwGetWindowUserPointer(w);
-        c->dist-=(float)y*3; if(c->dist<5)c->dist=5;});
+        c->dist-=(float)y*3; if(c->dist<1)c->dist=1;});
+
+    glfwSetKeyCallback(win, [](GLFWwindow* w, int key, int, int action, int){
+        if (key == GLFW_KEY_F && action == GLFW_PRESS) {
+            // Zoom All: reset camera to fit billet
+            auto* c=(Camera*)glfwGetWindowUserPointer(w);
+            c->dist=60; c->yaw=45; c->pitch=30; c->tx=15; c->ty=15; c->tz=7.5f;
+        }
+    });
 
     // ── Debug Viz State ──
     static int renderMode = 0; // 0=Solid, 1=Wireframe, 2=Solid+Wire
@@ -234,12 +242,23 @@ int main() {
     while (!glfwWindowShouldClose(win)) {
         glfwPollEvents();
 
-        // Orbit drag
+        // Orbit drag (Right mouse)
         if (glfwGetMouseButton(win, GLFW_MOUSE_BUTTON_RIGHT)==GLFW_PRESS) {
             double mx,my; glfwGetCursorPos(win,&mx,&my);
             if(!drag){drag=true;lx=mx;ly=my;}
-            cam.yaw+=(float)(mx-lx)*0.3f; cam.pitch+=(float)(my-ly)*0.3f;
+            cam.yaw+=(float)(mx-lx)*0.3f; cam.pitch+=(float)(ly-my)*0.3f;
             if(cam.pitch>89)cam.pitch=89; if(cam.pitch<-89)cam.pitch=-89;
+            lx=mx;ly=my;
+        // Pan (Middle mouse)
+        } else if (glfwGetMouseButton(win, GLFW_MOUSE_BUTTON_MIDDLE)==GLFW_PRESS) {
+            double mx,my; glfwGetCursorPos(win,&mx,&my);
+            if(!drag){drag=true;lx=mx;ly=my;}
+            float panSpeed = cam.dist * 0.003f;
+            float yr = cam.yaw * 3.14159f / 180.0f;
+            // Pan in screen-space right/up directions
+            cam.tx -= (float)(mx-lx) * panSpeed * cosf(yr);
+            cam.ty -= (float)(mx-lx) * panSpeed * sinf(yr);
+            cam.tz += (float)(my-ly) * panSpeed;
             lx=mx;ly=my;
         } else drag=false;
 
