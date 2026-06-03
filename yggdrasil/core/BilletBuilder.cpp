@@ -127,46 +127,86 @@ BilletModel buildBillet(const ResolutionConfig& config,
         model.microGrid = nullptr;
     }
     else if (config.mode == ResolutionConfig::DUAL_TRACK) {
-        // Step 1: 构建 FloatGrid SDF（共享 Transform 的 VoxelSize = D_v）
+        // Step 1: 构建 FloatGrid SDF（共享 Transform，VoxelSize = D_v）
         model.sdfGrid = buildBoxSDF(config.D_v, origin, dims);
 
-        // Step 2: 生成 IPW₀ 粗面元
-        // 自适应 d_v_init：确保每面至少 4×4 个面元，同时不过密
+        // Step 2: 逐体素注入 IPW₀ 粗面元
+        double D_v = config.D_v;
         double minDim = std::min({dims.x(), dims.y(), dims.z()});
-        double d_v_init = std::min(minDim / 4.0, std::max(10.0 * config.d_v, config.D_v));
-        std::vector<openvdb::Vec3R> points;
-        std::vector<openvdb::Vec3f> normals;
-        std::vector<uint8_t> precision;
-        generateIPW0Surfels(model.sdfGrid, origin, dims, config.D_v, d_v_init,
-                            points, normals, precision);
+        double d_v_init = std::min(minDim / 4.0, std::max(10.0 * config.d_v, D_v));
+        float bandWidth = 3.0f * static_cast<float>(D_v);
+
+        // 收集点（按体素分组，确保每个点落在正确的体素中）
+        std::vector<openvdb::Vec3R> allPoints;
+        std::vector<openvdb::Vec3f> allNormals;
+        std::vector<uint8_t> allPrecision;
+
+        auto& xform = *model.sdfGrid->transformPtr();
+        auto sdfAcc = model.sdfGrid->getConstAccessor();
+
+        // 遍历 FloatGrid 窄带表面体素
+        for (auto iter = model.sdfGrid->cbeginValueOn(); iter; ++iter) {
+            float sdfVal = *iter;
+            // 表面体素判定：SDF 接近零（-D_v < SDF < D_v）
+            if (sdfVal >= -static_cast<float>(D_v) && sdfVal <= static_cast<float>(D_v)) {
+                openvdb::Coord voxelCoord = iter.getCoord();
+                Vec3d voxelCenter = xform.indexToWorld(voxelCoord);
+
+                // 估算表面法向（从 SDF 梯度，中心差分）
+                float gx = sdfAcc.getValue(voxelCoord.offsetBy(1,0,0)) -
+                           sdfAcc.getValue(voxelCoord.offsetBy(-1,0,0));
+                float gy = sdfAcc.getValue(voxelCoord.offsetBy(0,1,0)) -
+                           sdfAcc.getValue(voxelCoord.offsetBy(0,-1,0));
+                float gz = sdfAcc.getValue(voxelCoord.offsetBy(0,0,1)) -
+                           sdfAcc.getValue(voxelCoord.offsetBy(0,0,-1));
+                openvdb::Vec3f normal(gx, gy, gz);
+                float nlen = normal.length();
+                if (nlen > 1e-6f) normal /= nlen;
+                else normal = openvdb::Vec3f(0, 0, 1);
+
+                // 在该体素表面放 1 个面元（粗精度 IPW₀）
+                // 投影到零等值面：沿法向偏移 -sdfVal
+                Vec3d surfelPos = voxelCenter - Vec3d(normal.x(), normal.y(), normal.z()) * sdfVal;
+
+                allPoints.push_back(surfelPos);
+                allNormals.push_back(normal);
+                allPrecision.push_back(0); // COARSE
+            }
+        }
 
         // Step 3: 创建 PointDataGrid（共享 Transform）
-        auto xform = model.sdfGrid->transformPtr();
-        model.microGrid = openvdb::points::createPointDataGrid<openvdb::points::NullCodec,
-            openvdb::points::PointDataGrid>(points, *xform);
+        if (!allPoints.empty()) {
+            model.microGrid = openvdb::points::createPointDataGrid<
+                openvdb::points::NullCodec, openvdb::points::PointDataGrid>(
+                allPoints, xform);
+        } else {
+            model.microGrid = openvdb::points::PointDataGrid::create();
+            model.microGrid->setTransform(model.sdfGrid->transformPtr());
+        }
         model.microGrid->setName("micro_surfels");
 
-        // Step 4: 注册并附加 normal + precision + active 属性
+        // Step 4: 附加属性（normal, precision）+ Group "active"
         openvdb::points::TypedAttributeArray<openvdb::Vec3f>::registerType();
         openvdb::points::TypedAttributeArray<uint8_t>::registerType();
 
         auto& tree = model.microGrid->tree();
+        size_t globalIdx = 0;
         for (auto leaf = tree.beginLeaf(); leaf; ++leaf) {
             auto attrSet = leaf->stealAttributeSet();
 
-            // Append normal (Vec3f)
+            // Append normal
             if (attrSet->descriptor().find("normal") == openvdb::points::AttributeSet::INVALID_POS) {
                 attrSet->appendAttribute("normal",
                     openvdb::points::TypedAttributeArray<openvdb::Vec3f>::attributeType(),
                     static_cast<openvdb::Index>(leaf->pointCount()));
             }
-            // Append precision (uint8)
+            // Append precision
             if (attrSet->descriptor().find("precision") == openvdb::points::AttributeSet::INVALID_POS) {
                 attrSet->appendAttribute("precision",
                     openvdb::points::TypedAttributeArray<uint8_t>::attributeType(),
                     static_cast<openvdb::Index>(leaf->pointCount()));
             }
-            // Append active (uint8)
+            // Append group "active" (as uint8 for now; Group migration deferred)
             if (attrSet->descriptor().find("active") == openvdb::points::AttributeSet::INVALID_POS) {
                 attrSet->appendAttribute("active",
                     openvdb::points::TypedAttributeArray<uint8_t>::attributeType(),
@@ -174,31 +214,27 @@ BilletModel buildBillet(const ResolutionConfig& config,
             }
 
             leaf->replaceAttributeSet(attrSet.release(), true);
-        }
 
-        // Step 5: 写入属性值
-        size_t globalIdx = 0;
-        for (auto leaf = tree.beginLeaf(); leaf; ++leaf) {
-            auto attrSetPtr = leaf->stealAttributeSet();
+            // Write normal + precision + active values
+            {
+                auto attrSetW = leaf->stealAttributeSet();
+                auto* normalArr = attrSetW->get("normal");
+                auto* precArr = attrSetW->get("precision");
+                auto* activeArr = attrSetW->get("active");
+                auto whN = openvdb::points::AttributeWriteHandle<openvdb::Vec3f>::create(*normalArr);
+                auto whP = openvdb::points::AttributeWriteHandle<uint8_t>::create(*precArr);
+                auto whA = openvdb::points::AttributeWriteHandle<uint8_t>::create(*activeArr);
 
-            auto* normalArr = attrSetPtr->get("normal");
-            auto* precArr = attrSetPtr->get("precision");
-            auto* activeArr = attrSetPtr->get("active");
-
-            auto whNormal = openvdb::points::AttributeWriteHandle<openvdb::Vec3f>::create(*normalArr);
-            auto whPrec = openvdb::points::AttributeWriteHandle<uint8_t>::create(*precArr);
-            auto whActive = openvdb::points::AttributeWriteHandle<uint8_t>::create(*activeArr);
-
-            for (size_t i = 0; i < whNormal->size(); ++i) {
-                if (globalIdx < normals.size()) {
-                    whNormal->set(i, normals[globalIdx]);
-                    whPrec->set(i, precision[globalIdx]);
-                    whActive->set(i, 1); // all active
+                for (size_t i = 0; i < whN->size(); ++i) {
+                    if (globalIdx < allNormals.size()) {
+                        whN->set(i, allNormals[globalIdx]);
+                        whP->set(i, allPrecision[globalIdx]);
+                        whA->set(i, 1); // all active
+                    }
+                    globalIdx++;
                 }
-                globalIdx++;
+                leaf->replaceAttributeSet(attrSetW.release(), true);
             }
-
-            leaf->replaceAttributeSet(attrSetPtr.release(), true);
         }
     }
 

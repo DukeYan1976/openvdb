@@ -40,7 +40,7 @@ ResolutionConfig solveResolution(double t, double R_min, double F_min,
     // 单轨可行性：用实际表面积估算内存
     double surfaceArea = 2.0 * (Lx * Ly + Ly * Lz + Lx * Lz);
     double activeVoxels = (surfaceArea / (cfg.d_v * cfg.d_v)) * 6.0; // 2*halfWidth=6
-    double memoryEst = activeVoxels * 4.0; // float = 4 bytes
+    double memoryEst = activeVoxels * 4.0 * 2.0; // ×2 factor for leaf node overhead
 
     if (memoryEst < static_cast<double>(memBudget)) {
         cfg.mode = ResolutionConfig::SINGLE_TRACK;
