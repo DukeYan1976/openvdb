@@ -2,6 +2,7 @@
 
 #include <openvdb/openvdb.h>
 #include <openvdb/tools/LevelSetSphere.h>
+#include <openvdb/points/PointDataGrid.h>
 #include <cstdint>
 
 namespace ygg {
@@ -28,11 +29,14 @@ struct ResolutionConfig {
 
 struct BilletModel {
     openvdb::FloatGrid::Ptr sdfGrid;
+    openvdb::points::PointDataGrid::Ptr microGrid;  // 面元网格（与 sdfGrid 共享 Transform）
+
     ResolutionConfig config;
     Vec3d origin;
     Vec3d dims;
 
     bool isSingleTrack() const { return config.mode == ResolutionConfig::SINGLE_TRACK; }
+    bool isDualTrack() const { return config.mode == ResolutionConfig::DUAL_TRACK; }
 };
 
 } // namespace ygg

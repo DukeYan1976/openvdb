@@ -41,6 +41,7 @@ add_executable(ygg_tests
     tests/test_toolsdf.cpp
     tests/test_cutting.cpp
     tests/test_e2e.cpp
+    tests/test_memory.cpp
 )
 target_link_libraries(ygg_tests PRIVATE yggdrasil GTest::gtest_main)
 

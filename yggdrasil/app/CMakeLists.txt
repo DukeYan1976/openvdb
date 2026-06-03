@@ -14,30 +14,35 @@ target_include_directories(glad PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/glad/include
 )
 
-# --- GLFW (use existing local source) ---
+# --- GLFW ---
 set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(glfw
-    SOURCE_DIR "D:/WorkSpace/02_Develop/SourceCode_2/2DRegionApprox/build/_deps/glfw-src"
+    GIT_REPOSITORY https://github.com/glfw/glfw.git
+    GIT_TAG 3.4
 )
 FetchContent_MakeAvailable(glfw)
 
-# --- Dear ImGui (use existing local source) ---
-set(IMGUI_DIR "D:/WorkSpace/02_Develop/SourceCode_2/2DRegionApprox/build/_deps/imgui-src")
+# --- Dear ImGui ---
+FetchContent_Declare(imgui
+    GIT_REPOSITORY https://github.com/ocornut/imgui.git
+    GIT_TAG v1.91.8
+)
+FetchContent_MakeAvailable(imgui)
 
 add_library(imgui_impl STATIC
-    ${IMGUI_DIR}/imgui.cpp
-    ${IMGUI_DIR}/imgui_demo.cpp
-    ${IMGUI_DIR}/imgui_draw.cpp
-    ${IMGUI_DIR}/imgui_tables.cpp
-    ${IMGUI_DIR}/imgui_widgets.cpp
-    ${IMGUI_DIR}/backends/imgui_impl_glfw.cpp
-    ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp
+    ${imgui_SOURCE_DIR}/imgui.cpp
+    ${imgui_SOURCE_DIR}/imgui_demo.cpp
+    ${imgui_SOURCE_DIR}/imgui_draw.cpp
+    ${imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
 )
 target_include_directories(imgui_impl PUBLIC
-    ${IMGUI_DIR}
-    ${IMGUI_DIR}/backends
+    ${imgui_SOURCE_DIR}
+    ${imgui_SOURCE_DIR}/backends
 )
 target_link_libraries(imgui_impl PUBLIC glfw glad)
 
@@ -45,7 +50,7 @@ target_link_libraries(imgui_impl PUBLIC glfw glad)
 find_package(OpenGL REQUIRED)
 
 # --- OpenVDB (optional) ---
-option(YGG_APP_USE_OPENVDB "Enable OpenVDB core integration" OFF)
+option(YGG_APP_USE_OPENVDB "Enable OpenVDB core integration" ON)
 
 set(APP_SOURCES main.cpp)
 set(APP_LIBS imgui_impl glad OpenGL::GL)
