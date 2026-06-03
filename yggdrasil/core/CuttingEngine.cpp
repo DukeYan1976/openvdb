@@ -19,7 +19,7 @@ namespace ygg {
 // C: 光栅化刀具SDF为Grid + csgDifferenceSDF（OpenVDB原生优化，需临时Grid）
 // ═══════════════════════════════════════════════════════════════════════
 #ifndef CUT_STRATEGY
-#define CUT_STRATEGY B  // 默认使用方案B
+#define CUT_STRATEGY B  // B全面胜出(见bench_strategies结果)
 #endif
 
 // 方案A: 暴力包围盒三重循环（基线）
