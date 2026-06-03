@@ -1,45 +1,141 @@
 #include "core/CuttingEngine.h"
 #include <openvdb/tools/Prune.h>
+#include <openvdb/points/PointCount.h>
+#include <openvdb/points/PointAttribute.h>
 #include <cmath>
 
 namespace ygg {
 
-void CuttingEngine::cut(BilletModel& billet, const ToolSweepSDF& toolSDF) {
+// 单轨切削（Phase 1 逻辑，不变）
+static void cutSingleTrack(BilletModel& billet, const ToolSweepSDF& toolSDF) {
     auto& grid = billet.sdfGrid;
     auto& xform = grid->transform();
     double voxelSize = xform.voxelSize()[0];
     float bandWidth = 3.0f * static_cast<float>(voxelSize);
 
-    // 计算刀具包围盒在索引空间的范围
     auto bbox = toolSDF.getBoundingBox();
     auto minIdx = xform.worldToIndexCellCentered(bbox.min());
     auto maxIdx = xform.worldToIndexCellCentered(bbox.max());
 
     auto accessor = grid->getAccessor();
-
-    // 遍历包围盒内的体素，执行 SDF 布尔差集: max(billet, -tool)
     openvdb::Coord ijk;
     for (ijk[0] = minIdx[0]; ijk[0] <= maxIdx[0]; ++ijk[0]) {
         for (ijk[1] = minIdx[1]; ijk[1] <= maxIdx[1]; ++ijk[1]) {
             for (ijk[2] = minIdx[2]; ijk[2] <= maxIdx[2]; ++ijk[2]) {
                 Vec3d worldPos = xform.indexToWorld(ijk);
                 double toolDist = toolSDF.eval(worldPos);
-
-                // 仅处理刀具内部或表面附近的体素
                 if (toolDist < bandWidth) {
                     float billetVal = accessor.getValue(ijk);
                     float newVal = std::max(billetVal, static_cast<float>(-toolDist));
-
-                    if (newVal != billetVal) {
+                    if (newVal != billetVal)
                         accessor.setValue(ijk, newVal);
-                    }
+                }
+            }
+        }
+    }
+    openvdb::tools::pruneLevelSet(grid->tree());
+}
+
+// 双轨切削：4-phase 流程
+static void cutDualTrack(BilletModel& billet, const ToolSweepSDF& toolSDF) {
+    auto& sdfGrid = billet.sdfGrid;
+    auto& microGrid = billet.microGrid;
+    auto& xform = sdfGrid->transform();
+    double D_v = xform.voxelSize()[0];
+    float bandWidth = 3.0f * static_cast<float>(D_v);
+
+    // Phase 1: 宏观过滤 — 更新 SDF (同单轨逻辑)
+    auto bbox = toolSDF.getBoundingBox();
+    auto minIdx = xform.worldToIndexCellCentered(bbox.min());
+    auto maxIdx = xform.worldToIndexCellCentered(bbox.max());
+
+    auto sdfAccessor = sdfGrid->getAccessor();
+    openvdb::Coord ijk;
+    for (ijk[0] = minIdx[0]; ijk[0] <= maxIdx[0]; ++ijk[0]) {
+        for (ijk[1] = minIdx[1]; ijk[1] <= maxIdx[1]; ++ijk[1]) {
+            for (ijk[2] = minIdx[2]; ijk[2] <= maxIdx[2]; ++ijk[2]) {
+                Vec3d worldPos = xform.indexToWorld(ijk);
+                double toolDist = toolSDF.eval(worldPos);
+                if (toolDist < bandWidth) {
+                    float billetVal = sdfAccessor.getValue(ijk);
+                    float newVal = std::max(billetVal, static_cast<float>(-toolDist));
+                    if (newVal != billetVal)
+                        sdfAccessor.setValue(ijk, newVal);
                 }
             }
         }
     }
 
-    // 剪枝：移除远离表面的体素
-    openvdb::tools::pruneLevelSet(grid->tree());
+    // Phase 2: 微观面元剥离
+    if (microGrid) {
+        auto& tree = microGrid->tree();
+        for (auto leaf = tree.beginLeaf(); leaf; ++leaf) {
+            auto leafOrigin = leaf->origin();
+            Vec3d leafWorld = xform.indexToWorld(leafOrigin);
+            Vec3d leafMax = leafWorld + Vec3d(8 * D_v);
+            if (leafWorld.x() > bbox.max().x() || leafMax.x() < bbox.min().x() ||
+                leafWorld.y() > bbox.max().y() || leafMax.y() < bbox.min().y() ||
+                leafWorld.z() > bbox.max().z() || leafMax.z() < bbox.min().z())
+                continue;
+
+            auto attrSetPtr = leaf->stealAttributeSet();
+            auto* activeArr = attrSetPtr->get("active");
+            if (!activeArr) {
+                leaf->replaceAttributeSet(attrSetPtr.release(), true);
+                continue;
+            }
+
+            auto* posArr = attrSetPtr->get("P");
+            auto posHandle = openvdb::points::AttributeHandle<openvdb::Vec3f>::create(*posArr);
+            auto activeHandle = openvdb::points::AttributeWriteHandle<uint8_t>::create(*activeArr);
+
+            // 遍历叶节点中所有体素，确定每个点所属的体素
+            // PointDataLeaf 的 value 存储的是累积 offset
+            // 体素 n 的点范围 = [offset(n-1), offset(n))
+            for (openvdb::Index voxelIdx = 0; voxelIdx < 512; ++voxelIdx) {
+                openvdb::Index end = static_cast<openvdb::Index>(leaf->getValue(voxelIdx));
+                openvdb::Index start = (voxelIdx == 0) ? openvdb::Index(0) :
+                    static_cast<openvdb::Index>(leaf->getValue(voxelIdx - 1));
+                if (start == end) continue;
+
+                // 体素在叶节点中的局部坐标
+                openvdb::Coord localCoord(
+                    (voxelIdx >> 6) & 7,   // x: bits 6-8
+                    (voxelIdx >> 3) & 7,   // y: bits 3-5
+                    voxelIdx & 7);         // z: bits 0-2
+                openvdb::Coord voxelCoord = leafOrigin + localCoord;
+
+                for (openvdb::Index idx = start; idx < end; ++idx) {
+                    if (activeHandle->get(idx) == 0) continue;
+
+                    openvdb::Vec3f localP = posHandle->get(idx);
+                    Vec3d worldPos = xform.indexToWorld(
+                        Vec3d(voxelCoord.x() + localP.x(),
+                              voxelCoord.y() + localP.y(),
+                              voxelCoord.z() + localP.z()));
+
+                    double dist = toolSDF.eval(worldPos);
+                    if (dist <= 0.0) {
+                        activeHandle->set(idx, 0);
+                    }
+                }
+            }
+
+            leaf->replaceAttributeSet(attrSetPtr.release(), true);
+        }
+    }
+
+    // Phase 3: 边界面元注入 — 暂不实现（Sprint 8）
+    // Phase 4: pruneLevelSet
+    openvdb::tools::pruneLevelSet(sdfGrid->tree());
+}
+
+void CuttingEngine::cut(BilletModel& billet, const ToolSweepSDF& toolSDF) {
+    if (billet.isSingleTrack()) {
+        cutSingleTrack(billet, toolSDF);
+    } else {
+        cutDualTrack(billet, toolSDF);
+    }
 }
 
 double computeVolume(const openvdb::FloatGrid::Ptr& grid) {
