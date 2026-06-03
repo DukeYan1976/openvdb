@@ -347,10 +347,19 @@ int main() {
                 // 当前状态 vs 预览状态
                 const char* curMode = cfg.mode == ygg::ResolutionConfig::SINGLE_TRACK ? "SINGLE_TRACK" :
                                       cfg.mode == ygg::ResolutionConfig::DUAL_TRACK ? "DUAL_TRACK" : "ATLAS";
-                ImGui::Text("Current: %s (d_v=%.4f D_v=%.3f)", curMode, cfg.d_v, cfg.D_v);
+                ImGui::Text("Current: %s (d_v=%.4f D_v=%.3f N=%d)", curMode, cfg.d_v, cfg.D_v, cfg.N);
+                if (cfg.mode == ygg::ResolutionConfig::SINGLE_TRACK) {
+                    ImGui::Text("  Mesh VoxelSize = %.4f mm (= d_v, full precision)", cfg.d_v);
+                } else {
+                    ImGui::TextColored(ImVec4(1,0.8f,0.2f,1),
+                        "  Mesh VoxelSize = %.3f mm (= D_v, coarse for display)", cfg.D_v);
+                    ImGui::TextColored(ImVec4(0.5f,1,0.5f,1),
+                        "  Surfel precision = %.4f mm (= d_v, check MicroGrid points)", cfg.d_v);
+                }
                 if (buildTimeMs > 0)
-                    ImGui::Text("Last build: %.1f ms | Mesh: %zu verts",
-                                buildTimeMs, mesh.vertices.size()/6);
+                    ImGui::Text("Last build: %.1f ms | Mesh: %zu verts | Voxels: %zu",
+                                buildTimeMs, mesh.vertices.size()/6,
+                                billet.sdfGrid->activeVoxelCount());
                 ImGui::Separator();
                 if (ImGui::Button("Execute Cut")) {
                     ygg::CuttingEngine engine;
