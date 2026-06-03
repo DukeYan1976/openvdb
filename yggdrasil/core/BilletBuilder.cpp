@@ -11,22 +11,40 @@ namespace ygg {
 // 手动长方体 SDF 构建（共用）
 static openvdb::FloatGrid::Ptr buildBoxSDF(double voxelSize, const Vec3d& origin, const Vec3d& dims) {
     float halfWidth = 3.0f;
+    float bandWidth = halfWidth * static_cast<float>(voxelSize);
     auto xform = openvdb::math::Transform::createLinearTransform(voxelSize);
-    auto grid = openvdb::FloatGrid::create(halfWidth * static_cast<float>(voxelSize));
+    auto grid = openvdb::FloatGrid::create(bandWidth);
     grid->setTransform(xform);
     grid->setGridClass(openvdb::GRID_LEVEL_SET);
     grid->setName("billet");
 
-    auto minIdx = xform->worldToIndexCellCentered(origin - Vec3d(halfWidth * voxelSize));
-    auto maxIdx = xform->worldToIndexCellCentered(origin + dims + Vec3d(halfWidth * voxelSize));
-
     auto accessor = grid->getAccessor();
+    Vec3d boxMin = origin, boxMax = origin + dims;
+
+    // 只遍历窄带区域：距六面 ±halfWidth 范围内的体素
+    // 外扩 halfWidth 层，内缩 halfWidth 层
+    auto outerMin = xform->worldToIndexCellCentered(boxMin - Vec3d(bandWidth));
+    auto outerMax = xform->worldToIndexCellCentered(boxMax + Vec3d(bandWidth));
+    auto innerMin = xform->worldToIndexCellCentered(boxMin + Vec3d(bandWidth));
+    auto innerMax = xform->worldToIndexCellCentered(boxMax - Vec3d(bandWidth));
+
+    // 先填充内部为负背景值（用 fill 整块操作）
+    if (innerMin.x() < innerMax.x() && innerMin.y() < innerMax.y() && innerMin.z() < innerMax.z()) {
+        grid->fill(openvdb::CoordBBox(innerMin, innerMax), -bandWidth, /*active=*/false);
+    }
+
+    // 只遍历窄带层（6 个面的薄壳区域）
     openvdb::Coord ijk;
-    for (ijk[0] = minIdx[0]; ijk[0] <= maxIdx[0]; ++ijk[0]) {
-        for (ijk[1] = minIdx[1]; ijk[1] <= maxIdx[1]; ++ijk[1]) {
-            for (ijk[2] = minIdx[2]; ijk[2] <= maxIdx[2]; ++ijk[2]) {
+    for (ijk[0] = outerMin[0]; ijk[0] <= outerMax[0]; ++ijk[0]) {
+        for (ijk[1] = outerMin[1]; ijk[1] <= outerMax[1]; ++ijk[1]) {
+            for (ijk[2] = outerMin[2]; ijk[2] <= outerMax[2]; ++ijk[2]) {
+                // 跳过深内部（已经 fill 了）
+                if (ijk[0] > innerMin[0] && ijk[0] < innerMax[0] &&
+                    ijk[1] > innerMin[1] && ijk[1] < innerMax[1] &&
+                    ijk[2] > innerMin[2] && ijk[2] < innerMax[2])
+                    continue;
+
                 Vec3d world = xform->indexToWorld(ijk);
-                Vec3d boxMin = origin, boxMax = origin + dims;
                 double dx = std::max(boxMin.x() - world.x(), world.x() - boxMax.x());
                 double dy = std::max(boxMin.y() - world.y(), world.y() - boxMax.y());
                 double dz = std::max(boxMin.z() - world.z(), world.z() - boxMax.z());
@@ -39,11 +57,8 @@ static openvdb::FloatGrid::Ptr buildBoxSDF(double voxelSize, const Vec3d& origin
                     dist = static_cast<float>(std::sqrt(ex*ex + ey*ey + ez*ez));
                 }
 
-                float bandWidth = halfWidth * static_cast<float>(voxelSize);
                 if (std::abs(dist) < bandWidth) {
                     accessor.setValue(ijk, dist);
-                } else if (dist < 0) {
-                    accessor.setValue(ijk, -bandWidth);
                 }
             }
         }

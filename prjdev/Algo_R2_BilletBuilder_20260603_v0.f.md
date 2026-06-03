@@ -1,7 +1,7 @@
 # R2 算法设计：建立初始毛坯计算模型
 
-**文档编号**：`Algo_R2_BilletBuilder_20260601_v0.a.md`  
-**状态**：v0.b  
+**文档编号**：`Algo_R2_BilletBuilder_20260603_v0.f.md`  
+**状态**：v0.f  
 **作者**：Duke / Kiro  
 **日期**：2026-06-01  
 **前置依赖**：R1（ResolutionConfig）  
@@ -182,8 +182,9 @@ function injectSurfels_IPW0(microGrid, voxelCoord, d_v_init, sdfGrid):
         for j in range(N_init):
             offset = localSurfaceOffset(i, j, N_init, D_v, normal)
             p = voxelCenter + offset
-            points.append({pos: p, normal: normal, active: 1, 
+            points.append({pos: p, normal: normal, 
                            precision: COARSE})  // 标记为粗精度
+            // active 通过 AttributeGroup 管理，注入时默认 group.active=true
     
     appendPoints(microGrid, voxelCoord, points)
 ```
@@ -203,8 +204,9 @@ function injectSurfels_Cut(microGrid, voxelCoord, config, cutNormal):
         for j in range(N):
             offset = localSurfaceOffset(i, j, N, D_v, cutNormal)
             p = voxelCenter + offset
-            points.append({pos: p, normal: cutNormal, active: 1,
+            points.append({pos: p, normal: cutNormal,
                            precision: FINE})  // 标记为精细精度
+            // active 通过 AttributeGroup 管理，注入时默认 group.active=true
     
     appendPoints(microGrid, voxelCoord, points)
 ```
@@ -215,8 +217,12 @@ function injectSurfels_Cut(microGrid, voxelCoord, config, cutNormal):
 PointDataGrid 每个点的属性：
   - Position (Vec3f): 相对于体素中心的局部偏移
   - Normal (Vec3f): 表面法向量
-  - Active (uint8): 1=材料存在, 0=已切除
   - Precision (uint8): COARSE=初始粗面元, FINE=切削后精细面元
+
+面元活跃状态通过 AttributeGroup("active") 管理（非属性）：
+  - 新注入面元默认属于 active group
+  - 被切除面元从 active group 移除
+  - PointDelete 可直接按 group 过滤删除
 ```
 
 ### 4.8 双轨同步遍历
@@ -238,11 +244,11 @@ function cuttingTraversal(sdfGrid, microGrid, toolSDF, config):
         // 微观精确计算
         surfels = microGrid.getPoints(i,j,k)
         for each surfel in surfels:
-            if surfel.active == 0:
+            if surfel not in group("active"):
                 continue
             dist = toolSDF.eval(surfel.position)
             if dist <= 0:
-                surfel.active = 0  // 位掩码翻转
+                remove surfel from group("active")  // 面元剥离
 
         // 在切削边界注入精细面元（新暴露表面，N²级采样）
         if hasNewBoundary(surfels, toolSDF):
@@ -350,3 +356,4 @@ function buildBillet(config, origin, dimensions) -> BilletModel:
 | v0.c | 2026-06-01 | 修正双轨架构：共享 Transform(D_v) |
 | v0.d | 2026-06-01 | IPW₀ 概念引入：初始表面粗精度，切削后精细 |
 | v0.e | 2026-06-01 | Fix-2: 明确双轨遍历规则——以 FloatGrid 为主树，PointDataGrid 延迟注入触发机制 |
+| v0.f | 2026-06-03 | §4.5/§4.6: `active` 标记由 uint8_t 属性改为 AttributeGroup（R6 Spike 验证） |

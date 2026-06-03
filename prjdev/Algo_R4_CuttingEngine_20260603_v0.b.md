@@ -1,6 +1,9 @@
 # R4 算法设计：实现刀具扫掠体 SDF 与毛坯计算模型的切削计算
 
-  **文档编号**：`Algo_R4_CuttingEngine_20260601_v0.a.md`
+  **文档编号**：`Algo_R4_CuttingEngine_20260603_v0.b.md`  
+  **状态**：已修订（Spike 验证修正）  
+  **作者**：Duke / Jarvas  
+  **日期**：2026-06-03
   **状态**：初稿
   **作者**：Duke / Kiro
   **日期**：2026-06-01
@@ -136,15 +139,15 @@
       // 遍历体素内所有活跃面元
       points = microGrid.getPoints(voxelCoord)
       for each surfel in points:
-          if surfel.active == 0:
+          if surfel not in group("active"):
               continue  // 已被切除，跳过
 
           // 精确距离计算（解析 SDF，无离散化误差）
           dist = toolSDF.eval(surfel.position)
 
           if dist <= 0:
-              // 材料剥离：位掩码翻转
-              surfel.active = 0
+              // 材料剥离：从 active group 中移除
+              remove surfel from group("active")
 
       // 在切削边界注入新的精细面元（新暴露表面）
       if hasPartialCut(points):
@@ -160,7 +163,7 @@
 
       for each voxelCoord in affectedVoxels:
           points = microGrid.getPoints(voxelCoord)
-          activeCount = count(p for p in points if p.active == 1)
+          activeCount = count(p for p in points if p in group("active"))
 
           if activeCount == 0:
               // 体素内材料完全被切除 → SDF 设为正值（空气）
@@ -216,7 +219,8 @@
                   continue
 
               appendPoint(microGrid, voxelCoord,
-                         {pos: candidate, normal: toolNormal, active: 1, precision: FINE})
+                         {pos: candidate, normal: toolNormal, precision: FINE})
+              // active 通过 AttributeGroup 管理：groupWriteHandle("active")->set(offset, true)
   ```
 
   **复杂度**：N² 次 eval（而非 N³）。N=128 时 = 16384 次，可接受。
@@ -284,9 +288,9 @@
   ├─────────────────────────┼────────────────────────────────────────────────────┤
   │ 切削体积精度            │ 理论扫掠体体积 vs 实际切除体素体积，偏差 < 5%      │
   ├─────────────────────────┼────────────────────────────────────────────────────┤
-  │ 双轨面元剥离正确        │ 刀具内部面元 active=0，外部面元 active=1           │
+  │ 双轨面元剥离正确        │ 刀具内部面元移出 active group，外部面元保持 active group │
   ├─────────────────────────┼────────────────────────────────────────────────────┤
-  │ 双轨宏观/微观一致性     │ SDF=正值的体素内无 active=1 的面元                 │
+  │ 双轨宏观/微观一致性     │ SDF=正值的体素内无 active group 的面元                 │
   ├─────────────────────────┼────────────────────────────────────────────────────┤
   │ 多段切削累积正确        │ 10 段连续切削后，结果与一次性大扫掠体等价          │
   ├─────────────────────────┼────────────────────────────────────────────────────┤
@@ -314,4 +318,4 @@
   │ 版本 │ 日期       │ 修订内容 │
   ├──────┼────────────┼──────────┤
   │ v0.a │ 2026-06-01 │ 初稿创建 │
-  └──────┴────────────┴──────────┘
+  │ v0.b │ 2026-06-03 │ §4.4: `active` 标记由 uint8_t 属性改为 AttributeGroup（R6 Spike 验证） │

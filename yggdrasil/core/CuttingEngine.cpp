@@ -1,5 +1,6 @@
 #include "core/CuttingEngine.h"
 #include <openvdb/tools/Prune.h>
+#include <openvdb/tools/LevelSetMeasure.h>
 #include <openvdb/points/PointCount.h>
 #include <openvdb/points/PointAttribute.h>
 #include <openvdb/points/PointConversion.h>
@@ -280,12 +281,8 @@ void CuttingEngine::cut(BilletModel& billet, const ToolSweepSDF& toolSDF) {
 }
 
 double computeVolume(const openvdb::FloatGrid::Ptr& grid) {
-    double voxelVol = std::pow(grid->voxelSize()[0], 3);
-    size_t count = 0;
-    for (auto iter = grid->cbeginValueOn(); iter; ++iter) {
-        if (*iter < 0.0f) ++count;
-    }
-    return static_cast<double>(count) * voxelVol;
+    openvdb::tools::LevelSetMeasure<openvdb::FloatGrid> measure(*grid);
+    return measure.volume();
 }
 
 } // namespace ygg
