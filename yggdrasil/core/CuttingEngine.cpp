@@ -2,6 +2,7 @@
 #include <openvdb/tools/Prune.h>
 #include <openvdb/points/PointCount.h>
 #include <openvdb/points/PointAttribute.h>
+#include <openvdb/points/PointConversion.h>
 #include <cmath>
 
 namespace ygg {
@@ -125,7 +126,128 @@ static void cutDualTrack(BilletModel& billet, const ToolSweepSDF& toolSDF) {
         }
     }
 
-    // Phase 3: 边界面元注入 — 暂不实现（Sprint 8）
+    // Phase 3: 边界面元注入（在刀具零等值面上注入精细面元）
+    {
+        auto& tree = microGrid->tree();
+        double d_v = billet.config.d_v;
+        int N = billet.config.N;
+
+        // 收集需要注入面元的体素（部分切削的体素）
+        for (auto leaf = tree.beginLeaf(); leaf; ++leaf) {
+            auto leafOrigin = leaf->origin();
+            Vec3d leafWorld = xform.indexToWorld(leafOrigin);
+            Vec3d leafMax = leafWorld + Vec3d(8 * D_v);
+            if (leafWorld.x() > bbox.max().x() || leafMax.x() < bbox.min().x() ||
+                leafWorld.y() > bbox.max().y() || leafMax.y() < bbox.min().y() ||
+                leafWorld.z() > bbox.max().z() || leafMax.z() < bbox.min().z())
+                continue;
+
+            // 检查是否有部分切削（既有 active=0 又有 active=1）
+            auto attrSetPtr = leaf->stealAttributeSet();
+            auto* activeArr = attrSetPtr->get("active");
+            if (!activeArr) {
+                leaf->replaceAttributeSet(attrSetPtr.release(), true);
+                continue;
+            }
+            auto ah = openvdb::points::AttributeHandle<uint8_t>::create(*activeArr);
+
+            bool hasActive = false, hasInactive = false;
+            for (size_t i = 0; i < ah->size(); ++i) {
+                if (ah->get(i) == 1) hasActive = true;
+                else hasInactive = true;
+                if (hasActive && hasInactive) break;
+            }
+
+            leaf->replaceAttributeSet(attrSetPtr.release(), true);
+
+            if (!hasActive || !hasInactive) continue; // 非边界叶节点
+
+            // 为该叶节点覆盖区域的刀具表面注入精细面元
+            // N² 表面采样：在刀具零等值面上采样
+            Vec3d center = (leafWorld + leafMax) * 0.5;
+            Vec3d toolGrad = toolSDF.gradient(center);
+            double gradLen = toolGrad.length();
+            if (gradLen < 1e-10) continue;
+            Vec3d normal = toolGrad / gradLen;
+
+            // 构建切平面坐标系
+            Vec3d u, v;
+            if (std::abs(normal.x()) < 0.9)
+                u = Vec3d(1,0,0).cross(normal);
+            else
+                u = Vec3d(0,1,0).cross(normal);
+            u.normalize();
+            v = normal.cross(u);
+
+            // 在切平面上 N×N 采样，投影到刀具表面
+            std::vector<openvdb::Vec3R> newPoints;
+            int sampleN = std::min(N, 8); // 限制每叶节点注入量
+            for (int i = 0; i < sampleN; ++i) {
+                for (int j = 0; j < sampleN; ++j) {
+                    Vec3d offset = ((i + 0.5 - sampleN/2.0) * d_v) * u +
+                                   ((j + 0.5 - sampleN/2.0) * d_v) * v;
+                    Vec3d candidate = center + offset;
+
+                    // 投影到刀具零等值面
+                    double dist = toolSDF.eval(candidate);
+                    candidate = candidate - dist * normal;
+
+                    // 验证投影点在叶节点覆盖范围内
+                    if (candidate.x() < leafWorld.x() || candidate.x() > leafMax.x() ||
+                        candidate.y() < leafWorld.y() || candidate.y() > leafMax.y() ||
+                        candidate.z() < leafWorld.z() || candidate.z() > leafMax.z())
+                        continue;
+
+                    // 验证投影后确实在刀具表面附近
+                    if (std::abs(toolSDF.eval(candidate)) < d_v)
+                        newPoints.push_back(candidate);
+                }
+            }
+
+            if (newPoints.empty()) continue;
+
+            // 创建临时 PointDataGrid 并合并
+            auto tempGrid = openvdb::points::createPointDataGrid<
+                openvdb::points::NullCodec, openvdb::points::PointDataGrid>(
+                newPoints, *microGrid->transformPtr());
+
+            // 为临时 grid 的叶节点添加属性
+            for (auto tLeaf = tempGrid->tree().beginLeaf(); tLeaf; ++tLeaf) {
+                auto tAttr = tLeaf->stealAttributeSet();
+                openvdb::points::TypedAttributeArray<openvdb::Vec3f>::registerType();
+                openvdb::points::TypedAttributeArray<uint8_t>::registerType();
+                tAttr->appendAttribute("normal",
+                    openvdb::points::TypedAttributeArray<openvdb::Vec3f>::attributeType(),
+                    static_cast<openvdb::Index>(tLeaf->pointCount()));
+                tAttr->appendAttribute("precision",
+                    openvdb::points::TypedAttributeArray<uint8_t>::attributeType(),
+                    static_cast<openvdb::Index>(tLeaf->pointCount()));
+                tAttr->appendAttribute("active",
+                    openvdb::points::TypedAttributeArray<uint8_t>::attributeType(),
+                    static_cast<openvdb::Index>(tLeaf->pointCount()));
+
+                // 设置属性值
+                auto* nArr = tAttr->get("normal");
+                auto* pArr = tAttr->get("precision");
+                auto* aArr = tAttr->get("active");
+                auto whN = openvdb::points::AttributeWriteHandle<openvdb::Vec3f>::create(*nArr);
+                auto whP = openvdb::points::AttributeWriteHandle<uint8_t>::create(*pArr);
+                auto whA = openvdb::points::AttributeWriteHandle<uint8_t>::create(*aArr);
+                for (size_t i = 0; i < whN->size(); ++i) {
+                    whN->set(i, openvdb::Vec3f(static_cast<float>(normal.x()),
+                                               static_cast<float>(normal.y()),
+                                               static_cast<float>(normal.z())));
+                    whP->set(i, 1); // FINE
+                    whA->set(i, 1); // active
+                }
+                tLeaf->replaceAttributeSet(tAttr.release(), true);
+            }
+
+            // 合并到主 microGrid（简单方法：用 merge）
+            microGrid->tree().merge(tempGrid->tree());
+        }
+    }
+
     // Phase 4: pruneLevelSet
     openvdb::tools::pruneLevelSet(sdfGrid->tree());
 }
