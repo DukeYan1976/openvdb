@@ -206,6 +206,7 @@ int main() {
     static bool useDualTrack = false;
     static bool needRebuild = false;
     static float tolerance = 1.0f;  // 加工精度 t (mm)，控制模式自动切换
+    static float billetSize[3] = {30.0f, 30.0f, 15.0f};  // Lx, Ly, Lz
 #endif
 
     glfwSetWindowUserPointer(win, &cam);
@@ -285,10 +286,19 @@ int main() {
 
             // ── Tab: 切削控制 ──
             if (ImGui::BeginTabItem("Cutting")) {
-                ImGui::SliderFloat("Cut Y", &cutY, 2.0f, 28.0f);
-                ImGui::SliderFloat("Cut Z (sphere center)", &cutZ, 10.0f, 20.0f);
+                // 毛坯尺寸
+                ImGui::Text("Billet Size (mm):");
+                ImGui::SetNextItemWidth(200);
+                ImGui::InputFloat3("Lx Ly Lz", billetSize);
+                if (billetSize[0] < 5) billetSize[0] = 5;
+                if (billetSize[1] < 5) billetSize[1] = 5;
+                if (billetSize[2] < 5) billetSize[2] = 5;
+                ImGui::Separator();
+
+                ImGui::SliderFloat("Cut Y", &cutY, 2.0f, billetSize[1]-2.0f);
+                ImGui::SliderFloat("Cut Z (sphere center)", &cutZ, billetSize[2]*0.5f, billetSize[2]+5.0f);
                 ImGui::SliderFloat("Tool R", &cutR, 1.0f, 8.0f);
-                ImGui::Text("Cut depth: %.1f mm", 15.0f + cutR - cutZ);
+                ImGui::Text("Cut depth: %.1f mm", billetSize[2] + cutR - cutZ);
                 ImGui::Separator();
                 ImGui::Checkbox("Show Tool", &showTool);
                 if (showTool) {
@@ -306,7 +316,8 @@ int main() {
 
                 // 预览模式（不重建，仅显示将会切换到的模式）
                 auto previewCfg = ygg::solveResolution(
-                    (double)tolerance, (double)cutR, 2.0, {30, 30, 15});
+                    (double)tolerance, (double)cutR, 2.0,
+                    {(double)billetSize[0], (double)billetSize[1], (double)billetSize[2]});
                 const char* autoMode = previewCfg.mode == ygg::ResolutionConfig::SINGLE_TRACK ? "SINGLE_TRACK" :
                                        previewCfg.mode == ygg::ResolutionConfig::DUAL_TRACK ? "DUAL_TRACK" : "ATLAS";
                 ImVec4 modeColor = previewCfg.mode == ygg::ResolutionConfig::SINGLE_TRACK ?
@@ -320,7 +331,7 @@ int main() {
                 if (ImGui::Button("Apply")) {
                     auto t0 = std::chrono::high_resolution_clock::now();
                     cfg = previewCfg;
-                    billet = ygg::buildBillet(cfg, {0,0,0}, {30, 30, 15});
+                    billet = ygg::buildBillet(cfg, {0,0,0}, {(double)billetSize[0], (double)billetSize[1], (double)billetSize[2]});
                     mesh = ygg::vdbToMesh(billet.sdfGrid);
                     uploadMesh(mesh.vertices.data(), mesh.vertices.size()*sizeof(float),
                                mesh.indices.data(), mesh.indices.size()*sizeof(uint32_t),
@@ -356,7 +367,7 @@ int main() {
                 }
                 ImGui::SameLine();
                 if (ImGui::Button("Reset")) {
-                    billet = ygg::buildBillet(cfg, {0,0,0}, {30, 30, 15});
+                    billet = ygg::buildBillet(cfg, {0,0,0}, {(double)billetSize[0], (double)billetSize[1], (double)billetSize[2]});
                     mesh = ygg::vdbToMesh(billet.sdfGrid);
                     uploadMesh(mesh.vertices.data(), mesh.vertices.size()*sizeof(float),
                                mesh.indices.data(), mesh.indices.size()*sizeof(uint32_t),
@@ -417,9 +428,8 @@ int main() {
             // Clip plane
             float clipPlane[4] = {0,0,0,0};
             if (clipEnabled) {
-                float billetDims[3] = {30.0f, 30.0f, 15.0f};
                 clipPlane[clipAxis] = 1.0f;
-                clipPlane[3] = -(clipPos * billetDims[clipAxis]);
+                clipPlane[3] = -(clipPos * billetSize[clipAxis]);
                 glEnable(GL_CLIP_DISTANCE0);
             } else {
                 glDisable(GL_CLIP_DISTANCE0);
