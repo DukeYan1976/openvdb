@@ -65,7 +65,20 @@ static void cutSingleTrack_B(BilletModel& billet, const ToolSweepSDF& toolSDF) {
     auto minIdx = xform.worldToIndexCellCentered(bbox.min());
     auto maxIdx = xform.worldToIndexCellCentered(bbox.max());
 
-    // 遍历活跃体素，仅处理包围盒内的
+    // 先激活刀具BBox内的 inactive 负值体素
+    {
+        auto acc = grid->getAccessor();
+        openvdb::Coord ijk;
+        for (ijk[0] = minIdx[0]; ijk[0] <= maxIdx[0]; ++ijk[0])
+            for (ijk[1] = minIdx[1]; ijk[1] <= maxIdx[1]; ++ijk[1])
+                for (ijk[2] = minIdx[2]; ijk[2] <= maxIdx[2]; ++ijk[2]) {
+                    float val = acc.getValue(ijk);
+                    if (val < 0 && !acc.isValueOn(ijk))
+                        acc.setValueOn(ijk, val);
+                }
+    }
+
+    // 遍历活跃体素
     for (auto iter = grid->beginValueOn(); iter; ++iter) {
         auto coord = iter.getCoord();
         if (coord.x() < minIdx.x() || coord.x() > maxIdx.x() ||
@@ -99,6 +112,25 @@ static void cutSingleTrack_B_parallel(BilletModel& billet, const ToolSweepSDF& t
     auto minIdx = xform.worldToIndexCellCentered(bbox.min());
     auto maxIdx = xform.worldToIndexCellCentered(bbox.max());
 
+    // 关键：先将刀具BBox内的 inactive 负值区域激活为活跃体素
+    // （内部 tile 需要被展开为单独体素才能被窄带更新）
+    grid->tree().voxelizeActiveTiles();
+    // fill 刀具 BBox 内的区域为活跃（保留原值）
+    openvdb::CoordBBox idxBBox(minIdx, maxIdx);
+    auto acc = grid->getAccessor();
+    openvdb::Coord ijk;
+    for (ijk[0] = minIdx[0]; ijk[0] <= maxIdx[0]; ++ijk[0]) {
+        for (ijk[1] = minIdx[1]; ijk[1] <= maxIdx[1]; ++ijk[1]) {
+            for (ijk[2] = minIdx[2]; ijk[2] <= maxIdx[2]; ++ijk[2]) {
+                float val = acc.getValue(ijk);
+                if (val < 0 && !acc.isValueOn(ijk)) {
+                    acc.setValueOn(ijk, val);
+                }
+            }
+        }
+    }
+
+    // 并行遍历所有活跃体素
     using TreeT = openvdb::FloatGrid::TreeType;
     openvdb::tree::LeafManager<TreeT> leafMgr(grid->tree());
 
@@ -112,7 +144,6 @@ static void cutSingleTrack_B_parallel(BilletModel& billet, const ToolSweepSDF& t
                     leafOrigin.z() + 8 < minIdx.z() || leafOrigin.z() > maxIdx.z())
                     continue;
 
-                // 遍历叶节点内所有活跃体素（用 offset 安全写入）
                 for (auto it = leaf.beginValueOn(); it; ++it) {
                     auto coord = it.getCoord();
                     if (coord.x() < minIdx.x() || coord.x() > maxIdx.x() ||
