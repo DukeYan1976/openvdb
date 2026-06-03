@@ -384,10 +384,13 @@ int main() {
                                 buildTimeMs, mesh.vertices.size()/6,
                                 billet.sdfGrid->activeVoxelCount());
                 ImGui::Separator();
+                static int cutStrategy = 3; // D=parallel
+                ImGui::Combo("Cut Strategy", &cutStrategy, "A: Brute-force\0B: Active-only (serial)\0C: Rasterize+CSG\0D: Active-only (parallel)\0");
                 static double cutTimeMs = 0, meshTimeMs = 0, uploadTimeMs = 0;
                 if (ImGui::Button("Execute Cut")) {
                     auto tc0 = std::chrono::high_resolution_clock::now();
                     ygg::CuttingEngine engine;
+                    engine.strategy = static_cast<ygg::CuttingEngine::Strategy>(cutStrategy);
                     engine.cut(billet, ygg::ToolSweepSDF(
                         ygg::ToolType::BALL_END, cutR, 0, 20,
                         {2,(double)cutY,(double)cutZ}, {28,(double)cutY,(double)cutZ}));

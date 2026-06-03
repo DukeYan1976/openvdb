@@ -168,16 +168,13 @@ static void cutSingleTrack_C(BilletModel& billet, const ToolSweepSDF& toolSDF) {
     openvdb::tools::csgDifference(*grid, *toolGrid);
 }
 
-static void cutSingleTrack(BilletModel& billet, const ToolSweepSDF& toolSDF) {
-#if CUT_STRATEGY == A
-    cutSingleTrack_A(billet, toolSDF);
-#elif CUT_STRATEGY == C
-    cutSingleTrack_C(billet, toolSDF);
-#elif CUT_STRATEGY == D
-    cutSingleTrack_B_parallel(billet, toolSDF);
-#else
-    cutSingleTrack_B(billet, toolSDF);  // 方案B串行
-#endif
+static void cutSingleTrack(BilletModel& billet, const ToolSweepSDF& toolSDF, CuttingEngine::Strategy strat) {
+    switch (strat) {
+        case CuttingEngine::STRAT_A: cutSingleTrack_A(billet, toolSDF); break;
+        case CuttingEngine::STRAT_C: cutSingleTrack_C(billet, toolSDF); break;
+        case CuttingEngine::STRAT_D: cutSingleTrack_B_parallel(billet, toolSDF); break;
+        default: cutSingleTrack_B(billet, toolSDF); break;
+    }
 }
 
 // 双轨切削：4-phase 流程
@@ -414,7 +411,7 @@ static void cutDualTrack(BilletModel& billet, const ToolSweepSDF& toolSDF) {
 
 void CuttingEngine::cut(BilletModel& billet, const ToolSweepSDF& toolSDF) {
     if (billet.isSingleTrack()) {
-        cutSingleTrack(billet, toolSDF);
+        cutSingleTrack(billet, toolSDF, strategy);
     } else {
         cutDualTrack(billet, toolSDF);
     }
