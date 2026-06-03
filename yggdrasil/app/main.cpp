@@ -315,10 +315,13 @@ int main() {
                 if (tolerance > 10.0f) tolerance = 10.0f;
                 ImGui::Text("d_v = %.4f mm (= t/2)", tolerance * 0.5f);
 
-                // 预览模式（不重建，仅显示将会切换到的模式）
+                static float memBudgetMB = 500.0f; // 降低默认值让DUAL_TRACK更容易触发
+                ImGui::SliderFloat("Mem Budget (MB)", &memBudgetMB, 100.0f, 4000.0f);
+
                 auto previewCfg = ygg::solveResolution(
                     (double)tolerance, (double)cutR, 2.0,
-                    {(double)billetSize[0], (double)billetSize[1], (double)billetSize[2]});
+                    {(double)billetSize[0], (double)billetSize[1], (double)billetSize[2]},
+                    static_cast<size_t>(memBudgetMB * 1024 * 1024));
                 const char* autoMode = previewCfg.mode == ygg::ResolutionConfig::SINGLE_TRACK ? "SINGLE_TRACK" :
                                        previewCfg.mode == ygg::ResolutionConfig::DUAL_TRACK ? "DUAL_TRACK" : "ATLAS";
                 ImVec4 modeColor = previewCfg.mode == ygg::ResolutionConfig::SINGLE_TRACK ?
@@ -362,18 +365,30 @@ int main() {
                                 buildTimeMs, mesh.vertices.size()/6,
                                 billet.sdfGrid->activeVoxelCount());
                 ImGui::Separator();
+                static double cutTimeMs = 0, meshTimeMs = 0, uploadTimeMs = 0;
                 if (ImGui::Button("Execute Cut")) {
+                    auto tc0 = std::chrono::high_resolution_clock::now();
                     ygg::CuttingEngine engine;
                     engine.cut(billet, ygg::ToolSweepSDF(
                         ygg::ToolType::BALL_END, cutR, 0, 20,
                         {2,(double)cutY,(double)cutZ}, {28,(double)cutY,(double)cutZ}));
+                    auto tc1 = std::chrono::high_resolution_clock::now();
                     mesh = ygg::vdbToMesh(billet.sdfGrid);
+                    auto tc2 = std::chrono::high_resolution_clock::now();
                     uploadMesh(mesh.vertices.data(), mesh.vertices.size()*sizeof(float),
                                mesh.indices.data(), mesh.indices.size()*sizeof(uint32_t),
                                (int)mesh.indices.size());
+                    auto tc3 = std::chrono::high_resolution_clock::now();
                     volume = ygg::computeVolume(billet.sdfGrid);
                     cutCount++;
                     ptDirty = true;
+                    cutTimeMs = std::chrono::duration<double,std::milli>(tc1-tc0).count();
+                    meshTimeMs = std::chrono::duration<double,std::milli>(tc2-tc1).count();
+                    uploadTimeMs = std::chrono::duration<double,std::milli>(tc3-tc2).count();
+                }
+                if (cutTimeMs > 0) {
+                    ImGui::Text("Cut: %.1f ms | Mesh: %.1f ms | Upload: %.1f ms | Total: %.1f ms",
+                                cutTimeMs, meshTimeMs, uploadTimeMs, cutTimeMs+meshTimeMs+uploadTimeMs);
                 }
                 ImGui::SameLine();
                 if (ImGui::Button("Reset")) {

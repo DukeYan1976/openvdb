@@ -1,5 +1,6 @@
 #include "core/CuttingEngine.h"
 #include <openvdb/tools/Prune.h>
+#include <openvdb/tools/Composite.h>
 #include <openvdb/tools/LevelSetMeasure.h>
 #include <openvdb/points/PointCount.h>
 #include <openvdb/points/PointAttribute.h>
@@ -10,8 +11,19 @@
 
 namespace ygg {
 
-// 单轨切削（Phase 1 逻辑，不变）
-static void cutSingleTrack(BilletModel& billet, const ToolSweepSDF& toolSDF) {
+// ═══════════════════════════════════════════════════════════════════════
+// 单轨切削策略评估代码（3种方案，精度一致，比较效率和内存）
+// 选择方式：修改 CUT_STRATEGY 宏 (A / B / C)
+// A: 暴力包围盒遍历（基线，当前实现）
+// B: 仅遍历活跃体素 + 包围盒过滤（零额外内存）
+// C: 光栅化刀具SDF为Grid + csgDifferenceSDF（OpenVDB原生优化，需临时Grid）
+// ═══════════════════════════════════════════════════════════════════════
+#ifndef CUT_STRATEGY
+#define CUT_STRATEGY B  // 默认使用方案B
+#endif
+
+// 方案A: 暴力包围盒三重循环（基线）
+static void cutSingleTrack_A(BilletModel& billet, const ToolSweepSDF& toolSDF) {
     auto& grid = billet.sdfGrid;
     auto& xform = grid->transform();
     double voxelSize = xform.voxelSize()[0];
@@ -38,6 +50,82 @@ static void cutSingleTrack(BilletModel& billet, const ToolSweepSDF& toolSDF) {
         }
     }
     openvdb::tools::pruneLevelSet(grid->tree());
+}
+
+// 方案B: 仅遍历已有活跃体素（窄带），包围盒过滤跳过无关体素
+// 优势：零额外内存，只处理有数据的体素
+static void cutSingleTrack_B(BilletModel& billet, const ToolSweepSDF& toolSDF) {
+    auto& grid = billet.sdfGrid;
+    auto& xform = grid->transform();
+    double voxelSize = xform.voxelSize()[0];
+    float bandWidth = 3.0f * static_cast<float>(voxelSize);
+
+    auto bbox = toolSDF.getBoundingBox();
+    auto minIdx = xform.worldToIndexCellCentered(bbox.min());
+    auto maxIdx = xform.worldToIndexCellCentered(bbox.max());
+
+    // 遍历活跃体素，仅处理包围盒内的
+    for (auto iter = grid->beginValueOn(); iter; ++iter) {
+        auto coord = iter.getCoord();
+        if (coord.x() < minIdx.x() || coord.x() > maxIdx.x() ||
+            coord.y() < minIdx.y() || coord.y() > maxIdx.y() ||
+            coord.z() < minIdx.z() || coord.z() > maxIdx.z())
+            continue;
+
+        Vec3d worldPos = xform.indexToWorld(coord);
+        double toolDist = toolSDF.eval(worldPos);
+        if (toolDist < bandWidth) {
+            float billetVal = iter.getValue();
+            float newVal = std::max(billetVal, static_cast<float>(-toolDist));
+            if (newVal != billetVal)
+                iter.setValue(newVal);
+        }
+    }
+    openvdb::tools::pruneLevelSet(grid->tree());
+}
+
+// 方案C: 光栅化刀具SDF为临时Grid + csgDifferenceSDF
+// 优势：OpenVDB内部拓扑级优化；劣势：临时Grid内存开销
+static void cutSingleTrack_C(BilletModel& billet, const ToolSweepSDF& toolSDF) {
+    auto& grid = billet.sdfGrid;
+    auto& xform = grid->transform();
+    double voxelSize = xform.voxelSize()[0];
+    float bandWidth = 3.0f * static_cast<float>(voxelSize);
+
+    auto bbox = toolSDF.getBoundingBox();
+    auto minIdx = xform.worldToIndexCellCentered(bbox.min());
+    auto maxIdx = xform.worldToIndexCellCentered(bbox.max());
+
+    // 光栅化刀具SDF为临时Grid
+    auto toolGrid = openvdb::FloatGrid::create(bandWidth);
+    toolGrid->setTransform(grid->transformPtr());
+    toolGrid->setGridClass(openvdb::GRID_LEVEL_SET);
+
+    auto accessor = toolGrid->getAccessor();
+    openvdb::Coord ijk;
+    for (ijk[0] = minIdx[0]; ijk[0] <= maxIdx[0]; ++ijk[0]) {
+        for (ijk[1] = minIdx[1]; ijk[1] <= maxIdx[1]; ++ijk[1]) {
+            for (ijk[2] = minIdx[2]; ijk[2] <= maxIdx[2]; ++ijk[2]) {
+                Vec3d worldPos = xform.indexToWorld(ijk);
+                float dist = static_cast<float>(toolSDF.eval(worldPos));
+                if (std::abs(dist) < bandWidth)
+                    accessor.setValue(ijk, dist);
+            }
+        }
+    }
+
+    // OpenVDB 原生布尔差集
+    openvdb::tools::csgDifference(*grid, *toolGrid);
+}
+
+static void cutSingleTrack(BilletModel& billet, const ToolSweepSDF& toolSDF) {
+#if CUT_STRATEGY == A
+    cutSingleTrack_A(billet, toolSDF);
+#elif CUT_STRATEGY == C
+    cutSingleTrack_C(billet, toolSDF);
+#else
+    cutSingleTrack_B(billet, toolSDF);  // 默认方案B
+#endif
 }
 
 // 双轨切削：4-phase 流程
