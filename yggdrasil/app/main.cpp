@@ -10,6 +10,8 @@
 #include "core/BilletBuilder.h"
 #include "core/ToolSweepSDF.h"
 #include "core/CuttingEngine.h"
+#include <openvdb/points/PointCount.h>
+#include <openvdb/points/PointAttribute.h>
 #endif
 
 #include <cstdio>
@@ -24,10 +26,15 @@ layout(location=0) in vec3 aPos;
 layout(location=1) in vec3 aNorm;
 uniform mat4 uMVP;
 uniform mat3 uNormalMat;
+uniform vec4 uClipPlane;
 out vec3 vNorm;
+out float vClipDist;
 void main(){
     gl_Position = uMVP * vec4(aPos, 1.0);
     vNorm = normalize(uNormalMat * aNorm);
+    vClipDist = dot(aPos, uClipPlane.xyz) + uClipPlane.w;
+    gl_ClipDistance[0] = vClipDist;
+    gl_PointSize = 4.0;
 })";
 
 static const char* fragSrc = R"(
@@ -197,6 +204,23 @@ int main() {
         auto* c=(Camera*)glfwGetWindowUserPointer(w);
         c->dist-=(float)y*3; if(c->dist<5)c->dist=5;});
 
+    // ── Debug Viz State ──
+    static int renderMode = 0; // 0=Solid, 1=Wireframe, 2=Solid+Wire
+    static bool showMicroGrid = false;
+    static float pointSize = 4.0f;
+    static float wireWidth = 1.5f;
+    static bool clipEnabled = false;
+    static int clipAxis = 2;
+    static float clipPos = 0.5f;
+    static float macroColor[3] = {0.7f, 0.75f, 0.8f};
+    static float microColorActive[3] = {0.1f, 0.85f, 0.3f};
+    static float microColorInactive[3] = {0.85f, 0.1f, 0.1f};
+
+    // ── MicroGrid point cloud data ──
+    static GLuint ptVAO = 0, ptVBO = 0;
+    static int ptCount = 0;
+    static bool ptDirty = true;
+
     while (!glfwWindowShouldClose(win)) {
         glfwPollEvents();
 
@@ -213,44 +237,107 @@ int main() {
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        ImGui::Begin("Control Panel");
-        ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
+        ImGui::Begin("Yggdrasil Debug Panel", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+
 #if YGG_HAS_OPENVDB
-        ImGui::Text("Volume: %.1f mm3", volume);
-        ImGui::Text("Cuts: %d", cutCount);
+        // ══════ 状态概览栏 ══════
+        ImGui::TextColored(ImVec4(0.4f,0.8f,1.0f,1.0f), "⚙ Simulation State");
         ImGui::Separator();
-        ImGui::SliderFloat("Cut Y", &cutY, 2.0f, 28.0f);
-        ImGui::SliderFloat("Tool R", &cutR, 1.0f, 8.0f);
-        if (ImGui::Button("Execute Cut")) {
-            ygg::CuttingEngine engine;
-            engine.cut(billet, ygg::ToolSweepSDF(
-                ygg::ToolType::BALL_END, cutR, 0, 20,
-                {2,(double)cutY,0}, {28,(double)cutY,0}));
-            mesh = ygg::vdbToMesh(billet.sdfGrid);
-            printf("After cut: %zu verts, %zu indices\n",
-                   mesh.vertices.size()/6, mesh.indices.size());
-            uploadMesh(mesh.vertices.data(), mesh.vertices.size()*sizeof(float),
-                       mesh.indices.data(), mesh.indices.size()*sizeof(uint32_t),
-                       (int)mesh.indices.size());
-            volume = ygg::computeVolume(billet.sdfGrid);
-            printf("Volume after cut: %.1f\n", volume);
-            cutCount++;
+        const char* modeStr = cfg.mode == ygg::ResolutionConfig::SINGLE_TRACK ? "SINGLE_TRACK" :
+                              cfg.mode == ygg::ResolutionConfig::DUAL_TRACK ? "DUAL_TRACK" : "ATLAS";
+        ImGui::Text("Mode: %s | d_v=%.3f D_v=%.3f N=%d", modeStr, cfg.d_v, cfg.D_v, cfg.N);
+        ImGui::Text("Volume: %.1f mm³ | Cuts: %d", volume, cutCount);
+        size_t activeVox = billet.sdfGrid->activeVoxelCount();
+        ImGui::Text("FloatGrid: %zu voxels (%.2f MB)",
+                    activeVox, billet.sdfGrid->memUsage()/1e6);
+        if (billet.microGrid) {
+            size_t ptCnt = openvdb::points::pointCount(billet.microGrid->tree());
+            ImGui::Text("PointGrid: %zu surfels (%.2f MB)",
+                        ptCnt, billet.microGrid->memUsage()/1e6);
         }
-        if (ImGui::Button("Reset Billet")) {
-            billet = ygg::buildBillet(cfg, {0,0,0}, {30, 30, 15});
-            mesh = ygg::vdbToMesh(billet.sdfGrid);
-            uploadMesh(mesh.vertices.data(), mesh.vertices.size()*sizeof(float),
-                       mesh.indices.data(), mesh.indices.size()*sizeof(uint32_t),
-                       (int)mesh.indices.size());
-            volume = ygg::computeVolume(billet.sdfGrid);
-            cutCount = 0;
+        ImGui::Spacing();
+
+        // ══════ TabBar ══════
+        if (ImGui::BeginTabBar("DebugTabs")) {
+            // ── Tab: 外观模式 ──
+            if (ImGui::BeginTabItem("Appearance")) {
+                ImGui::Text("Render Mode:");
+                ImGui::RadioButton("Solid", &renderMode, 0); ImGui::SameLine();
+                ImGui::RadioButton("Wireframe", &renderMode, 1); ImGui::SameLine();
+                ImGui::RadioButton("Solid+Wire", &renderMode, 2);
+
+                ImGui::Checkbox("Show MicroGrid Points", &showMicroGrid);
+                ImGui::SliderFloat("Point Size", &pointSize, 1.0f, 10.0f);
+                ImGui::SliderFloat("Wire Width", &wireWidth, 0.5f, 5.0f);
+                ImGui::ColorEdit3("Macro Color", macroColor);
+                ImGui::ColorEdit3("Micro Active", microColorActive);
+                ImGui::EndTabItem();
+            }
+
+            // ── Tab: 切削控制 ──
+            if (ImGui::BeginTabItem("Cutting")) {
+                ImGui::SliderFloat("Cut Y", &cutY, 2.0f, 28.0f);
+                ImGui::SliderFloat("Tool R", &cutR, 1.0f, 8.0f);
+                if (ImGui::Button("Execute Cut")) {
+                    ygg::CuttingEngine engine;
+                    engine.cut(billet, ygg::ToolSweepSDF(
+                        ygg::ToolType::BALL_END, cutR, 0, 20,
+                        {2,(double)cutY,0}, {28,(double)cutY,0}));
+                    mesh = ygg::vdbToMesh(billet.sdfGrid);
+                    uploadMesh(mesh.vertices.data(), mesh.vertices.size()*sizeof(float),
+                               mesh.indices.data(), mesh.indices.size()*sizeof(uint32_t),
+                               (int)mesh.indices.size());
+                    volume = ygg::computeVolume(billet.sdfGrid);
+                    cutCount++;
+                    ptDirty = true;
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Reset")) {
+                    billet = ygg::buildBillet(cfg, {0,0,0}, {30, 30, 15});
+                    mesh = ygg::vdbToMesh(billet.sdfGrid);
+                    uploadMesh(mesh.vertices.data(), mesh.vertices.size()*sizeof(float),
+                               mesh.indices.data(), mesh.indices.size()*sizeof(uint32_t),
+                               (int)mesh.indices.size());
+                    volume = ygg::computeVolume(billet.sdfGrid);
+                    cutCount = 0;
+                    ptDirty = true;
+                }
+                ImGui::EndTabItem();
+            }
+
+            // ── Tab: 数据检查 ──
+            if (ImGui::BeginTabItem("Inspect")) {
+                ImGui::Checkbox("Clip Plane", &clipEnabled);
+                if (clipEnabled) {
+                    ImGui::RadioButton("X", &clipAxis, 0); ImGui::SameLine();
+                    ImGui::RadioButton("Y", &clipAxis, 1); ImGui::SameLine();
+                    ImGui::RadioButton("Z", &clipAxis, 2);
+                    ImGui::SliderFloat("Position", &clipPos, 0.0f, 1.0f);
+                }
+                ImGui::EndTabItem();
+            }
+
+            // ── Tab: 性能 ──
+            if (ImGui::BeginTabItem("Performance")) {
+                ImGui::Text("FPS: %.1f (%.2f ms)", ImGui::GetIO().Framerate, 1000.0f/ImGui::GetIO().Framerate);
+                ImGui::Text("Mesh vertices: %zu", mesh.vertices.size()/6);
+                ImGui::Text("Mesh indices: %zu", mesh.indices.size());
+                ImGui::Separator();
+                ImGui::Text("FloatGrid: %.2f MB", billet.sdfGrid->memUsage()/1e6);
+                if (billet.microGrid)
+                    ImGui::Text("PointGrid: %.2f MB", billet.microGrid->memUsage()/1e6);
+                ImGui::EndTabItem();
+            }
+
+            ImGui::EndTabBar();
         }
 #else
-        ImGui::Text("OpenVDB not enabled. Window-only mode.");
+        ImGui::Text("OpenVDB not enabled.");
 #endif
         ImGui::End();
         ImGui::Render();
 
+        // ══════ Render ══════
         int w, h; glfwGetFramebufferSize(win, &w, &h);
         glViewport(0, 0, w, h);
         glClearColor(0.15f, 0.15f, 0.18f, 1.0f);
@@ -263,10 +350,112 @@ int main() {
             glUniformMatrix4fv(glGetUniformLocation(g_prog,"uMVP"),1,GL_FALSE,mvp);
             glUniformMatrix3fv(glGetUniformLocation(g_prog,"uNormalMat"),1,GL_FALSE,nm);
             glUniform3f(glGetUniformLocation(g_prog,"uLightDir"),0.30f,0.51f,0.81f);
-            glUniform3f(glGetUniformLocation(g_prog,"uColor"),0.7f,0.75f,0.8f);
-            glBindVertexArray(g_VAO);
-            glDrawElements(GL_TRIANGLES, g_idxCount, GL_UNSIGNED_INT, nullptr);
+
+            // Clip plane
+            float clipPlane[4] = {0,0,0,0};
+            if (clipEnabled) {
+                float billetDims[3] = {30.0f, 30.0f, 15.0f};
+                clipPlane[clipAxis] = 1.0f;
+                clipPlane[3] = -(clipPos * billetDims[clipAxis]);
+                glEnable(GL_CLIP_DISTANCE0);
+            } else {
+                glDisable(GL_CLIP_DISTANCE0);
+            }
+            glUniform4f(glGetUniformLocation(g_prog,"uClipPlane"),
+                        clipPlane[0], clipPlane[1], clipPlane[2], clipPlane[3]);
+
+            // Solid pass
+            if (renderMode == 0 || renderMode == 2) {
+                glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+                glUniform3f(glGetUniformLocation(g_prog,"uColor"),
+                            macroColor[0], macroColor[1], macroColor[2]);
+                glBindVertexArray(g_VAO);
+                glDrawElements(GL_TRIANGLES, g_idxCount, GL_UNSIGNED_INT, nullptr);
+            }
+            // Wireframe pass
+            if (renderMode == 1 || renderMode == 2) {
+                glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+                glLineWidth(wireWidth);
+                glEnable(GL_POLYGON_OFFSET_LINE);
+                glPolygonOffset(-1.0f, -1.0f);
+                glUniform3f(glGetUniformLocation(g_prog,"uColor"), 0.2f, 0.2f, 0.25f);
+                glBindVertexArray(g_VAO);
+                glDrawElements(GL_TRIANGLES, g_idxCount, GL_UNSIGNED_INT, nullptr);
+                glDisable(GL_POLYGON_OFFSET_LINE);
+                glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+            }
+
+            glDisable(GL_CLIP_DISTANCE0);
         }
+
+#if YGG_HAS_OPENVDB
+        // ── MicroGrid point cloud rendering ──
+        if (showMicroGrid && billet.microGrid) {
+            if (ptDirty) {
+                // Extract surfel positions + colors
+                std::vector<float> ptData; // x,y,z,r,g,b per point
+                auto& tree = billet.microGrid->tree();
+                auto& xf = billet.microGrid->transform();
+                for (auto leaf = tree.cbeginLeaf(); leaf; ++leaf) {
+                    auto leafOrigin = leaf->origin();
+                    auto& attrSet = leaf->attributeSet();
+                    auto* posArr = attrSet.get("P");
+                    auto* activeArr = attrSet.get("active");
+                    if (!posArr || !activeArr) continue;
+                    auto ph = openvdb::points::AttributeHandle<openvdb::Vec3f>::create(*posArr);
+                    auto ah = openvdb::points::AttributeHandle<uint8_t>::create(*activeArr);
+
+                    for (openvdb::Index vIdx = 0; vIdx < 512; ++vIdx) {
+                        openvdb::Index end = static_cast<openvdb::Index>(leaf->getValue(vIdx));
+                        openvdb::Index start = (vIdx==0) ? openvdb::Index(0) :
+                            static_cast<openvdb::Index>(leaf->getValue(vIdx-1));
+                        openvdb::Coord lc((vIdx>>6)&7,(vIdx>>3)&7,vIdx&7);
+                        openvdb::Coord vc = leafOrigin + lc;
+                        for (openvdb::Index i = start; i < end; ++i) {
+                            auto p = ph->get(i);
+                            auto wp = xf.indexToWorld(openvdb::Vec3d(
+                                vc.x()+p.x(), vc.y()+p.y(), vc.z()+p.z()));
+                            ptData.push_back(float(wp.x()));
+                            ptData.push_back(float(wp.y()));
+                            ptData.push_back(float(wp.z()));
+                            if (ah->get(i) == 1) {
+                                ptData.push_back(microColorActive[0]);
+                                ptData.push_back(microColorActive[1]);
+                                ptData.push_back(microColorActive[2]);
+                            } else {
+                                ptData.push_back(microColorInactive[0]);
+                                ptData.push_back(microColorInactive[1]);
+                                ptData.push_back(microColorInactive[2]);
+                            }
+                        }
+                    }
+                }
+                ptCount = (int)(ptData.size() / 6);
+                if (!ptVAO) { glGenVertexArrays(1, &ptVAO); glGenBuffers(1, &ptVBO); }
+                glBindVertexArray(ptVAO);
+                glBindBuffer(GL_ARRAY_BUFFER, ptVBO);
+                glBufferData(GL_ARRAY_BUFFER, ptData.size()*sizeof(float), ptData.data(), GL_DYNAMIC_DRAW);
+                glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6*sizeof(float), (void*)0);
+                glEnableVertexAttribArray(0);
+                glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6*sizeof(float), (void*)(3*sizeof(float)));
+                glEnableVertexAttribArray(1);
+                ptDirty = false;
+            }
+            if (ptCount > 0) {
+                float mvp[16], nm[9];
+                buildMVP(cam, w, h, mvp, nm);
+                glUseProgram(g_prog);
+                glUniformMatrix4fv(glGetUniformLocation(g_prog,"uMVP"),1,GL_FALSE,mvp);
+                glUniform3f(glGetUniformLocation(g_prog,"uLightDir"),0,0,1);
+                glPointSize(pointSize);
+                glEnable(GL_PROGRAM_POINT_SIZE);
+                glBindVertexArray(ptVAO);
+                // Use vertex color as uColor trick: set uColor to white, multiply in shader
+                glUniform3f(glGetUniformLocation(g_prog,"uColor"), 1.0f, 1.0f, 1.0f);
+                glDrawArrays(GL_POINTS, 0, ptCount);
+            }
+        }
+#endif
 
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         glfwSwapBuffers(win);
