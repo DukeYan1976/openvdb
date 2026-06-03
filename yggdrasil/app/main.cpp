@@ -88,21 +88,25 @@ static void uploadMesh(const float* verts, size_t vertBytes,
     g_idxCount = count;
 }
 
-// --- Camera ---
-struct Camera { float dist=60, yaw=45, pitch=30, tx=15, ty=15, tz=5; };
+// --- Camera (CAD-style orbit, orthographic) ---
+struct Camera {
+    float yaw = 45, pitch = 30;         // orbit angles (degrees)
+    float tx = 15, ty = 15, tz = 7.5f;  // target (rotation center)
+    float orthoSize = 25.0f;            // half-width of ortho viewport (mm)
+    float dist = 200.0f;                // eye distance (for view matrix)
+};
 
 static void buildMVP(const Camera& c, int w, int h, float mvp[16], float nm[9]) {
-    // Perspective projection (column-major)
-    float asp = (float)w/(float)h;
-    float fov = 45.0f * 3.14159f / 180.0f;
-    float zNear = 0.1f, zFar = 500.0f;
-    float t = tanf(fov * 0.5f);
+    float asp = (float)w / (float)h;
+    float zNear = 0.1f, zFar = 1000.0f;
+
+    // Orthographic projection (column-major)
     float P[16] = {0};
-    P[0]  = 1.0f / (asp * t);
-    P[5]  = 1.0f / t;
-    P[10] = -(zFar + zNear) / (zFar - zNear);
-    P[11] = -1.0f;
-    P[14] = -2.0f * zFar * zNear / (zFar - zNear);
+    P[0]  = 1.0f / (asp * c.orthoSize);
+    P[5]  = 1.0f / c.orthoSize;
+    P[10] = -2.0f / (zFar - zNear);
+    P[14] = -(zFar + zNear) / (zFar - zNear);
+    P[15] = 1.0f;
 
     // Camera position
     float yr = c.yaw * 3.14159f / 180.0f;
@@ -212,13 +216,16 @@ int main() {
     glfwSetWindowUserPointer(win, &cam);
     glfwSetScrollCallback(win, [](GLFWwindow* w, double, double y){
         auto* c=(Camera*)glfwGetWindowUserPointer(w);
-        c->dist-=(float)y*3; if(c->dist<1)c->dist=1;});
+        c->orthoSize *= (y > 0) ? 0.9f : 1.1f;
+        if(c->orthoSize < 1.0f) c->orthoSize = 1.0f;
+        if(c->orthoSize > 500.0f) c->orthoSize = 500.0f;
+    });
 
     glfwSetKeyCallback(win, [](GLFWwindow* w, int key, int, int action, int){
         if (key == GLFW_KEY_F && action == GLFW_PRESS) {
-            // Zoom All: reset camera to fit billet
             auto* c=(Camera*)glfwGetWindowUserPointer(w);
-            c->dist=60; c->yaw=45; c->pitch=30; c->tx=15; c->ty=15; c->tz=7.5f;
+            c->orthoSize = 25.0f; c->yaw = 45; c->pitch = 30;
+            c->tx = 15; c->ty = 15; c->tz = 7.5f;
         }
     });
 
@@ -242,25 +249,42 @@ int main() {
     while (!glfwWindowShouldClose(win)) {
         glfwPollEvents();
 
-        // Orbit drag (Right mouse)
-        if (glfwGetMouseButton(win, GLFW_MOUSE_BUTTON_RIGHT)==GLFW_PRESS) {
-            double mx,my; glfwGetCursorPos(win,&mx,&my);
-            if(!drag){drag=true;lx=mx;ly=my;}
-            cam.yaw+=(float)(mx-lx)*0.3f; cam.pitch+=(float)(ly-my)*0.3f;
-            if(cam.pitch>89)cam.pitch=89; if(cam.pitch<-89)cam.pitch=-89;
-            lx=mx;ly=my;
-        // Pan (Middle mouse)
-        } else if (glfwGetMouseButton(win, GLFW_MOUSE_BUTTON_MIDDLE)==GLFW_PRESS) {
-            double mx,my; glfwGetCursorPos(win,&mx,&my);
-            if(!drag){drag=true;lx=mx;ly=my;}
-            float panSpeed = cam.dist * 0.003f;
-            float yr = cam.yaw * 3.14159f / 180.0f;
-            // Pan in screen-space right/up directions
-            cam.tx -= (float)(mx-lx) * panSpeed * cosf(yr);
-            cam.ty -= (float)(mx-lx) * panSpeed * sinf(yr);
-            cam.tz += (float)(my-ly) * panSpeed;
-            lx=mx;ly=my;
-        } else drag=false;
+        // CAD-style mouse interaction
+        // Middle button = rotate, Middle+Shift or Right = pan
+        {
+            double mx, my; glfwGetCursorPos(win, &mx, &my);
+            bool mmb = glfwGetMouseButton(win, GLFW_MOUSE_BUTTON_MIDDLE) == GLFW_PRESS;
+            bool rmb = glfwGetMouseButton(win, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
+            bool shift = (glfwGetKey(win, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS ||
+                          glfwGetKey(win, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS);
+
+            if (mmb || rmb) {
+                if (!drag) { drag = true; lx = mx; ly = my; }
+                double dx = mx - lx, dy = my - ly;
+
+                if (mmb && !shift) {
+                    // Rotate
+                    cam.yaw += (float)dx * 0.3f;
+                    cam.pitch += (float)dy * 0.3f;
+                    if (cam.pitch > 89) cam.pitch = 89;
+                    if (cam.pitch < -89) cam.pitch = -89;
+                } else {
+                    // Pan (Shift+MMB or RMB)
+                    int vw, vh; glfwGetFramebufferSize(win, &vw, &vh);
+                    float panScale = 2.0f * cam.orthoSize / (float)vh;
+                    float yr = cam.yaw * 3.14159f / 180.0f;
+                    float pr = cam.pitch * 3.14159f / 180.0f;
+                    // Screen right/up in world space
+                    float rx = -sinf(yr), ry = cosf(yr);
+                    cam.tx += (float)dx * panScale * rx;
+                    cam.ty += (float)dx * panScale * ry;
+                    cam.tz += (float)dy * panScale * cosf(pr);
+                }
+                lx = mx; ly = my;
+            } else {
+                drag = false;
+            }
+        }
 
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
@@ -520,7 +544,7 @@ int main() {
                 // 重建刀具 mesh（用 SDF 球体光栅化 + volumeToMesh）
                 auto toolXform = openvdb::math::Transform::createLinearTransform(0.3);
                 auto toolSphere = openvdb::tools::createLevelSetSphere<openvdb::FloatGrid>(
-                    float(cutR), openvdb::Vec3f(15.0f, cutY, cutZ), float(0.5), float(3.0));
+                    float(cutR), openvdb::Vec3f(28.0f, cutY, cutZ), float(0.5), float(3.0));
                 auto toolMesh = ygg::vdbToMesh(toolSphere);
                 if (!toolVAO) { glGenVertexArrays(1,&toolVAO); glGenBuffers(1,&toolVBO); glGenBuffers(1,&toolEBO); }
                 glBindVertexArray(toolVAO);
