@@ -312,6 +312,7 @@ int main() {
                 ImGui::SetNextItemWidth(80);
                 ImGui::InputFloat("t (mm)", &tolerance, 0, 0, "%.4f");
                 if (tolerance < 0.001f) tolerance = 0.001f;
+                if (tolerance > 10.0f) tolerance = 10.0f;
                 ImGui::Text("d_v = %.4f mm (= t/2)", tolerance * 0.5f);
 
                 // 预览模式（不重建，仅显示将会切换到的模式）
