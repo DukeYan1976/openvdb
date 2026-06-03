@@ -204,6 +204,7 @@ int main() {
     static float toolCutColor[3] = {0.2f, 0.6f, 1.0f};
     static bool useDualTrack = false;
     static bool needRebuild = false;
+    static float tolerance = 1.0f;  // 加工精度 t (mm)，控制模式自动切换
 #endif
 
     glfwSetWindowUserPointer(win, &cam);
@@ -294,17 +295,23 @@ int main() {
                     ImGui::ColorEdit3("Cut Zone Color", toolCutColor);
                 }
                 ImGui::Separator();
-                if (ImGui::Checkbox("Dual Track Mode", &useDualTrack)) {
-                    needRebuild = true;
-                }
-                if (needRebuild) {
-                    if (useDualTrack) {
-                        cfg.mode = ygg::ResolutionConfig::DUAL_TRACK;
-                        cfg.d_v = 0.5; cfg.D_v = 4.0; cfg.N = 8;
-                    } else {
-                        cfg.mode = ygg::ResolutionConfig::SINGLE_TRACK;
-                        cfg.d_v = 0.5; cfg.D_v = 0.5; cfg.N = 1;
-                    }
+                ImGui::Text("Precision Control:");
+                float prevTol = tolerance;
+                ImGui::SliderFloat("Tolerance t (mm)", &tolerance, 0.001f, 2.0f, "%.4f", ImGuiSliderFlags_Logarithmic);
+                ImGui::Text("d_v = %.4f mm (= t/2)", tolerance * 0.5f);
+
+                // 自动计算模式
+                auto newCfg = ygg::solveResolution(
+                    (double)tolerance, (double)cutR, 2.0, {30, 30, 15});
+                const char* autoMode = newCfg.mode == ygg::ResolutionConfig::SINGLE_TRACK ? "SINGLE_TRACK" :
+                                       newCfg.mode == ygg::ResolutionConfig::DUAL_TRACK ? "DUAL_TRACK" : "ATLAS";
+                ImVec4 modeColor = newCfg.mode == ygg::ResolutionConfig::SINGLE_TRACK ?
+                    ImVec4(0.3f,1.0f,0.3f,1.0f) : ImVec4(1.0f,0.8f,0.2f,1.0f);
+                ImGui::TextColored(modeColor, "Auto Mode: %s (D_v=%.3f N=%d)",
+                                   autoMode, newCfg.D_v, newCfg.N);
+
+                if (tolerance != prevTol || needRebuild) {
+                    cfg = newCfg;
                     billet = ygg::buildBillet(cfg, {0,0,0}, {30, 30, 15});
                     mesh = ygg::vdbToMesh(billet.sdfGrid);
                     uploadMesh(mesh.vertices.data(), mesh.vertices.size()*sizeof(float),
@@ -314,6 +321,7 @@ int main() {
                     cutCount = 0;
                     ptDirty = true;
                     needRebuild = false;
+                    useDualTrack = (cfg.mode == ygg::ResolutionConfig::DUAL_TRACK);
                 }
                 ImGui::Separator();
                 if (ImGui::Button("Execute Cut")) {
