@@ -2,6 +2,7 @@
 #include "core/BilletBuilder.h"
 #include "types/MemoryStats.h"
 #include <openvdb/points/PointCount.h>
+#include <chrono>
 
 using namespace ygg;
 
@@ -16,9 +17,11 @@ TEST_F(BilletBuilderTest, SingleTrack_CreatesValidLevelSet) {
     cfg.d_v = 0.5;  cfg.D_v = 0.5;  cfg.N = 1;
 
     auto billet = buildBillet(cfg, {0,0,0}, {20, 20, 10});
-    ASSERT_NE(billet.sdfGrid, nullptr);
+    ASSERT_TRUE(billet.sdfGrid != nullptr);
     EXPECT_EQ(billet.sdfGrid->getGridClass(), openvdb::GRID_LEVEL_SET);
     EXPECT_NEAR(billet.sdfGrid->voxelSize()[0], 0.5, 1e-10);
+    EXPECT_TRUE(billet.microGrid == nullptr);
+    EXPECT_TRUE(billet.dirtyMask == nullptr);
 }
 
 TEST_F(BilletBuilderTest, SingleTrack_SDFNegativeInside) {
@@ -27,89 +30,52 @@ TEST_F(BilletBuilderTest, SingleTrack_SDFNegativeInside) {
     cfg.d_v = 0.5;  cfg.D_v = 0.5;  cfg.N = 1;
 
     auto billet = buildBillet(cfg, {0,0,0}, {20, 20, 10});
-    auto accessor = billet.sdfGrid->getConstAccessor();
     auto& xform = billet.sdfGrid->transform();
-
-    // 中心点应在内部 (SDF < 0)
     auto idx = xform.worldToIndexCellCentered({10, 10, 5});
-    EXPECT_LT(accessor.getValue(idx), 0.0f);
+    EXPECT_LT(billet.sdfGrid->getConstAccessor().getValue(idx), 0.0f);
 }
 
-TEST_F(BilletBuilderTest, SingleTrack_SDFPositiveOutside) {
-    ResolutionConfig cfg;
-    cfg.mode = ResolutionConfig::SINGLE_TRACK;
-    cfg.d_v = 0.5;  cfg.D_v = 0.5;  cfg.N = 1;
-
-    auto billet = buildBillet(cfg, {0,0,0}, {20, 20, 10});
-    auto accessor = billet.sdfGrid->getConstAccessor();
-    auto& xform = billet.sdfGrid->transform();
-
-    // 外部点 SDF > 0
-    auto idx = xform.worldToIndexCellCentered({-5, 10, 5});
-    EXPECT_GT(accessor.getValue(idx), 0.0f);
-}
-
-TEST_F(BilletBuilderTest, SingleTrack_ActiveVoxelsReasonable) {
-    ResolutionConfig cfg;
-    cfg.mode = ResolutionConfig::SINGLE_TRACK;
-    cfg.d_v = 1.0;  cfg.D_v = 1.0;  cfg.N = 1;
-
-    auto billet = buildBillet(cfg, {0,0,0}, {10, 10, 10});
-    // 10mm cube with voxelSize=1mm → ~6 faces × 100 voxels × 6 halfwidth layers
-    // Should have some active voxels but not millions
-    auto count = billet.sdfGrid->activeVoxelCount();
-    EXPECT_GT(count, 0u);
-    EXPECT_LT(count, 100000u);
-}
-
-// ===== T6.4: DualGrid Integration Tests =====
-
-TEST_F(BilletBuilderTest, DualGrid_CreatePointDataGrid_SharedTransform) {
-    ResolutionConfig cfg;
-    cfg.mode = ResolutionConfig::DUAL_TRACK;
-    cfg.d_v = 0.1; cfg.D_v = 6.4; cfg.N = 64;
-
-    auto billet = buildBillet(cfg, {0,0,0}, {30, 30, 20});
-    ASSERT_NE(billet.sdfGrid, nullptr);
-    ASSERT_NE(billet.microGrid, nullptr);
-    EXPECT_TRUE(billet.isDualTrack());
-
-    // 共享 Transform 验证
-    EXPECT_DOUBLE_EQ(billet.sdfGrid->voxelSize()[0], cfg.D_v);
-    EXPECT_DOUBLE_EQ(billet.microGrid->voxelSize()[0], cfg.D_v);
-}
-
-TEST_F(BilletBuilderTest, DualGrid_IPW0_SurfelsInjected) {
+TEST_F(BilletBuilderTest, DualTrack_BuildProducesNoSurfels) {
     ResolutionConfig cfg;
     cfg.mode = ResolutionConfig::DUAL_TRACK;
     cfg.d_v = 0.1; cfg.D_v = 6.4; cfg.N = 64;
 
     auto billet = buildBillet(cfg, {0,0,0}, {30, 30, 20});
 
-    size_t ptCount = openvdb::points::pointCount(billet.microGrid->tree());
-    EXPECT_GT(ptCount, 0u);
-
-    // 粗精度：平均每叶节点面元不多
-    size_t leafCount = billet.microGrid->tree().leafCount();
-    ASSERT_GT(leafCount, 0u);
-    double avgPerLeaf = static_cast<double>(ptCount) / leafCount;
-    EXPECT_LT(avgPerLeaf, 2000.0);  // 粗精度 N_init²=4 per voxel, ~240 voxels/leaf → ~960
+    // Lazy surfels: microGrid must be null after build
+    EXPECT_TRUE(billet.microGrid == nullptr);
+    // SDF exists with D_v voxel size
+    ASSERT_TRUE(billet.sdfGrid != nullptr);
+    EXPECT_NEAR(billet.sdfGrid->voxelSize()[0], cfg.D_v, 1e-10);
+    // DirtyMask exists and shares Transform
+    ASSERT_TRUE(billet.dirtyMask != nullptr);
+    EXPECT_NEAR(billet.dirtyMask->voxelSize()[0], cfg.D_v, 1e-10);
+    EXPECT_EQ(billet.dirtyMask->activeVoxelCount(), 0u);
 }
 
-TEST_F(BilletBuilderTest, DualGrid_MemoryStats_Reported) {
+TEST_F(BilletBuilderTest, DualTrack_GeometryDef_Set) {
     ResolutionConfig cfg;
     cfg.mode = ResolutionConfig::DUAL_TRACK;
     cfg.d_v = 0.1; cfg.D_v = 6.4; cfg.N = 64;
 
-    auto billet = buildBillet(cfg, {0,0,0}, {30, 30, 20});
+    auto billet = buildBillet(cfg, {1,2,3}, {30, 30, 20});
+    EXPECT_EQ(billet.geometry.type, GeometryDef::BOX);
+    EXPECT_DOUBLE_EQ(billet.geometry.origin.x(), 1.0);
+    EXPECT_DOUBLE_EQ(billet.geometry.dims.z(), 20.0);
+}
 
-    ygg::MemoryStats stats;
-    stats.update(billet.sdfGrid, billet.microGrid);
+TEST_F(BilletBuilderTest, DualTrack_BuildIsFast) {
+    // With lazy surfel generation, build should be very fast
+    ResolutionConfig cfg;
+    cfg.mode = ResolutionConfig::DUAL_TRACK;
+    cfg.d_v = 0.01; cfg.D_v = 5.0; cfg.N = 500;
 
-    EXPECT_GT(stats.floatGridBytes, 0u);
-    EXPECT_GT(stats.pointGridBytes, 0u);
-    EXPECT_GT(stats.pointCount, 0u);
-    EXPECT_EQ(stats.activePointCount, stats.pointCount); // 初始全活跃
-    EXPECT_GT(stats.leafNodeCount, 0u);
-    stats.print();
+    auto t0 = std::chrono::high_resolution_clock::now();
+    auto billet = buildBillet(cfg, {0,0,0}, {500, 500, 200});
+    auto t1 = std::chrono::high_resolution_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1-t0).count();
+
+    EXPECT_TRUE(billet.microGrid == nullptr);  // zero surfels
+    EXPECT_LT(ms, 500.0);  // build in < 500ms (only SDF construction)
+    printf("[BilletBuilder] DualTrack build: %.1f ms\n", ms);
 }

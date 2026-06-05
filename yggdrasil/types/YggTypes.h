@@ -27,10 +27,21 @@ struct ResolutionConfig {
     int atlas_divisions = 0;
 };
 
+struct GeometryDef {
+    enum Type { BOX, CYLINDER, MESH };
+    Type type = BOX;
+    Vec3d origin{0, 0, 0};
+    Vec3d dims{0, 0, 0};       // BOX dimensions
+    double radius = 0;          // CYLINDER
+    double height = 0;          // CYLINDER
+};
+
 struct BilletModel {
     openvdb::FloatGrid::Ptr sdfGrid;
-    openvdb::points::PointDataGrid::Ptr microGrid;  // 面元网格（与 sdfGrid 共享 Transform）
+    openvdb::points::PointDataGrid::Ptr microGrid;  // 面元（延迟创建，初始 nullptr）
+    openvdb::MaskGrid::Ptr dirtyMask;               // 脏区标记
 
+    GeometryDef geometry;
     ResolutionConfig config;
     Vec3d origin;
     Vec3d dims;

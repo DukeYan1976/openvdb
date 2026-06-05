@@ -1,4 +1,5 @@
 #include "core/CuttingEngine.h"
+#include "core/SurfelGenerator.h"
 #include <openvdb/tools/Prune.h>
 #include <openvdb/tools/Composite.h>
 #include <openvdb/tools/Interpolation.h>
@@ -6,8 +7,12 @@
 #include <openvdb/points/PointCount.h>
 #include <openvdb/points/PointAttribute.h>
 #include <openvdb/points/PointConversion.h>
+#include <openvdb/tree/LeafManager.h>
+#include <tbb/parallel_for.h>
+#include <tbb/enumerable_thread_specific.h>
 #include <cmath>
-#include <map>
+#include <cstdio>
+#include <algorithm>
 #include <vector>
 
 namespace ygg {
@@ -209,236 +214,206 @@ static void cutSingleTrack(BilletModel& billet, const ToolSweepSDF& toolSDF, Cut
     }
 }
 
-// 双轨切削：4-phase 流程
+// ─── Phase 2 helper: inject a batch of surfels into existing microGrid incrementally ───
+static void injectSurfels(BilletModel& billet,
+                          const std::vector<openvdb::Vec3R>& positions,
+                          const std::vector<openvdb::Vec3f>& normals,
+                          const openvdb::math::Transform& xform) {
+    if (positions.empty()) return;
+    openvdb::points::TypedAttributeArray<openvdb::Vec3f>::registerType();
+    openvdb::points::TypedAttributeArray<uint8_t>::registerType();
+
+    // Build a temporary PointDataGrid for the new surfels
+    auto newGrid = openvdb::points::createPointDataGrid<
+        openvdb::points::NullCodec, openvdb::points::PointDataGrid>(positions, xform);
+
+    // Attach attributes to new grid
+    size_t idx = 0;
+    for (auto leaf = newGrid->tree().beginLeaf(); leaf; ++leaf) {
+        auto as = leaf->stealAttributeSet();
+        if (as->descriptor().find("normal") == openvdb::points::AttributeSet::INVALID_POS)
+            as->appendAttribute("normal",
+                openvdb::points::TypedAttributeArray<openvdb::Vec3f>::attributeType(),
+                static_cast<openvdb::Index>(leaf->pointCount()));
+        if (as->descriptor().find("active") == openvdb::points::AttributeSet::INVALID_POS)
+            as->appendAttribute("active",
+                openvdb::points::TypedAttributeArray<uint8_t>::attributeType(),
+                static_cast<openvdb::Index>(leaf->pointCount()));
+        leaf->replaceAttributeSet(as.release(), true);
+
+        auto as2 = leaf->stealAttributeSet();
+        auto whN = openvdb::points::AttributeWriteHandle<openvdb::Vec3f>::create(*as2->get("normal"));
+        auto whA = openvdb::points::AttributeWriteHandle<uint8_t>::create(*as2->get("active"));
+        for (size_t i = 0; i < whN->size(); ++i, ++idx) {
+            whN->set(i, idx < normals.size() ? normals[idx] : openvdb::Vec3f(0));
+            whA->set(i, 1);
+        }
+        leaf->replaceAttributeSet(as2.release(), true);
+    }
+
+    if (!billet.microGrid) {
+        billet.microGrid = newGrid;
+        billet.microGrid->setName("micro_surfels");
+    } else {
+        // Incremental merge: steal new leaves into existing tree
+        // Only works when new leaves occupy previously empty coords
+        billet.microGrid->tree().merge(newGrid->tree());
+    }
+}
+
+// 双轨切削：工业级 4-phase（增量注入 + 并行裁剪 + 分块采样）
 static void cutDualTrack(BilletModel& billet, const ToolSweepSDF& toolSDF) {
+    using TreeT = openvdb::FloatGrid::TreeType;
     auto& sdfGrid = billet.sdfGrid;
-    auto& microGrid = billet.microGrid;
     auto& xform = sdfGrid->transform();
     double D_v = xform.voxelSize()[0];
     float bandWidth = 3.0f * static_cast<float>(D_v);
 
-    // Phase 1: 宏观过滤 — 更新 SDF (同单轨逻辑)
     auto bbox = toolSDF.getBoundingBox();
-    auto minIdx = xform.worldToIndexCellCentered(bbox.min());
-    auto maxIdx = xform.worldToIndexCellCentered(bbox.max());
+    auto minIdx = xform.worldToIndexCellCentered(bbox.min()) - openvdb::Coord(1);
+    auto maxIdx = xform.worldToIndexCellCentered(bbox.max()) + openvdb::Coord(1);
 
-    auto sdfAccessor = sdfGrid->getAccessor();
-    openvdb::Coord ijk;
-    for (ijk[0] = minIdx[0]; ijk[0] <= maxIdx[0]; ++ijk[0]) {
-        for (ijk[1] = minIdx[1]; ijk[1] <= maxIdx[1]; ++ijk[1]) {
-            for (ijk[2] = minIdx[2]; ijk[2] <= maxIdx[2]; ++ijk[2]) {
-                Vec3d worldPos = xform.indexToWorld(ijk);
-                double toolDist = toolSDF.eval(worldPos);
-                if (toolDist < bandWidth) {
-                    float billetVal = sdfAccessor.getValue(ijk);
-                    float newVal = std::max(billetVal, static_cast<float>(-toolDist));
-                    if (newVal != billetVal)
-                        sdfAccessor.setValue(ijk, newVal);
-                }
-            }
-        }
-    }
+    printf("[DualTrack] D_v=%.4f d_v=%.4f N=%d\n", D_v, billet.config.d_v, billet.config.N);
+    fflush(stdout);
 
-    // Phase 2: 微观面元剥离
-    if (microGrid) {
-        auto& tree = microGrid->tree();
-        for (auto leaf = tree.beginLeaf(); leaf; ++leaf) {
-            auto leafOrigin = leaf->origin();
-            Vec3d leafWorld = xform.indexToWorld(leafOrigin);
-            Vec3d leafMax = leafWorld + Vec3d(8 * D_v);
-            if (leafWorld.x() > bbox.max().x() || leafMax.x() < bbox.min().x() ||
-                leafWorld.y() > bbox.max().y() || leafMax.y() < bbox.min().y() ||
-                leafWorld.z() > bbox.max().z() || leafMax.z() < bbox.min().z())
-                continue;
-
-            auto attrSetPtr = leaf->stealAttributeSet();
-            auto* activeArr = attrSetPtr->get("active");
-            if (!activeArr) {
-                leaf->replaceAttributeSet(attrSetPtr.release(), true);
-                continue;
-            }
-
-            auto* posArr = attrSetPtr->get("P");
-            auto posHandle = openvdb::points::AttributeHandle<openvdb::Vec3f>::create(*posArr);
-            auto activeHandle = openvdb::points::AttributeWriteHandle<uint8_t>::create(*activeArr);
-
-            // 遍历叶节点中所有体素，确定每个点所属的体素
-            // PointDataLeaf 的 value 存储的是累积 offset
-            // 体素 n 的点范围 = [offset(n-1), offset(n))
-            for (openvdb::Index voxelIdx = 0; voxelIdx < 512; ++voxelIdx) {
-                openvdb::Index end = static_cast<openvdb::Index>(leaf->getValue(voxelIdx));
-                openvdb::Index start = (voxelIdx == 0) ? openvdb::Index(0) :
-                    static_cast<openvdb::Index>(leaf->getValue(voxelIdx - 1));
-                if (start == end) continue;
-
-                // 体素在叶节点中的局部坐标
-                openvdb::Coord localCoord(
-                    (voxelIdx >> 6) & 7,   // x: bits 6-8
-                    (voxelIdx >> 3) & 7,   // y: bits 3-5
-                    voxelIdx & 7);         // z: bits 0-2
-                openvdb::Coord voxelCoord = leafOrigin + localCoord;
-
-                for (openvdb::Index idx = start; idx < end; ++idx) {
-                    if (activeHandle->get(idx) == 0) continue;
-
-                    openvdb::Vec3f localP = posHandle->get(idx);
-                    Vec3d worldPos = xform.indexToWorld(
-                        Vec3d(voxelCoord.x() + localP.x(),
-                              voxelCoord.y() + localP.y(),
-                              voxelCoord.z() + localP.z()));
-
-                    double dist = toolSDF.eval(worldPos);
-                    if (dist <= 0.0) {
-                        activeHandle->set(idx, 0);
-                    }
-                }
-            }
-
-            leaf->replaceAttributeSet(attrSetPtr.release(), true);
-        }
-    }
-
-    // Phase 3: 边界面元注入（在刀具零等值面上注入精细面元）
-    // 策略：找到部分切削的叶节点，在刀具表面采样新点，
-    //        重建该叶节点的属性集（追加新点）
+    // ═══ Phase 1: SDF CSG diff (TBB parallel) + dirty region ═══
+    // Activate inactive negative voxels in tool BBox
     {
-        auto& tree = microGrid->tree();
-        double d_v = billet.config.d_v;
-        int N = billet.config.N;
-
-        // 收集需要注入的新面元（按叶节点 origin 分组）
-        struct NewSurfel { openvdb::Vec3f localP; openvdb::Vec3f normal; };
-        std::map<openvdb::Coord, std::vector<NewSurfel>> injectionMap;
-
-        for (auto leaf = tree.cbeginLeaf(); leaf; ++leaf) {
-            auto leafOrigin = leaf->origin();
-            Vec3d leafWorld = xform.indexToWorld(leafOrigin);
-            Vec3d leafMax = leafWorld + Vec3d(8 * D_v);
-            if (leafWorld.x() > bbox.max().x() || leafMax.x() < bbox.min().x() ||
-                leafWorld.y() > bbox.max().y() || leafMax.y() < bbox.min().y() ||
-                leafWorld.z() > bbox.max().z() || leafMax.z() < bbox.min().z())
-                continue;
-
-            // 检查是否部分切削
-            auto& attrSet = leaf->attributeSet();
-            auto* activeArr = attrSet.get("active");
-            if (!activeArr) continue;
-            auto ah = openvdb::points::AttributeHandle<uint8_t>::create(*activeArr);
-            bool hasActive = false, hasInactive = false;
-            for (size_t i = 0; i < ah->size() && !(hasActive && hasInactive); ++i) {
-                if (ah->get(i) == 1) hasActive = true; else hasInactive = true;
-            }
-            if (!hasActive || !hasInactive) continue;
-
-            // 在叶节点中心附近的刀具表面采样
-            Vec3d center = (leafWorld + leafMax) * 0.5;
-            Vec3d toolGrad = toolSDF.gradient(center);
-            double gradLen = toolGrad.length();
-            if (gradLen < 1e-10) continue;
-            Vec3d normal = toolGrad / gradLen;
-
-            Vec3d u, v;
-            if (std::abs(normal.x()) < 0.9) u = Vec3d(1,0,0).cross(normal);
-            else u = Vec3d(0,1,0).cross(normal);
-            u.normalize(); v = normal.cross(u);
-
-            int sampleN = std::min(N, 8);
-            for (int i = 0; i < sampleN; ++i) {
-                for (int j = 0; j < sampleN; ++j) {
-                    Vec3d offset = ((i + 0.5 - sampleN/2.0) * d_v) * u +
-                                   ((j + 0.5 - sampleN/2.0) * d_v) * v;
-                    Vec3d candidate = center + offset;
-                    double dist = toolSDF.eval(candidate);
-                    candidate = candidate - dist * normal;
-
-                    if (candidate.x() < leafWorld.x() || candidate.x() > leafMax.x() ||
-                        candidate.y() < leafWorld.y() || candidate.y() > leafMax.y() ||
-                        candidate.z() < leafWorld.z() || candidate.z() > leafMax.z())
-                        continue;
-                    if (std::abs(toolSDF.eval(candidate)) > d_v) continue;
-
-                    // 转为 index-space 相对于体素的偏移
-                    Vec3d idxPos = xform.worldToIndex(candidate);
-                    openvdb::Coord voxelCoord(
-                        static_cast<int>(std::floor(idxPos.x())),
-                        static_cast<int>(std::floor(idxPos.y())),
-                        static_cast<int>(std::floor(idxPos.z())));
-                    openvdb::Vec3f localP(
-                        static_cast<float>(idxPos.x() - voxelCoord.x()),
-                        static_cast<float>(idxPos.y() - voxelCoord.y()),
-                        static_cast<float>(idxPos.z() - voxelCoord.z()));
-
-                    injectionMap[leafOrigin].push_back({localP,
-                        openvdb::Vec3f(float(normal.x()), float(normal.y()), float(normal.z()))});
+        auto acc = sdfGrid->getAccessor();
+        openvdb::Coord ijk;
+        for (ijk[0]=minIdx[0]; ijk[0]<=maxIdx[0]; ++ijk[0])
+            for (ijk[1]=minIdx[1]; ijk[1]<=maxIdx[1]; ++ijk[1])
+                for (ijk[2]=minIdx[2]; ijk[2]<=maxIdx[2]; ++ijk[2]) {
+                    float v = acc.getValue(ijk);
+                    if (v < 0 && !acc.isValueOn(ijk)) acc.setValueOn(ijk, v);
                 }
-            }
-        }
+    }
 
-        // 注入：用 createPointDataGrid 重建包含新旧点的叶节点不现实
-        // 简化方案：创建新的 PointDataGrid 只包含新面元，存入独立 Grid
-        // 实际合并需要 OpenVDB 的 PointMerge（复杂）
-        // 务实方案：直接为新面元创建独立 PointDataGrid 挂在 BilletModel 上
-        if (!injectionMap.empty()) {
-            std::vector<openvdb::Vec3R> newWorldPts;
-            std::vector<openvdb::Vec3f> newNormals;
-            for (auto& [origin, surfels] : injectionMap) {
-                for (auto& s : surfels) {
-                    // 重建世界坐标（近似：用叶节点 origin + 偏移中心）
-                    Vec3d leafW = xform.indexToWorld(origin);
-                    Vec3d worldP = leafW + Vec3d(s.localP.x() * D_v,
-                                                  s.localP.y() * D_v,
-                                                  s.localP.z() * D_v);
-                    newWorldPts.push_back(worldP);
-                    newNormals.push_back(s.normal);
-                }
-            }
+    // TBB parallel SDF update + dirty voxel collection
+    openvdb::tree::LeafManager<TreeT> leafMgr(sdfGrid->tree());
+    using DirtyVec = std::vector<openvdb::Coord>;
+    tbb::enumerable_thread_specific<DirtyVec> tlsDirty;
 
-            if (!newWorldPts.empty()) {
-                // 创建新 PointDataGrid 并追加属性
-                auto newPtGrid = openvdb::points::createPointDataGrid<
-                    openvdb::points::NullCodec, openvdb::points::PointDataGrid>(
-                    newWorldPts, *microGrid->transformPtr());
+    tbb::parallel_for(leafMgr.leafRange(),
+        [&](const openvdb::tree::LeafManager<TreeT>::LeafRange& range) {
+            auto& localDirty = tlsDirty.local();
+            for (auto leafIt = range.begin(); leafIt; ++leafIt) {
+                auto& leaf = *leafIt;
+                auto lo = leaf.origin();
+                if (lo.x()+8<minIdx.x() || lo.x()>maxIdx.x() ||
+                    lo.y()+8<minIdx.y() || lo.y()>maxIdx.y() ||
+                    lo.z()+8<minIdx.z() || lo.z()>maxIdx.z()) continue;
 
-                openvdb::points::TypedAttributeArray<openvdb::Vec3f>::registerType();
-                openvdb::points::TypedAttributeArray<uint8_t>::registerType();
+                for (auto it = leaf.beginValueOn(); it; ++it) {
+                    auto coord = it.getCoord();
+                    if (coord.x()<minIdx.x() || coord.x()>maxIdx.x() ||
+                        coord.y()<minIdx.y() || coord.y()>maxIdx.y() ||
+                        coord.z()<minIdx.z() || coord.z()>maxIdx.z()) continue;
 
-                size_t normalIdx = 0;
-                for (auto tLeaf = newPtGrid->tree().beginLeaf(); tLeaf; ++tLeaf) {
-                    auto tAttr = tLeaf->stealAttributeSet();
-                    tAttr->appendAttribute("normal",
-                        openvdb::points::TypedAttributeArray<openvdb::Vec3f>::attributeType(),
-                        static_cast<openvdb::Index>(tLeaf->pointCount()));
-                    tAttr->appendAttribute("precision",
-                        openvdb::points::TypedAttributeArray<uint8_t>::attributeType(),
-                        static_cast<openvdb::Index>(tLeaf->pointCount()));
-                    tAttr->appendAttribute("active",
-                        openvdb::points::TypedAttributeArray<uint8_t>::attributeType(),
-                        static_cast<openvdb::Index>(tLeaf->pointCount()));
-
-                    auto* nArr = tAttr->get("normal");
-                    auto* pArr = tAttr->get("precision");
-                    auto* aArr = tAttr->get("active");
-                    auto whN = openvdb::points::AttributeWriteHandle<openvdb::Vec3f>::create(*nArr);
-                    auto whP = openvdb::points::AttributeWriteHandle<uint8_t>::create(*pArr);
-                    auto whA = openvdb::points::AttributeWriteHandle<uint8_t>::create(*aArr);
-                    for (size_t i = 0; i < whN->size(); ++i) {
-                        whN->set(i, (normalIdx < newNormals.size()) ? newNormals[normalIdx] : openvdb::Vec3f(0));
-                        whP->set(i, 1); // FINE
-                        whA->set(i, 1); // active
-                        normalIdx++;
+                    Vec3d wp = xform.indexToWorld(coord);
+                    double toolDist = toolSDF.eval(wp);
+                    if (toolDist < bandWidth) {
+                        float oldVal = it.getValue();
+                        float newVal = std::max(oldVal, static_cast<float>(-toolDist));
+                        if (newVal != oldVal) {
+                            it.setValue(newVal);
+                            // Dirty criteria: tool interior + near new surface
+                            // Catches deep penetration (oldVal was background positive)
+                            if (toolDist <= 0.0 && std::abs(newVal) < bandWidth)
+                                localDirty.push_back(coord);
+                        }
                     }
-                    tLeaf->replaceAttributeSet(tAttr.release(), true);
                 }
-
-                // 合并新旧 Grid：用 steal + topologyCopy 方案
-                // PointDataGrid::merge 对相同 descriptor 的树可用
-                microGrid->tree().merge(newPtGrid->tree());
             }
+        });
+
+    // Merge + dedup dirty voxels
+    std::vector<openvdb::Coord> dirtyVoxels;
+    for (auto& v : tlsDirty) {
+        for (auto& coord : v) {
+            if (billet.microGrid && billet.microGrid->tree().isValueOn(coord)) continue;
+            billet.dirtyMask->getAccessor().setValueOn(coord);
+            dirtyVoxels.push_back(coord);
         }
     }
 
-    // Phase 4: pruneLevelSet
+    printf("[DualTrack] Phase1: %zu dirty voxels\n", dirtyVoxels.size());
+    fflush(stdout);
+
+    // ═══ Phase 2: Chunked surfel generation + incremental injection ═══
+    if (!dirtyVoxels.empty()) {
+        const int N = billet.config.N;
+        const double d_v = billet.config.d_v;
+        const size_t CHUNK = 256; // process this many voxels at a time to bound memory
+        size_t totalGenerated = 0;
+
+        for (size_t start = 0; start < dirtyVoxels.size(); start += CHUNK) {
+            size_t end = std::min(start + CHUNK, dirtyVoxels.size());
+            std::vector<openvdb::Coord> chunk(dirtyVoxels.begin() + start,
+                                              dirtyVoxels.begin() + end);
+
+            auto batch = SurfelGenerator::sampleToolSurface(toolSDF, chunk, xform, d_v, N);
+            totalGenerated += batch.positions.size();
+
+            // Incremental injection (no full rebuild)
+            injectSurfels(billet, batch.positions, batch.normals, xform);
+        }
+
+        printf("[DualTrack] Phase2: %zu surfels injected (N=%d, chunks=%zu)\n",
+            totalGenerated, N, (dirtyVoxels.size()+CHUNK-1)/CHUNK);
+        fflush(stdout);
+    }
+
+    // ═══ Phase 3: Parallel surfel clipping ═══
+    if (billet.microGrid) {
+        using PtTreeT = openvdb::points::PointDataGrid::TreeType;
+        openvdb::tree::LeafManager<PtTreeT> ptLeafMgr(billet.microGrid->tree());
+
+        tbb::parallel_for(ptLeafMgr.leafRange(),
+            [&](const openvdb::tree::LeafManager<PtTreeT>::LeafRange& range) {
+                for (auto leafIt = range.begin(); leafIt; ++leafIt) {
+                    auto& leaf = *leafIt;
+                    auto lo = leaf.origin();
+                    Vec3d lw = xform.indexToWorld(lo);
+                    Vec3d lmax = lw + Vec3d(8.0 * D_v);
+                    if (lw.x()>bbox.max().x()+D_v || lmax.x()<bbox.min().x()-D_v ||
+                        lw.y()>bbox.max().y()+D_v || lmax.y()<bbox.min().y()-D_v ||
+                        lw.z()>bbox.max().z()+D_v || lmax.z()<bbox.min().z()-D_v) continue;
+
+                    // Each leaf is independent; steal its attribute set for mutable access
+                    auto as = leaf.stealAttributeSet();
+                    auto* posArr = as->get("P");
+                    auto* actArr = as->get("active");
+                    if (!posArr || !actArr) { leaf.replaceAttributeSet(as.release(), true); continue; }
+
+                    auto ph = openvdb::points::AttributeHandle<openvdb::Vec3f>::create(*posArr);
+                    auto wh = openvdb::points::AttributeWriteHandle<uint8_t>::create(*actArr);
+
+                    for (openvdb::Index vIdx = 0; vIdx < 512; ++vIdx) {
+                        openvdb::Index endI = static_cast<openvdb::Index>(leaf.getValue(vIdx));
+                        openvdb::Index startI = (vIdx==0) ? openvdb::Index(0) :
+                            static_cast<openvdb::Index>(leaf.getValue(vIdx-1));
+                        if (startI == endI) continue;
+                        openvdb::Coord vc = lo + openvdb::Coord((vIdx>>6)&7,(vIdx>>3)&7,vIdx&7);
+                        for (openvdb::Index i = startI; i < endI; ++i) {
+                            if (wh->get(i) == 0) continue;
+                            auto p = ph->get(i);
+                            Vec3d wp = xform.indexToWorld(
+                                Vec3d(vc.x()+p.x(), vc.y()+p.y(), vc.z()+p.z()));
+                            if (toolSDF.eval(wp) <= 0.0) wh->set(i, 0);
+                        }
+                    }
+                    leaf.replaceAttributeSet(as.release(), true);
+                }
+            });
+
+        printf("[DualTrack] Phase3: parallel clip done\n"); fflush(stdout);
+    }
+
+    // ═══ Phase 4: Prune + clear ═══
     openvdb::tools::pruneLevelSet(sdfGrid->tree());
+    billet.dirtyMask->clear();
+    printf("[DualTrack] Done.\n"); fflush(stdout);
 }
 
 void CuttingEngine::cut(BilletModel& billet, const ToolSweepSDF& toolSDF) {
@@ -456,6 +431,7 @@ double computeVolume(const openvdb::FloatGrid::Ptr& grid) {
 
 openvdb::FloatGrid::Ptr buildLocalCutSurface(
     const BilletModel& billet, const ToolSweepSDF& lastTool) {
+    // Render ONLY the tool's zero-isosurface inside the billet (= newly exposed cut face)
     double displayVs = std::max(billet.config.d_v, 0.05);
     float bandWidth = 3.0f * static_cast<float>(displayVs);
 
@@ -470,7 +446,6 @@ openvdb::FloatGrid::Ptr buildLocalCutSurface(
     auto maxIdx = xform->worldToIndexCellCentered(bbox.max());
 
     auto& billetXform = billet.sdfGrid->transform();
-    auto billetAcc = billet.sdfGrid->getConstAccessor();
     auto acc = grid->getAccessor();
 
     openvdb::Coord ijk;
@@ -478,14 +453,22 @@ openvdb::FloatGrid::Ptr buildLocalCutSurface(
         for (ijk[1] = minIdx[1]; ijk[1] <= maxIdx[1]; ++ijk[1]) {
             for (ijk[2] = minIdx[2]; ijk[2] <= maxIdx[2]; ++ijk[2]) {
                 Vec3d wp = xform->indexToWorld(ijk);
-                // 从粗毛坯 Grid 插值采样
-                Vec3d billetIdx = billetXform.worldToIndex(wp);
-                float billetVal = openvdb::tools::BoxSampler::sample(
-                    billet.sdfGrid->tree(), billetIdx);
-                float toolVal = -static_cast<float>(lastTool.eval(wp));
-                float sdf = std::max(billetVal, toolVal);
-                if (std::abs(sdf) < bandWidth)
-                    acc.setValue(ijk, sdf);
+
+                // Tool SDF (positive outside tool, negative inside)
+                float toolSdf = static_cast<float>(lastTool.eval(wp));
+
+                // Check if point is inside the ORIGINAL billet (before cut)
+                // Use billet geometry definition for exact inside test
+                auto& geo = billet.geometry;
+                bool insideBillet = (wp.x() > geo.origin.x() && wp.x() < geo.origin.x()+geo.dims.x() &&
+                                    wp.y() > geo.origin.y() && wp.y() < geo.origin.y()+geo.dims.y() &&
+                                    wp.z() > geo.origin.z() && wp.z() < geo.origin.z()+geo.dims.z());
+
+                if (!insideBillet) continue; // only show cut surface inside billet
+
+                // The cut surface IS the tool's zero-isosurface
+                if (std::abs(toolSdf) < bandWidth)
+                    acc.setValue(ijk, toolSdf);
             }
         }
     }

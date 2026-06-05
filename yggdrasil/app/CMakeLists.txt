@@ -4,6 +4,10 @@ project(YggApp LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+if(MSVC)
+    add_compile_options(/bigobj)
+endif()
+
 include(FetchContent)
 
 # --- glad (local, pre-generated) ---
@@ -68,6 +72,7 @@ if(YGG_APP_USE_OPENVDB)
         ../core/BilletBuilder.cpp
         ../core/ToolSweepSDF.cpp
         ../core/CuttingEngine.cpp
+        ../core/SurfelGenerator.cpp
     )
     target_include_directories(ygg_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
     target_link_libraries(ygg_core PUBLIC OpenVDB::openvdb)

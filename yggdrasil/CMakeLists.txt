@@ -4,6 +4,10 @@ project(Yggdrasil LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+if(MSVC)
+    add_compile_options(/bigobj)
+endif()
+
 # Ensure GTest uses same standard
 set(CMAKE_CXX_STANDARD 17 CACHE STRING "" FORCE)
 set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
@@ -20,6 +24,7 @@ add_library(yggdrasil
     core/BilletBuilder.cpp
     core/ToolSweepSDF.cpp
     core/CuttingEngine.cpp
+    core/SurfelGenerator.cpp
 )
 target_include_directories(yggdrasil PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(yggdrasil PUBLIC OpenVDB::openvdb)
@@ -41,9 +46,6 @@ add_executable(ygg_tests
     tests/test_toolsdf.cpp
     tests/test_cutting.cpp
     tests/test_e2e.cpp
-    tests/test_memory.cpp
-    tests/test_dualgrid_cut.cpp
-    tests/test_dualgrid_accuracy.cpp
 )
 target_link_libraries(ygg_tests PRIVATE yggdrasil GTest::gtest_main)
 

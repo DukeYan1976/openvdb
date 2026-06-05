@@ -17,8 +17,8 @@ ResolutionConfig solveResolution(double t, double R_min, double F_min,
     // Step 3: 理想面元密度因子
     int N_ideal = static_cast<int>(std::floor(D_upper / cfg.d_v));
 
-    // 边界情况：D_upper < d_v
-    if (N_ideal < 1) {
+    // 边界情况：D_upper < d_v → 退化为 SINGLE_TRACK
+    if (N_ideal < 2) {
         cfg.mode = ResolutionConfig::SINGLE_TRACK;
         cfg.D_v = cfg.d_v;
         cfg.N = 1;
@@ -33,21 +33,10 @@ ResolutionConfig solveResolution(double t, double R_min, double F_min,
     // Step 5: 最终共享体素尺寸
     cfg.D_v = cfg.N * cfg.d_v;
 
-    // Step 6: 模式判定
-    double Lx = dims.x(), Ly = dims.y(), Lz = dims.z();
-    double L_max = std::max({Lx, Ly, Lz});
+    // Step 6: 模式判定 — DUAL_TRACK 是默认主路径
+    double L_max = std::max({dims.x(), dims.y(), dims.z()});
 
-    // 单轨可行性：用实际表面积估算内存
-    double surfaceArea = 2.0 * (Lx * Ly + Ly * Lz + Lx * Lz);
-    double activeVoxels = (surfaceArea / (cfg.d_v * cfg.d_v)) * 6.0; // 2*halfWidth=6
-    double memoryEst = activeVoxels * 4.0 * 2.0; // ×2 factor for leaf node overhead
-
-    if (memoryEst < static_cast<double>(memBudget)) {
-        cfg.mode = ResolutionConfig::SINGLE_TRACK;
-        cfg.D_v = cfg.d_v;
-        cfg.N = 1;
-        cfg.n = 0;
-    } else if ((L_max / cfg.d_v) > 1.67e7) {
+    if ((L_max / cfg.d_v) > 1.67e7) {
         cfg.mode = ResolutionConfig::ATLAS_REGION;
         cfg.atlas_divisions = static_cast<int>(
             std::ceil(L_max / (1.67e7 * cfg.d_v)));

@@ -10,161 +10,248 @@
 #include "core/BilletBuilder.h"
 #include "core/ToolSweepSDF.h"
 #include "core/CuttingEngine.h"
-#include <openvdb/points/PointCount.h>
-#include <openvdb/points/PointAttribute.h>
-#include <openvdb/tools/LevelSetSphere.h>
 #endif
 
 #include <cstdio>
 #include <cmath>
 #include <vector>
 #include <cstdint>
+#include <string>
 #include <chrono>
 
-// --- Shader sources ---
-static const char* vertSrc = R"(
+// ═══════════════════════════════════════════════════════════════
+// Shaders
+// ═══════════════════════════════════════════════════════════════
+static const char* g_vertSrc = R"(
 #version 330 core
 layout(location=0) in vec3 aPos;
 layout(location=1) in vec3 aNorm;
 uniform mat4 uMVP;
 uniform mat3 uNormalMat;
-uniform vec4 uClipPlane;
 out vec3 vNorm;
-out float vClipDist;
 void main(){
     gl_Position = uMVP * vec4(aPos, 1.0);
     vNorm = normalize(uNormalMat * aNorm);
-    vClipDist = dot(aPos, uClipPlane.xyz) + uClipPlane.w;
-    gl_ClipDistance[0] = vClipDist;
     gl_PointSize = 4.0;
 })";
 
-static const char* fragSrc = R"(
+static const char* g_fragSrc = R"(
 #version 330 core
 in vec3 vNorm;
 out vec4 fragColor;
 uniform vec3 uLightDir;
 uniform vec3 uColor;
+uniform float uAlpha;
 void main(){
     float diff = abs(dot(vNorm, uLightDir)) * 0.7 + 0.3;
-    fragColor = vec4(uColor * diff, 1.0);
+    fragColor = vec4(uColor * diff, uAlpha);
 })";
 
-// --- GL state ---
-static GLuint g_prog = 0, g_VAO = 0, g_VBO = 0, g_EBO = 0;
-static int g_idxCount = 0;
+// Line shader (no lighting)
+static const char* g_lineVertSrc = R"(
+#version 330 core
+layout(location=0) in vec3 aPos;
+uniform mat4 uMVP;
+void main(){ gl_Position = uMVP * vec4(aPos, 1.0); }
+)";
 
-static void initGL() {
-    GLuint vs = glCreateShader(GL_VERTEX_SHADER);
-    glShaderSource(vs, 1, &vertSrc, nullptr); glCompileShader(vs);
-    GLint ok; glGetShaderiv(vs, GL_COMPILE_STATUS, &ok);
-    if(!ok){char log[512];glGetShaderInfoLog(vs,512,nullptr,log);printf("VS err: %s\n",log);}
-    GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
-    glShaderSource(fs, 1, &fragSrc, nullptr); glCompileShader(fs);
-    glGetShaderiv(fs, GL_COMPILE_STATUS, &ok);
-    if(!ok){char log[512];glGetShaderInfoLog(fs,512,nullptr,log);printf("FS err: %s\n",log);}
-    g_prog = glCreateProgram();
-    glAttachShader(g_prog, vs); glAttachShader(g_prog, fs);
-    glLinkProgram(g_prog);
-    glGetProgramiv(g_prog, GL_LINK_STATUS, &ok);
-    if(!ok){char log[512];glGetProgramInfoLog(g_prog,512,nullptr,log);printf("Link err: %s\n",log);}
-    glDeleteShader(vs); glDeleteShader(fs);
-    glGenVertexArrays(1, &g_VAO);
-    glGenBuffers(1, &g_VBO);
-    glGenBuffers(1, &g_EBO);
+static const char* g_lineFragSrc = R"(
+#version 330 core
+out vec4 fragColor;
+uniform vec3 uColor;
+uniform float uAlpha;
+void main(){ fragColor = vec4(uColor, uAlpha); }
+)";
+
+// ═══════════════════════════════════════════════════════════════
+// GL helpers
+// ═══════════════════════════════════════════════════════════════
+static GLuint compileProgram(const char* vs, const char* fs) {
+    GLuint v = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(v, 1, &vs, nullptr); glCompileShader(v);
+    GLint ok; glGetShaderiv(v, GL_COMPILE_STATUS, &ok);
+    if(!ok){char log[512];glGetShaderInfoLog(v,512,nullptr,log);printf("VS: %s\n",log);}
+    GLuint f = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(f, 1, &fs, nullptr); glCompileShader(f);
+    glGetShaderiv(f, GL_COMPILE_STATUS, &ok);
+    if(!ok){char log[512];glGetShaderInfoLog(f,512,nullptr,log);printf("FS: %s\n",log);}
+    GLuint p = glCreateProgram();
+    glAttachShader(p, v); glAttachShader(p, f);
+    glLinkProgram(p);
+    glDeleteShader(v); glDeleteShader(f);
+    return p;
 }
 
-static void uploadMesh(const float* verts, size_t vertBytes,
-                       const uint32_t* idx, size_t idxBytes, int count) {
-    glBindVertexArray(g_VAO);
-    glBindBuffer(GL_ARRAY_BUFFER, g_VBO);
-    glBufferData(GL_ARRAY_BUFFER, vertBytes, verts, GL_DYNAMIC_DRAW);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_EBO);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, idxBytes, idx, GL_DYNAMIC_DRAW);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6*sizeof(float), (void*)0);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6*sizeof(float), (void*)(3*sizeof(float)));
-    glEnableVertexAttribArray(1);
-    g_idxCount = count;
-}
+struct GPUMesh {
+    GLuint vao=0, vbo=0, ebo=0;
+    int count=0;
+    void init() { glGenVertexArrays(1,&vao); glGenBuffers(1,&vbo); glGenBuffers(1,&ebo); }
+    void upload(const float* verts, size_t vBytes, const uint32_t* idx, size_t iBytes, int n) {
+        if(!vao) init();
+        glBindVertexArray(vao);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glBufferData(GL_ARRAY_BUFFER, vBytes, verts, GL_DYNAMIC_DRAW);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, iBytes, idx, GL_DYNAMIC_DRAW);
+        glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,6*sizeof(float),(void*)0);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(1,3,GL_FLOAT,GL_FALSE,6*sizeof(float),(void*)(3*sizeof(float)));
+        glEnableVertexAttribArray(1);
+        count = n;
+    }
+    void draw() { if(count>0){glBindVertexArray(vao);glDrawElements(GL_TRIANGLES,count,GL_UNSIGNED_INT,nullptr);} }
+};
 
-// --- Camera (CAD-style orbit, orthographic) ---
+struct GPULines {
+    GLuint vao=0, vbo=0;
+    int count=0;
+    void init() { glGenVertexArrays(1,&vao); glGenBuffers(1,&vbo); }
+    void upload(const float* data, size_t bytes, int vertCount) {
+        if(!vao) init();
+        glBindVertexArray(vao);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glBufferData(GL_ARRAY_BUFFER, bytes, data, GL_DYNAMIC_DRAW);
+        glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,3*sizeof(float),(void*)0);
+        glEnableVertexAttribArray(0);
+        count = vertCount;
+    }
+    void draw() { if(count>0){glBindVertexArray(vao);glDrawArrays(GL_LINES,0,count);} }
+};
+
+// ═══════════════════════════════════════════════════════════════
+// Camera (CAD-style orbit, orthographic)
+// ═══════════════════════════════════════════════════════════════
 struct Camera {
-    float yaw = 45, pitch = 30;         // orbit angles (degrees)
-    float tx = 15, ty = 15, tz = 7.5f;  // target (rotation center)
-    float orthoSize = 25.0f;            // half-width of ortho viewport (mm)
-    float dist = 200.0f;                // eye distance (for view matrix)
+    float yaw=45, pitch=30, dist=200;
+    float tx=15, ty=15, tz=7.5f;
+    float orthoSize=25.0f;
 };
 
 static void buildMVP(const Camera& c, int w, int h, float mvp[16], float nm[9]) {
-    float asp = (float)w / (float)h;
-    float zNear = 0.1f, zFar = 1000.0f;
+    float asp=(float)w/(float)h;
+    float zN=0.1f, zF=1000.f;
+    float P[16]={0};
+    P[0]=1.f/(asp*c.orthoSize); P[5]=1.f/c.orthoSize;
+    P[10]=-2.f/(zF-zN); P[14]=-(zF+zN)/(zF-zN); P[15]=1.f;
 
-    // Orthographic projection (column-major)
-    float P[16] = {0};
-    P[0]  = 1.0f / (asp * c.orthoSize);
-    P[5]  = 1.0f / c.orthoSize;
-    P[10] = -2.0f / (zFar - zNear);
-    P[14] = -(zFar + zNear) / (zFar - zNear);
-    P[15] = 1.0f;
+    float yr=c.yaw*3.14159f/180.f, pr=c.pitch*3.14159f/180.f;
+    float ex=c.tx+c.dist*cosf(pr)*cosf(yr);
+    float ey=c.ty+c.dist*cosf(pr)*sinf(yr);
+    float ez=c.tz+c.dist*sinf(pr);
 
-    // Camera position
-    float yr = c.yaw * 3.14159f / 180.0f;
-    float pr = c.pitch * 3.14159f / 180.0f;
-    float eyeX = c.tx + c.dist * cosf(pr) * cosf(yr);
-    float eyeY = c.ty + c.dist * cosf(pr) * sinf(yr);
-    float eyeZ = c.tz + c.dist * sinf(pr);
+    float fx=c.tx-ex, fy=c.ty-ey, fz=c.tz-ez;
+    float fl=sqrtf(fx*fx+fy*fy+fz*fz); fx/=fl;fy/=fl;fz/=fl;
+    float rx=fy, ry=-fx, rz=0;
+    float rl=sqrtf(rx*rx+ry*ry+rz*rz);
+    if(rl<1e-6f){rx=1;ry=rz=0;rl=1;} rx/=rl;ry/=rl;rz/=rl;
+    float ux=ry*fz-rz*fy, uy=rz*fx-rx*fz, uz=rx*fy-ry*fx;
 
-    // Forward (target - eye, normalized)
-    float fwdX = c.tx - eyeX, fwdY = c.ty - eyeY, fwdZ = c.tz - eyeZ;
-    float fl = sqrtf(fwdX*fwdX + fwdY*fwdY + fwdZ*fwdZ);
-    fwdX /= fl; fwdY /= fl; fwdZ /= fl;
+    float V[16]={rx,ux,-fx,0, ry,uy,-fy,0, rz,uz,-fz,0,
+        -(rx*ex+ry*ey+rz*ez),-(ux*ex+uy*ey+uz*ez),(fx*ex+fy*ey+fz*ez),1};
 
-    // Right = forward x up(0,0,1)
-    float rX = fwdY * 1.0f - fwdZ * 0.0f;
-    float rY = fwdZ * 0.0f - fwdX * 1.0f;
-    float rZ = fwdX * 0.0f - fwdY * 0.0f;
-    float rl = sqrtf(rX*rX + rY*rY + rZ*rZ);
-    if (rl < 1e-6f) { rX = 1; rY = rZ = 0; rl = 1; }
-    rX /= rl; rY /= rl; rZ /= rl;
-
-    // Up = right x forward
-    float upX = rY*fwdZ - rZ*fwdY;
-    float upY = rZ*fwdX - rX*fwdZ;
-    float upZ = rX*fwdY - rY*fwdX;
-
-    // View matrix (column-major)
-    float V[16] = {
-         rX,   upX,  -fwdX,  0,
-         rY,   upY,  -fwdY,  0,
-         rZ,   upZ,  -fwdZ,  0,
-        -(rX*eyeX + rY*eyeY + rZ*eyeZ),
-        -(upX*eyeX + upY*eyeY + upZ*eyeZ),
-         (fwdX*eyeX + fwdY*eyeY + fwdZ*eyeZ),
-         1
-    };
-
-    // MVP = P * V (column-major multiplication)
-    for (int col = 0; col < 4; col++) {
-        for (int row = 0; row < 4; row++) {
-            float sum = 0;
-            for (int k = 0; k < 4; k++)
-                sum += P[row + k*4] * V[k + col*4];
-            mvp[row + col*4] = sum;
-        }
+    for(int col=0;col<4;col++)for(int row=0;row<4;row++){
+        float s=0;for(int k=0;k<4;k++)s+=P[row+k*4]*V[k+col*4];
+        mvp[row+col*4]=s;
     }
-
-    // Normal matrix = upper 3x3 of View
-    nm[0]=rX;  nm[1]=upX; nm[2]=-fwdX;
-    nm[3]=rY;  nm[4]=upY; nm[5]=-fwdY;
-    nm[6]=rZ;  nm[7]=upZ; nm[8]=-fwdZ;
+    nm[0]=rx;nm[1]=ux;nm[2]=-fx; nm[3]=ry;nm[4]=uy;nm[5]=-fy; nm[6]=rz;nm[7]=uz;nm[8]=-fz;
 }
 
+// ═══════════════════════════════════════════════════════════════
+// Layer 1: Original Billet (analytic geometry)
+// ═══════════════════════════════════════════════════════════════
+static void buildBoxMesh(float ox, float oy, float oz,
+                         float dx, float dy, float dz,
+                         std::vector<float>& verts, std::vector<uint32_t>& idx) {
+    // 8 corners, 6 faces, 12 triangles
+    float x0=ox,y0=oy,z0=oz, x1=ox+dx,y1=oy+dy,z1=oz+dz;
+    struct V { float x,y,z,nx,ny,nz; };
+    // 24 vertices (4 per face, each with face normal)
+    V vtx[24] = {
+        // -Z face
+        {x0,y0,z0, 0,0,-1},{x1,y0,z0, 0,0,-1},{x1,y1,z0, 0,0,-1},{x0,y1,z0, 0,0,-1},
+        // +Z face
+        {x0,y0,z1, 0,0,1},{x1,y0,z1, 0,0,1},{x1,y1,z1, 0,0,1},{x0,y1,z1, 0,0,1},
+        // -Y face
+        {x0,y0,z0, 0,-1,0},{x1,y0,z0, 0,-1,0},{x1,y0,z1, 0,-1,0},{x0,y0,z1, 0,-1,0},
+        // +Y face
+        {x0,y1,z0, 0,1,0},{x1,y1,z0, 0,1,0},{x1,y1,z1, 0,1,0},{x0,y1,z1, 0,1,0},
+        // -X face
+        {x0,y0,z0, -1,0,0},{x0,y1,z0, -1,0,0},{x0,y1,z1, -1,0,0},{x0,y0,z1, -1,0,0},
+        // +X face
+        {x1,y0,z0, 1,0,0},{x1,y1,z0, 1,0,0},{x1,y1,z1, 1,0,0},{x1,y0,z1, 1,0,0},
+    };
+    verts.resize(24*6);
+    for(int i=0;i<24;i++){
+        verts[i*6+0]=vtx[i].x; verts[i*6+1]=vtx[i].y; verts[i*6+2]=vtx[i].z;
+        verts[i*6+3]=vtx[i].nx; verts[i*6+4]=vtx[i].ny; verts[i*6+5]=vtx[i].nz;
+    }
+    uint32_t faces[36]={
+        0,1,2, 0,2,3,   4,6,5, 4,7,6,
+        8,9,10, 8,10,11, 12,14,13, 12,15,14,
+        16,17,18, 16,18,19, 20,22,21, 20,23,22
+    };
+    idx.assign(faces, faces+36);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Layer 2: MacroGrid Wireframe
+// ═══════════════════════════════════════════════════════════════
+#if YGG_HAS_OPENVDB
+static void addWireBox(std::vector<float>& lines, double ox, double oy, double oz, double s) {
+    float x0=(float)ox,y0=(float)oy,z0=(float)oz;
+    float x1=x0+(float)s,y1=y0+(float)s,z1=z0+(float)s;
+    // 12 edges = 24 vertices
+    auto edge=[&](float ax,float ay,float az,float bx,float by,float bz){
+        lines.push_back(ax);lines.push_back(ay);lines.push_back(az);
+        lines.push_back(bx);lines.push_back(by);lines.push_back(bz);
+    };
+    // bottom
+    edge(x0,y0,z0,x1,y0,z0); edge(x1,y0,z0,x1,y1,z0);
+    edge(x1,y1,z0,x0,y1,z0); edge(x0,y1,z0,x0,y0,z0);
+    // top
+    edge(x0,y0,z1,x1,y0,z1); edge(x1,y0,z1,x1,y1,z1);
+    edge(x1,y1,z1,x0,y1,z1); edge(x0,y1,z1,x0,y0,z1);
+    // verticals
+    edge(x0,y0,z0,x0,y0,z1); edge(x1,y0,z0,x1,y0,z1);
+    edge(x1,y1,z0,x1,y1,z1); edge(x0,y1,z0,x0,y1,z1);
+}
+
+static void buildMacroGridLines(const openvdb::FloatGrid::Ptr& grid, int lod,
+                                std::vector<float>& lines) {
+    lines.clear();
+    auto& xform = grid->transform();
+    double vs = xform.voxelSize()[0];
+
+    if (lod == 0) {
+        // Per active voxel (expensive for large grids)
+        for (auto iter = grid->cbeginValueOn(); iter; ++iter) {
+            auto wp = xform.indexToWorld(iter.getCoord());
+            addWireBox(lines, wp.x()-vs*0.5, wp.y()-vs*0.5, wp.z()-vs*0.5, vs);
+        }
+    } else if (lod == 1) {
+        // Per LeafNode (8^3 voxels)
+        for (auto leaf = grid->tree().cbeginLeaf(); leaf; ++leaf) {
+            auto wp = xform.indexToWorld(leaf->origin());
+            addWireBox(lines, wp.x(), wp.y(), wp.z(), vs*8);
+        }
+    } else {
+        // Coarse: bounding box of entire grid
+        auto bbox = grid->evalActiveVoxelBoundingBox();
+        auto minW = xform.indexToWorld(bbox.min());
+        auto maxW = xform.indexToWorld(bbox.max()+openvdb::Coord(1));
+        addWireBox(lines, minW.x(), minW.y(), minW.z(),
+                   maxW.x()-minW.x());
+    }
+}
+#endif
+
+// ═══════════════════════════════════════════════════════════════
+// Main
+// ═══════════════════════════════════════════════════════════════
 int main() {
 #if YGG_HAS_OPENVDB
     openvdb::initialize();
 #endif
-
     if (!glfwInit()) return -1;
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
@@ -174,7 +261,6 @@ int main() {
     if (!win) { glfwTerminate(); return -1; }
     glfwMakeContextCurrent(win);
     glfwSwapInterval(1);
-
     if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) return -1;
 
     IMGUI_CHECKVERSION();
@@ -183,323 +269,287 @@ int main() {
     ImGui_ImplOpenGL3_Init("#version 330");
     ImGui::StyleColorsDark();
 
-    initGL();
+    GLuint meshProg = compileProgram(g_vertSrc, g_fragSrc);
+    GLuint lineProg = compileProgram(g_lineVertSrc, g_lineFragSrc);
+
     glEnable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
 
     Camera cam;
-    bool drag = false; double lx=0, ly=0;
+    bool drag=false; double lx=0,ly=0;
+
+    // ── Layer state ──
+    GPUMesh billetOrigMesh;   // Layer 1: analytic billet
+    GPUMesh sdfMesh;          // SDF marching cubes result
+    GPUMesh microDetailMesh;  // Layer 3: focus area detail
+    GPULines macroLines;      // Layer 2: wireframe
+
+    // Visibility & appearance
+    bool showOrigBillet = true;
+    float origAlpha = 0.5f;
+    float origColor[3] = {0.55f, 0.6f, 0.65f};
+
+    bool showMacroGrid = false;
+    int macroLod = 1; // 0=voxel, 1=leaf, 2=bbox
+    float macroColor[3] = {0.3f, 0.55f, 0.9f};
+    float macroLineWidth = 1.5f;
+
+    bool showMicroDetail = false;
+    float microColor[3] = {0.2f, 0.85f, 0.35f};
+    float focusRadius = 15.0f;
+    bool autoFocus = true;
+
+    bool showSdfMesh = true;
+    float sdfColor[3] = {0.7f, 0.75f, 0.8f};
 
 #if YGG_HAS_OPENVDB
-    auto cfg = ygg::solveResolution(0.5, 10.0, 2.0, {30, 30, 15});
-    auto billet = ygg::buildBillet(cfg, {0,0,0}, {30, 30, 15});
-    auto mesh = ygg::vdbToMesh(billet.sdfGrid);
-    printf("Initial mesh: %zu verts, %zu indices\n",
-           mesh.vertices.size()/6, mesh.indices.size());
-    uploadMesh(mesh.vertices.data(), mesh.vertices.size()*sizeof(float),
-               mesh.indices.data(), mesh.indices.size()*sizeof(uint32_t),
-               (int)mesh.indices.size());
+    // ── Simulation state ──
+    float billetSize[3] = {30,30,15};
+    auto cfg = ygg::solveResolution(0.5, 10.0, 2.0, {30,30,15});
+    auto billet = ygg::buildBillet(cfg, {0,0,0}, {30,30,15});
     double volume = ygg::computeVolume(billet.sdfGrid);
-    printf("Initial volume: %.1f mm3\n", volume);
     int cutCount = 0;
-    static float cutY = 15.0f, cutR = 3.0f;
-    static float cutZ = 16.0f;  // 球心Z位置（顶面=15，切入深度=15+R-cutZ）
-    static bool showTool = true;
-    static float toolColor[3] = {1.0f, 0.3f, 0.1f};
-    static float toolCutColor[3] = {0.2f, 0.6f, 1.0f};
-    static bool useDualTrack = false;
-    static bool needRebuild = false;
-    static float tolerance = 1.0f;  // 加工精度 t (mm)，控制模式自动切换
-    static float billetSize[3] = {30.0f, 30.0f, 15.0f};  // Lx, Ly, Lz
+    float cutY=15, cutR=3, cutZ=16;
+    bool layersDirty = true;
+    bool showTool = true;
+    float toolColor[3] = {1.0f, 0.3f, 0.1f};
+    float tolerance = 0.5f;
+    float memBudgetMB = 500.0f;
+    GPUMesh toolMesh;
+
+    // Build original billet mesh (analytic box)
+    {
+        std::vector<float> v; std::vector<uint32_t> i;
+        buildBoxMesh(0,0,0, billetSize[0],billetSize[1],billetSize[2], v, i);
+        billetOrigMesh.upload(v.data(), v.size()*sizeof(float),
+                              i.data(), i.size()*sizeof(uint32_t), (int)i.size());
+    }
 #endif
 
     glfwSetWindowUserPointer(win, &cam);
     glfwSetScrollCallback(win, [](GLFWwindow* w, double, double y){
         auto* c=(Camera*)glfwGetWindowUserPointer(w);
-        c->orthoSize *= (y > 0) ? 0.9f : 1.1f;
-        if(c->orthoSize < 1.0f) c->orthoSize = 1.0f;
-        if(c->orthoSize > 500.0f) c->orthoSize = 500.0f;
+        c->orthoSize *= (y>0)?0.9f:1.1f;
+        if(c->orthoSize<1)c->orthoSize=1;
+        if(c->orthoSize>500)c->orthoSize=500;
     });
-
-    glfwSetKeyCallback(win, [](GLFWwindow* w, int key, int, int action, int){
-        if (key == GLFW_KEY_F && action == GLFW_PRESS) {
-            auto* c=(Camera*)glfwGetWindowUserPointer(w);
-            c->orthoSize = 25.0f; c->yaw = 45; c->pitch = 30;
-            c->tx = 15; c->ty = 15; c->tz = 7.5f;
-        }
-    });
-
-    // ── Debug Viz State ──
-    static int renderMode = 0; // 0=Solid, 1=Wireframe, 2=Solid+Wire
-    static bool showMicroGrid = false;
-    static bool showCutSurface = false;
-    static float cutSurfaceColor[3] = {0.2f, 0.85f, 0.35f};
-    static GLuint csVAO = 0, csVBO = 0, csEBO = 0;
-    static int csIdxCount = 0;
-    static float pointSize = 4.0f;
-    static float wireWidth = 1.5f;
-    static bool clipEnabled = false;
-    static int clipAxis = 2;
-    static float clipPos = 0.5f;
-    static float macroColor[3] = {0.7f, 0.75f, 0.8f};
-    static float microColorActive[3] = {0.1f, 0.85f, 0.3f};
-    static float microColorInactive[3] = {0.85f, 0.1f, 0.1f};
-
-    // ── MicroGrid point cloud data ──
-    static GLuint ptVAO = 0, ptVBO = 0;
-    static int ptCount = 0;
-    static bool ptDirty = true;
 
     while (!glfwWindowShouldClose(win)) {
         glfwPollEvents();
 
-        // CAD-style mouse interaction
-        // Middle button = rotate, Middle+Shift or Right = pan
+        // ── Mouse interaction ──
         {
-            double mx, my; glfwGetCursorPos(win, &mx, &my);
-            bool mmb = glfwGetMouseButton(win, GLFW_MOUSE_BUTTON_MIDDLE) == GLFW_PRESS;
-            bool rmb = glfwGetMouseButton(win, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
-            bool shift = (glfwGetKey(win, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS ||
-                          glfwGetKey(win, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS);
-
-            if (mmb || rmb) {
-                if (!drag) { drag = true; lx = mx; ly = my; }
-                double dx = mx - lx, dy = my - ly;
-
-                if (mmb && !shift) {
-                    // Rotate
-                    cam.yaw += (float)dx * 0.3f;
-                    cam.pitch += (float)dy * 0.3f;
-                    if (cam.pitch > 89) cam.pitch = 89;
-                    if (cam.pitch < -89) cam.pitch = -89;
+            double mx,my; glfwGetCursorPos(win,&mx,&my);
+            bool mmb=glfwGetMouseButton(win,GLFW_MOUSE_BUTTON_MIDDLE)==GLFW_PRESS;
+            bool rmb=glfwGetMouseButton(win,GLFW_MOUSE_BUTTON_RIGHT)==GLFW_PRESS;
+            bool shift=(glfwGetKey(win,GLFW_KEY_LEFT_SHIFT)==GLFW_PRESS);
+            if(mmb||rmb){
+                if(!drag){drag=true;lx=mx;ly=my;}
+                double dx=mx-lx, dy=my-ly;
+                if(mmb&&!shift){
+                    cam.yaw+=(float)dx*0.3f; cam.pitch+=(float)dy*0.3f;
+                    if(cam.pitch>89)cam.pitch=89; if(cam.pitch<-89)cam.pitch=-89;
                 } else {
-                    // Pan (Shift+MMB or RMB)
-                    int vw, vh; glfwGetFramebufferSize(win, &vw, &vh);
-                    float panScale = 2.0f * cam.orthoSize / (float)vh;
-                    float yr = cam.yaw * 3.14159f / 180.0f;
-                    float pr = cam.pitch * 3.14159f / 180.0f;
-                    // Screen right/up in world space
-                    float rx = -sinf(yr), ry = cosf(yr);
-                    cam.tx += (float)dx * panScale * rx;
-                    cam.ty += (float)dx * panScale * ry;
-                    cam.tz += (float)dy * panScale * cosf(pr);
+                    int vw,vh; glfwGetFramebufferSize(win,&vw,&vh);
+                    float ps=2.f*cam.orthoSize/(float)vh;
+                    float yr=cam.yaw*3.14159f/180.f;
+                    cam.tx+=(float)dx*ps*(-sinf(yr));
+                    cam.ty+=(float)dx*ps*(cosf(yr));
+                    cam.tz+=(float)dy*ps;
                 }
-                lx = mx; ly = my;
-            } else {
-                drag = false;
-            }
+                lx=mx;ly=my;
+            } else drag=false;
         }
 
+#if YGG_HAS_OPENVDB
+        // ── Rebuild layers when dirty ──
+        if (layersDirty) {
+            // SDF mesh
+            auto mesh = ygg::vdbToMesh(billet.sdfGrid);
+            sdfMesh.upload(mesh.vertices.data(), mesh.vertices.size()*sizeof(float),
+                           mesh.indices.data(), mesh.indices.size()*sizeof(uint32_t),
+                           (int)mesh.indices.size());
+            // MacroGrid lines
+            if (showMacroGrid) {
+                std::vector<float> lines;
+                buildMacroGridLines(billet.sdfGrid, macroLod, lines);
+                macroLines.upload(lines.data(), lines.size()*sizeof(float), (int)lines.size()/3);
+            }
+            // MicroGrid detail (from buildLocalCutSurface if dual track + cut done)
+            if (showMicroDetail && cutCount > 0 && billet.isDualTrack()) {
+                ygg::ToolSweepSDF lastTool(ygg::ToolType::BALL_END, cutR, 0, 20,
+                    {2,(double)cutY,(double)cutZ}, {billetSize[0]-2.0,(double)cutY,(double)cutZ});
+                auto csGrid = ygg::buildLocalCutSurface(billet, lastTool);
+                auto csMesh = ygg::vdbToMesh(csGrid);
+                microDetailMesh.upload(csMesh.vertices.data(), csMesh.vertices.size()*sizeof(float),
+                                       csMesh.indices.data(), csMesh.indices.size()*sizeof(uint32_t),
+                                       (int)csMesh.indices.size());
+            }
+            layersDirty = false;
+        }
+#endif
+
+        // ── ImGui ──
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        ImGui::Begin("Yggdrasil Debug Panel", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
-
+        ImGui::Begin("Yggdrasil Control", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
 #if YGG_HAS_OPENVDB
-        // ══════ 状态概览栏 ══════
-        ImGui::TextColored(ImVec4(0.4f,0.8f,1.0f,1.0f), "⚙ Simulation State");
+        ImGui::Text("FPS: %.0f | Volume: %.1f mm3 | Cuts: %d", ImGui::GetIO().Framerate, volume, cutCount);
         ImGui::Separator();
-        const char* modeStr = cfg.mode == ygg::ResolutionConfig::SINGLE_TRACK ? "SINGLE_TRACK" :
-                              cfg.mode == ygg::ResolutionConfig::DUAL_TRACK ? "DUAL_TRACK" : "ATLAS";
-        ImGui::Text("Mode: %s | d_v=%.3f D_v=%.3f N=%d", modeStr, cfg.d_v, cfg.D_v, cfg.N);
-        ImGui::Text("Volume: %.1f mm³ | Cuts: %d", volume, cutCount);
-        size_t activeVox = billet.sdfGrid->activeVoxelCount();
-        ImGui::Text("FloatGrid: %zu voxels (%.2f MB)",
-                    activeVox, billet.sdfGrid->memUsage()/1e6);
-        if (billet.microGrid) {
-            size_t ptCnt = openvdb::points::pointCount(billet.microGrid->tree());
-            ImGui::Text("PointGrid: %zu surfels (%.2f MB)",
-                        ptCnt, billet.microGrid->memUsage()/1e6);
-        }
-        ImGui::Spacing();
 
-        // ══════ TabBar ══════
-        if (ImGui::BeginTabBar("DebugTabs")) {
-            // ── Tab: 外观模式 ──
-            if (ImGui::BeginTabItem("Appearance")) {
-                ImGui::Text("Render Mode:");
-                ImGui::RadioButton("Solid", &renderMode, 0); ImGui::SameLine();
-                ImGui::RadioButton("Wireframe", &renderMode, 1); ImGui::SameLine();
-                ImGui::RadioButton("Solid+Wire", &renderMode, 2);
+        if (ImGui::BeginTabBar("Tabs")) {
+            // ══ Visualization Tab ══
+            if (ImGui::BeginTabItem("Visualization")) {
+                ImGui::TextColored(ImVec4(1,0.8f,0.3f,1), "Layer 1: Original Billet");
+                ImGui::Checkbox("Show##orig", &showOrigBillet);
+                if (showOrigBillet) {
+                    ImGui::SameLine(); ImGui::SetNextItemWidth(120);
+                    ImGui::SliderFloat("Alpha##orig", &origAlpha, 0.0f, 1.0f);
+                    ImGui::ColorEdit3("Color##orig", origColor, ImGuiColorEditFlags_NoInputs);
+                }
+                ImGui::Spacing();
 
-                ImGui::Checkbox("Show MicroGrid Points", &showMicroGrid);
-                ImGui::Checkbox("Show Cut Surface (d_v precision)", &showCutSurface);
-                if (showCutSurface)
-                    ImGui::ColorEdit3("Cut Surface Color", cutSurfaceColor);
-                ImGui::SliderFloat("Point Size", &pointSize, 1.0f, 10.0f);
-                ImGui::SliderFloat("Wire Width", &wireWidth, 0.5f, 5.0f);
-                ImGui::ColorEdit3("Macro Color", macroColor);
-                ImGui::ColorEdit3("Micro Active", microColorActive);
+                ImGui::TextColored(ImVec4(0.3f,0.6f,1,1), "Layer 2: MacroGrid Wireframe");
+                if (ImGui::Checkbox("Show##macro", &showMacroGrid)) layersDirty = true;
+                if (showMacroGrid) {
+                    ImGui::SameLine();
+                    if (ImGui::RadioButton("Voxel", &macroLod, 0)) layersDirty = true;
+                    ImGui::SameLine();
+                    if (ImGui::RadioButton("Leaf(8^3)", &macroLod, 1)) layersDirty = true;
+                    ImGui::SameLine();
+                    if (ImGui::RadioButton("BBox", &macroLod, 2)) layersDirty = true;
+                    ImGui::SliderFloat("Line Width", &macroLineWidth, 0.5f, 5.0f);
+                    ImGui::ColorEdit3("Color##macro", macroColor, ImGuiColorEditFlags_NoInputs);
+                }
+                ImGui::Spacing();
+
+                ImGui::TextColored(ImVec4(0.2f,0.9f,0.4f,1), "Layer 3: MicroGrid Detail Surface");
+                if (ImGui::Checkbox("Show##micro", &showMicroDetail)) layersDirty = true;
+                if (showMicroDetail) {
+                    ImGui::Checkbox("Auto Focus (follow cut)", &autoFocus);
+                    ImGui::SliderFloat("Focus Radius (mm)", &focusRadius, 5.0f, 50.0f);
+                    ImGui::ColorEdit3("Color##micro", microColor, ImGuiColorEditFlags_NoInputs);
+                }
+                ImGui::Spacing();
+
+                ImGui::TextColored(ImVec4(0.7f,0.75f,0.8f,1), "SDF Mesh (Marching Cubes)");
+                ImGui::Checkbox("Show##sdf", &showSdfMesh);
+                if (showSdfMesh)
+                    ImGui::ColorEdit3("Color##sdf", sdfColor, ImGuiColorEditFlags_NoInputs);
+
                 ImGui::EndTabItem();
             }
 
-            // ── Tab: 切削控制 ──
+            // ══ Cutting Tab ══
             if (ImGui::BeginTabItem("Cutting")) {
-                // 毛坯尺寸
-                ImGui::Text("Billet Size (mm):");
-                ImGui::SetNextItemWidth(200);
-                ImGui::InputFloat3("Lx Ly Lz", billetSize);
-                if (billetSize[0] < 5) billetSize[0] = 5;
-                if (billetSize[1] < 5) billetSize[1] = 5;
-                if (billetSize[2] < 5) billetSize[2] = 5;
-                ImGui::Separator();
-
-                ImGui::SliderFloat("Cut Y", &cutY, 2.0f, billetSize[1]-2.0f);
-                ImGui::SliderFloat("Cut Z (sphere center)", &cutZ, billetSize[2]*0.5f, billetSize[2]+5.0f);
-                ImGui::SliderFloat("Tool R", &cutR, 1.0f, 8.0f);
-                ImGui::Text("Cut depth: %.1f mm", billetSize[2] + cutR - cutZ);
-                ImGui::Separator();
-                ImGui::Checkbox("Show Tool", &showTool);
-                if (showTool) {
-                    ImGui::ColorEdit3("Tool Color", toolColor);
-                    ImGui::ColorEdit3("Cut Zone Color", toolCutColor);
-                }
-                ImGui::Separator();
-                ImGui::Text("Precision Control:");
-                ImGui::SliderFloat("##tol_slider", &tolerance, 0.001f, 2.0f, "%.4f", ImGuiSliderFlags_Logarithmic);
-                ImGui::SameLine();
-                ImGui::SetNextItemWidth(80);
-                ImGui::InputFloat("t (mm)", &tolerance, 0, 0, "%.4f");
-                if (tolerance < 0.001f) tolerance = 0.001f;
-                if (tolerance > 10.0f) tolerance = 10.0f;
-                ImGui::Text("d_v = %.4f mm (= t/2)", tolerance * 0.5f);
-
-                static float memBudgetMB = 500.0f; // 降低默认值让DUAL_TRACK更容易触发
-                ImGui::SliderFloat("Mem Budget (MB)", &memBudgetMB, 100.0f, 4000.0f);
+                // ─── Build Section ───
+                ImGui::TextColored(ImVec4(0.4f,0.8f,1,1), "Build Settings");
+                ImGui::InputFloat3("Billet (mm)", billetSize);
+                ImGui::SliderFloat("Tolerance t", &tolerance, 0.001f, 2.0f, "%.4f", ImGuiSliderFlags_Logarithmic);
+                ImGui::SliderFloat("Mem Budget (MB)", &memBudgetMB, 50.0f, 4000.0f);
 
                 auto previewCfg = ygg::solveResolution(
                     (double)tolerance, (double)cutR, 2.0,
-                    {(double)billetSize[0], (double)billetSize[1], (double)billetSize[2]},
-                    static_cast<size_t>(memBudgetMB * 1024 * 1024));
-                const char* autoMode = previewCfg.mode == ygg::ResolutionConfig::SINGLE_TRACK ? "SINGLE_TRACK" :
-                                       previewCfg.mode == ygg::ResolutionConfig::DUAL_TRACK ? "DUAL_TRACK" : "ATLAS";
-                ImVec4 modeColor = previewCfg.mode == ygg::ResolutionConfig::SINGLE_TRACK ?
-                    ImVec4(0.3f,1.0f,0.3f,1.0f) : ImVec4(1.0f,0.8f,0.2f,1.0f);
-                ImGui::TextColored(modeColor, "Target: %s (D_v=%.3f N=%d)",
-                                   autoMode, previewCfg.D_v, previewCfg.N);
+                    {(double)billetSize[0],(double)billetSize[1],(double)billetSize[2]},
+                    static_cast<size_t>(memBudgetMB*1024*1024));
+                const char* mStr = previewCfg.mode==ygg::ResolutionConfig::SINGLE_TRACK?"SINGLE":
+                    previewCfg.mode==ygg::ResolutionConfig::DUAL_TRACK?"DUAL":"ATLAS";
+                ImGui::TextColored(ImVec4(0.3f,1,0.3f,1), "Preview: %s d_v=%.4f D_v=%.3f N=%d",
+                    mStr, previewCfg.d_v, previewCfg.D_v, previewCfg.N);
 
-                // Apply 按钮
-                static double buildTimeMs = 0;
-                ImGui::SameLine(0, 20);
-                if (ImGui::Button("Apply")) {
-                    auto t0 = std::chrono::high_resolution_clock::now();
+                static double buildMs=0;
+                if (ImGui::Button("Apply (Rebuild)")) {
+                    auto t0=std::chrono::high_resolution_clock::now();
                     cfg = previewCfg;
-                    billet = ygg::buildBillet(cfg, {0,0,0}, {(double)billetSize[0], (double)billetSize[1], (double)billetSize[2]});
-                    mesh = ygg::vdbToMesh(billet.sdfGrid);
-                    uploadMesh(mesh.vertices.data(), mesh.vertices.size()*sizeof(float),
-                               mesh.indices.data(), mesh.indices.size()*sizeof(uint32_t),
-                               (int)mesh.indices.size());
+                    billet = ygg::buildBillet(cfg, {0,0,0},
+                        {(double)billetSize[0],(double)billetSize[1],(double)billetSize[2]});
                     volume = ygg::computeVolume(billet.sdfGrid);
-                    cutCount = 0;
-                    ptDirty = true;
-                    useDualTrack = (cfg.mode == ygg::ResolutionConfig::DUAL_TRACK);
-                    auto t1 = std::chrono::high_resolution_clock::now();
-                    buildTimeMs = std::chrono::duration<double, std::milli>(t1-t0).count();
+                    cutCount=0; layersDirty=true;
+                    // Rebuild analytic billet mesh
+                    std::vector<float> bv; std::vector<uint32_t> bi;
+                    buildBoxMesh(0,0,0,billetSize[0],billetSize[1],billetSize[2],bv,bi);
+                    billetOrigMesh.upload(bv.data(),bv.size()*sizeof(float),
+                        bi.data(),bi.size()*sizeof(uint32_t),(int)bi.size());
+                    cam.tx=billetSize[0]/2; cam.ty=billetSize[1]/2; cam.tz=billetSize[2]/2;
+                    auto t1=std::chrono::high_resolution_clock::now();
+                    buildMs=std::chrono::duration<double,std::milli>(t1-t0).count();
                 }
-
-                // 当前状态 vs 预览状态
-                const char* curMode = cfg.mode == ygg::ResolutionConfig::SINGLE_TRACK ? "SINGLE_TRACK" :
-                                      cfg.mode == ygg::ResolutionConfig::DUAL_TRACK ? "DUAL_TRACK" : "ATLAS";
-                ImGui::Text("Current: %s (d_v=%.4f D_v=%.3f N=%d)", curMode, cfg.d_v, cfg.D_v, cfg.N);
-                if (cfg.mode == ygg::ResolutionConfig::SINGLE_TRACK) {
-                    ImGui::Text("  Mesh VoxelSize = %.4f mm (= d_v, full precision)", cfg.d_v);
-                } else {
-                    ImGui::TextColored(ImVec4(1,0.8f,0.2f,1),
-                        "  Mesh VoxelSize = %.3f mm (= D_v, coarse for display)", cfg.D_v);
-                    ImGui::TextColored(ImVec4(0.5f,1,0.5f,1),
-                        "  Surfel precision = %.4f mm (= d_v, check MicroGrid points)", cfg.d_v);
-                }
-                if (buildTimeMs > 0)
-                    ImGui::Text("Last build: %.1f ms | Mesh: %zu verts | Voxels: %zu",
-                                buildTimeMs, mesh.vertices.size()/6,
-                                billet.sdfGrid->activeVoxelCount());
+                if (buildMs>0) ImGui::SameLine(), ImGui::Text("%.1f ms", buildMs);
                 ImGui::Separator();
-                static int cutStrategy = 3; // D=parallel
-                ImGui::Combo("Cut Strategy", &cutStrategy, "A: Brute-force\0B: Active-only (serial)\0C: Rasterize+CSG\0D: Active-only (parallel)\0");
-                static double cutTimeMs = 0, meshTimeMs = 0, uploadTimeMs = 0;
+
+                // ─── Cut Section ───
+                ImGui::TextColored(ImVec4(1,0.6f,0.2f,1), "Cut Parameters");
+                ImGui::SliderFloat("Cut Y", &cutY, 2.0f, billetSize[1]-2.0f);
+                ImGui::SliderFloat("Cut Z", &cutZ, billetSize[2]*0.5f, billetSize[2]+5.0f);
+                ImGui::SliderFloat("Tool R", &cutR, 1.0f, 8.0f);
+                ImGui::Text("Depth: %.1f mm", billetSize[2]+cutR-cutZ);
+
+                static double cutMs=0;
+                static std::string cutInfo;
+                // Pre-compute cut scale info
+                {
+                    double pathLen = billetSize[0] - 4.0; // start=2, end=billetSize[0]-2
+                    ygg::ToolSweepSDF previewTool(ygg::ToolType::BALL_END, cutR, 0, 20,
+                        {2,(double)cutY,(double)cutZ}, {billetSize[0]-2.0,(double)cutY,(double)cutZ});
+                    auto tbbox = previewTool.getBoundingBox();
+                    auto tMin = billet.sdfGrid->transform().worldToIndexCellCentered(tbbox.min());
+                    auto tMax = billet.sdfGrid->transform().worldToIndexCellCentered(tbbox.max());
+                    long long voxelEst = (long long)(tMax.x()-tMin.x()+1)*(tMax.y()-tMin.y()+1)*(tMax.z()-tMin.z()+1);
+                    char buf[256];
+                    snprintf(buf, sizeof(buf),
+                        "Path: %.1fmm | R=%.1f | d_v=%.4f | BBox voxels: %lld | N=%d (surfels/voxel: %d)",
+                        pathLen, cutR, cfg.d_v, voxelEst, cfg.N, cfg.N*cfg.N);
+                    cutInfo = buf;
+                }
+                ImGui::TextWrapped("%s", cutInfo.c_str());
+
                 if (ImGui::Button("Execute Cut")) {
-                    auto tc0 = std::chrono::high_resolution_clock::now();
+                    printf("[Cut] Computing... %s\n", cutInfo.c_str());
+                    fflush(stdout);
+                    auto t0=std::chrono::high_resolution_clock::now();
                     ygg::CuttingEngine engine;
-                    engine.strategy = static_cast<ygg::CuttingEngine::Strategy>(cutStrategy);
                     engine.cut(billet, ygg::ToolSweepSDF(
                         ygg::ToolType::BALL_END, cutR, 0, 20,
-                        {2,(double)cutY,(double)cutZ}, {28,(double)cutY,(double)cutZ}));
-                    auto tc1 = std::chrono::high_resolution_clock::now();
-                    mesh = ygg::vdbToMesh(billet.sdfGrid);
-                    auto tc2 = std::chrono::high_resolution_clock::now();
-                    uploadMesh(mesh.vertices.data(), mesh.vertices.size()*sizeof(float),
-                               mesh.indices.data(), mesh.indices.size()*sizeof(uint32_t),
-                               (int)mesh.indices.size());
-                    auto tc3 = std::chrono::high_resolution_clock::now();
+                        {2,(double)cutY,(double)cutZ}, {billetSize[0]-2.0,(double)cutY,(double)cutZ}));
+                    auto t1=std::chrono::high_resolution_clock::now();
                     volume = ygg::computeVolume(billet.sdfGrid);
                     cutCount++;
-                    ptDirty = true;
-
-                    // 构建精确切削面 mesh（d_v 精度）
-                    if (showCutSurface && billet.isDualTrack()) {
-                        ygg::ToolSweepSDF lastTool(ygg::ToolType::BALL_END, cutR, 0, 20,
-                            {2,(double)cutY,(double)cutZ}, {28,(double)cutY,(double)cutZ});
-                        auto csGrid = ygg::buildLocalCutSurface(billet, lastTool);
-                        auto csMesh = ygg::vdbToMesh(csGrid);
-                        if (!csVAO) { glGenVertexArrays(1,&csVAO); glGenBuffers(1,&csVBO); glGenBuffers(1,&csEBO); }
-                        glBindVertexArray(csVAO);
-                        glBindBuffer(GL_ARRAY_BUFFER, csVBO);
-                        glBufferData(GL_ARRAY_BUFFER, csMesh.vertices.size()*sizeof(float), csMesh.vertices.data(), GL_DYNAMIC_DRAW);
-                        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, csEBO);
-                        glBufferData(GL_ELEMENT_ARRAY_BUFFER, csMesh.indices.size()*sizeof(uint32_t), csMesh.indices.data(), GL_DYNAMIC_DRAW);
-                        glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,6*sizeof(float),(void*)0);
-                        glEnableVertexAttribArray(0);
-                        glVertexAttribPointer(1,3,GL_FLOAT,GL_FALSE,6*sizeof(float),(void*)(3*sizeof(float)));
-                        glEnableVertexAttribArray(1);
-                        csIdxCount = (int)csMesh.indices.size();
-                    }
-                    cutTimeMs = std::chrono::duration<double,std::milli>(tc1-tc0).count();
-                    meshTimeMs = std::chrono::duration<double,std::milli>(tc2-tc1).count();
-                    uploadTimeMs = std::chrono::duration<double,std::milli>(tc3-tc2).count();
-                }
-                if (cutTimeMs > 0) {
-                    ImGui::Text("Cut: %.1f ms | Mesh: %.1f ms | Upload: %.1f ms | Total: %.1f ms",
-                                cutTimeMs, meshTimeMs, uploadTimeMs, cutTimeMs+meshTimeMs+uploadTimeMs);
+                    layersDirty = true;
+                    cutMs=std::chrono::duration<double,std::milli>(t1-t0).count();
                 }
                 ImGui::SameLine();
                 if (ImGui::Button("Reset")) {
-                    billet = ygg::buildBillet(cfg, {0,0,0}, {(double)billetSize[0], (double)billetSize[1], (double)billetSize[2]});
-                    mesh = ygg::vdbToMesh(billet.sdfGrid);
-                    uploadMesh(mesh.vertices.data(), mesh.vertices.size()*sizeof(float),
-                               mesh.indices.data(), mesh.indices.size()*sizeof(uint32_t),
-                               (int)mesh.indices.size());
+                    billet = ygg::buildBillet(cfg, {0,0,0},
+                        {(double)billetSize[0],(double)billetSize[1],(double)billetSize[2]});
                     volume = ygg::computeVolume(billet.sdfGrid);
-                    cutCount = 0;
-                    ptDirty = true;
+                    cutCount=0; layersDirty=true;
                 }
-                ImGui::EndTabItem();
-            }
+                if (cutMs>0) ImGui::Text("Cut: %.1f ms", cutMs);
 
-            // ── Tab: 数据检查 ──
-            if (ImGui::BeginTabItem("Inspect")) {
-                ImGui::Checkbox("Clip Plane", &clipEnabled);
-                if (clipEnabled) {
-                    ImGui::RadioButton("X", &clipAxis, 0); ImGui::SameLine();
-                    ImGui::RadioButton("Y", &clipAxis, 1); ImGui::SameLine();
-                    ImGui::RadioButton("Z", &clipAxis, 2);
-                    ImGui::SliderFloat("Position", &clipPos, 0.0f, 1.0f);
-                }
-                ImGui::EndTabItem();
-            }
-
-            // ── Tab: 性能 ──
-            if (ImGui::BeginTabItem("Performance")) {
-                ImGui::Text("FPS: %.1f (%.2f ms)", ImGui::GetIO().Framerate, 1000.0f/ImGui::GetIO().Framerate);
-                ImGui::Text("Mesh vertices: %zu", mesh.vertices.size()/6);
-                ImGui::Text("Mesh indices: %zu", mesh.indices.size());
                 ImGui::Separator();
-                ImGui::Text("FloatGrid: %.2f MB", billet.sdfGrid->memUsage()/1e6);
-                if (billet.microGrid)
-                    ImGui::Text("PointGrid: %.2f MB", billet.microGrid->memUsage()/1e6);
+                // ─── Tool Display ───
+                ImGui::Checkbox("Show Tool", &showTool);
+                if (showTool) ImGui::ColorEdit3("Tool Color", toolColor, ImGuiColorEditFlags_NoInputs);
+
+                ImGui::Separator();
+                const char* curMode = cfg.mode==ygg::ResolutionConfig::SINGLE_TRACK?"SINGLE":
+                    cfg.mode==ygg::ResolutionConfig::DUAL_TRACK?"DUAL":"ATLAS";
+                ImGui::Text("Active: %s d_v=%.4f D_v=%.3f N=%d", curMode, cfg.d_v, cfg.D_v, cfg.N);
+                ImGui::Text("Voxels: %zu | Mem: %.2f MB",
+                    billet.sdfGrid->activeVoxelCount(), billet.sdfGrid->memUsage()/1e6);
                 ImGui::EndTabItem();
             }
 
+            // ══ Performance Tab ══
+            if (ImGui::BeginTabItem("Performance")) {
+                ImGui::Text("FPS: %.1f (%.2f ms/frame)", ImGui::GetIO().Framerate, 1000.f/ImGui::GetIO().Framerate);
+                ImGui::Text("SDF Mesh: %d triangles", sdfMesh.count/3);
+                ImGui::Text("MacroGrid: %d line segments", macroLines.count/2);
+                ImGui::Text("MicroDetail: %d triangles", microDetailMesh.count/3);
+                ImGui::EndTabItem();
+            }
             ImGui::EndTabBar();
         }
 #else
@@ -508,187 +558,99 @@ int main() {
         ImGui::End();
         ImGui::Render();
 
-        // ══════ Render ══════
-        int w, h; glfwGetFramebufferSize(win, &w, &h);
-        glViewport(0, 0, w, h);
-        glClearColor(0.15f, 0.15f, 0.18f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        // ═══════════════════════════════════════════════════════════
+        // Render passes
+        // ═══════════════════════════════════════════════════════════
+        int w,h; glfwGetFramebufferSize(win,&w,&h);
+        glViewport(0,0,w,h);
+        glClearColor(0.12f,0.12f,0.15f,1);
+        glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
 
-        if (g_idxCount > 0) {
-            float mvp[16], nm[9];
-            buildMVP(cam, w, h, mvp, nm);
-            glUseProgram(g_prog);
-            glUniformMatrix4fv(glGetUniformLocation(g_prog,"uMVP"),1,GL_FALSE,mvp);
-            glUniformMatrix3fv(glGetUniformLocation(g_prog,"uNormalMat"),1,GL_FALSE,nm);
-            glUniform3f(glGetUniformLocation(g_prog,"uLightDir"),0.30f,0.51f,0.81f);
+        float mvp[16], nm[9];
+        buildMVP(cam, w, h, mvp, nm);
 
-            // Clip plane
-            float clipPlane[4] = {0,0,0,0};
-            if (clipEnabled) {
-                clipPlane[clipAxis] = 1.0f;
-                clipPlane[3] = -(clipPos * billetSize[clipAxis]);
-                glEnable(GL_CLIP_DISTANCE0);
-            } else {
-                glDisable(GL_CLIP_DISTANCE0);
-            }
-            glUniform4f(glGetUniformLocation(g_prog,"uClipPlane"),
-                        clipPlane[0], clipPlane[1], clipPlane[2], clipPlane[3]);
+        // ── Pass 1: Opaque objects (depth write ON) ──
+        glDepthMask(GL_TRUE);
+        glDisable(GL_BLEND);
 
-            // Solid pass
-            if (renderMode == 0 || renderMode == 2) {
-                glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
-                glUniform3f(glGetUniformLocation(g_prog,"uColor"),
-                            macroColor[0], macroColor[1], macroColor[2]);
-                glBindVertexArray(g_VAO);
-                glDrawElements(GL_TRIANGLES, g_idxCount, GL_UNSIGNED_INT, nullptr);
-            }
-            // Wireframe pass
-            if (renderMode == 1 || renderMode == 2) {
-                glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
-                glLineWidth(wireWidth);
-                glEnable(GL_POLYGON_OFFSET_LINE);
-                glPolygonOffset(-1.0f, -1.0f);
-                glUniform3f(glGetUniformLocation(g_prog,"uColor"), 0.2f, 0.2f, 0.25f);
-                glBindVertexArray(g_VAO);
-                glDrawElements(GL_TRIANGLES, g_idxCount, GL_UNSIGNED_INT, nullptr);
-                glDisable(GL_POLYGON_OFFSET_LINE);
-                glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
-            }
+        // SDF mesh (main workpiece)
+        if (showSdfMesh && sdfMesh.count>0) {
+            glUseProgram(meshProg);
+            glUniformMatrix4fv(glGetUniformLocation(meshProg,"uMVP"),1,GL_FALSE,mvp);
+            glUniformMatrix3fv(glGetUniformLocation(meshProg,"uNormalMat"),1,GL_FALSE,nm);
+            glUniform3f(glGetUniformLocation(meshProg,"uLightDir"),0.30f,0.51f,0.81f);
+            glUniform3f(glGetUniformLocation(meshProg,"uColor"),sdfColor[0],sdfColor[1],sdfColor[2]);
+            glUniform1f(glGetUniformLocation(meshProg,"uAlpha"),1.0f);
+            sdfMesh.draw();
+        }
 
-            glDisable(GL_CLIP_DISTANCE0);
+        // MicroGrid detail surface
+        if (showMicroDetail && microDetailMesh.count>0) {
+            glUseProgram(meshProg);
+            glUniformMatrix4fv(glGetUniformLocation(meshProg,"uMVP"),1,GL_FALSE,mvp);
+            glUniformMatrix3fv(glGetUniformLocation(meshProg,"uNormalMat"),1,GL_FALSE,nm);
+            glUniform3f(glGetUniformLocation(meshProg,"uLightDir"),0.30f,0.51f,0.81f);
+            glUniform3f(glGetUniformLocation(meshProg,"uColor"),microColor[0],microColor[1],microColor[2]);
+            glUniform1f(glGetUniformLocation(meshProg,"uAlpha"),1.0f);
+            microDetailMesh.draw();
+        }
+
+        // MacroGrid wireframe
+        if (showMacroGrid && macroLines.count>0) {
+            glUseProgram(lineProg);
+            glUniformMatrix4fv(glGetUniformLocation(lineProg,"uMVP"),1,GL_FALSE,mvp);
+            glUniform3f(glGetUniformLocation(lineProg,"uColor"),macroColor[0],macroColor[1],macroColor[2]);
+            glUniform1f(glGetUniformLocation(lineProg,"uAlpha"),1.0f);
+            glLineWidth(macroLineWidth);
+            macroLines.draw();
         }
 
 #if YGG_HAS_OPENVDB
-        // ── Cut Surface (high-res) rendering ──
-        if (showCutSurface && csIdxCount > 0) {
-            float mvp2[16], nm2[9];
-            buildMVP(cam, w, h, mvp2, nm2);
-            glUseProgram(g_prog);
-            glUniformMatrix4fv(glGetUniformLocation(g_prog,"uMVP"),1,GL_FALSE,mvp2);
-            glUniformMatrix3fv(glGetUniformLocation(g_prog,"uNormalMat"),1,GL_FALSE,nm2);
-            glUniform3f(glGetUniformLocation(g_prog,"uLightDir"),0.30f,0.51f,0.81f);
-            glUniform3f(glGetUniformLocation(g_prog,"uColor"),
-                        cutSurfaceColor[0], cutSurfaceColor[1], cutSurfaceColor[2]);
-            float noClip[4] = {0,0,0,0};
-            glUniform4f(glGetUniformLocation(g_prog,"uClipPlane"),0,0,0,0);
-            glBindVertexArray(csVAO);
-            glDrawElements(GL_TRIANGLES, csIdxCount, GL_UNSIGNED_INT, nullptr);
-        }
-
-        // ── Tool visualization ──
+        // Tool visualization (sphere at last path endpoint)
         if (showTool) {
-            // 生成刀具胶囊体的简化表示（两端球 + 中间线）
-            // 简化：只画一个球体代表刀具当前位置（中点）
-            static GLuint toolVAO=0, toolVBO=0, toolEBO=0;
-            static int toolIdxCount=0;
-            static float lastToolR=0, lastToolZ=0, lastToolY=0;
-            if (cutR != lastToolR || cutZ != lastToolZ || cutY != lastToolY) {
-                // 重建刀具 mesh（用 SDF 球体光栅化 + volumeToMesh）
-                auto toolXform = openvdb::math::Transform::createLinearTransform(0.3);
-                auto toolSphere = openvdb::tools::createLevelSetSphere<openvdb::FloatGrid>(
-                    float(cutR), openvdb::Vec3f(28.0f, cutY, cutZ), float(0.5), float(3.0));
-                auto toolMesh = ygg::vdbToMesh(toolSphere);
-                if (!toolVAO) { glGenVertexArrays(1,&toolVAO); glGenBuffers(1,&toolVBO); glGenBuffers(1,&toolEBO); }
-                glBindVertexArray(toolVAO);
-                glBindBuffer(GL_ARRAY_BUFFER, toolVBO);
-                glBufferData(GL_ARRAY_BUFFER, toolMesh.vertices.size()*sizeof(float), toolMesh.vertices.data(), GL_DYNAMIC_DRAW);
-                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, toolEBO);
-                glBufferData(GL_ELEMENT_ARRAY_BUFFER, toolMesh.indices.size()*sizeof(uint32_t), toolMesh.indices.data(), GL_DYNAMIC_DRAW);
-                glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,6*sizeof(float),(void*)0);
-                glEnableVertexAttribArray(0);
-                glVertexAttribPointer(1,3,GL_FLOAT,GL_FALSE,6*sizeof(float),(void*)(3*sizeof(float)));
-                glEnableVertexAttribArray(1);
-                toolIdxCount = (int)toolMesh.indices.size();
-                lastToolR=cutR; lastToolZ=cutZ; lastToolY=cutY;
+            static float lastR=0, lastY=0, lastZ=0, lastBX=0;
+            if (cutR!=lastR || cutY!=lastY || cutZ!=lastZ || billetSize[0]!=lastBX) {
+                auto sphere = openvdb::tools::createLevelSetSphere<openvdb::FloatGrid>(
+                    float(cutR), openvdb::Vec3f(float(billetSize[0]-2), cutY, cutZ), 0.5f);
+                auto tm = ygg::vdbToMesh(sphere);
+                toolMesh.upload(tm.vertices.data(), tm.vertices.size()*sizeof(float),
+                    tm.indices.data(), tm.indices.size()*sizeof(uint32_t), (int)tm.indices.size());
+                lastR=cutR; lastY=cutY; lastZ=cutZ; lastBX=billetSize[0];
             }
-            if (toolIdxCount > 0) {
-                float mvp[16], nm[9];
-                buildMVP(cam, w, h, mvp, nm);
-                glUseProgram(g_prog);
-                glUniformMatrix4fv(glGetUniformLocation(g_prog,"uMVP"),1,GL_FALSE,mvp);
-                glUniformMatrix3fv(glGetUniformLocation(g_prog,"uNormalMat"),1,GL_FALSE,nm);
-                glUniform3f(glGetUniformLocation(g_prog,"uLightDir"),0.30f,0.51f,0.81f);
-                // 底部半球（切削区）用 cutColor，上半用 toolColor
-                // 简化：整个球用 toolColor，半透明
+            if (toolMesh.count > 0) {
                 glEnable(GL_BLEND);
                 glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-                glUniform3f(glGetUniformLocation(g_prog,"uColor"),toolColor[0],toolColor[1],toolColor[2]);
-                glBindVertexArray(toolVAO);
-                glDrawElements(GL_TRIANGLES, toolIdxCount, GL_UNSIGNED_INT, nullptr);
+                glUseProgram(meshProg);
+                glUniformMatrix4fv(glGetUniformLocation(meshProg,"uMVP"),1,GL_FALSE,mvp);
+                glUniformMatrix3fv(glGetUniformLocation(meshProg,"uNormalMat"),1,GL_FALSE,nm);
+                glUniform3f(glGetUniformLocation(meshProg,"uLightDir"),0.30f,0.51f,0.81f);
+                glUniform3f(glGetUniformLocation(meshProg,"uColor"),toolColor[0],toolColor[1],toolColor[2]);
+                glUniform1f(glGetUniformLocation(meshProg,"uAlpha"),0.6f);
+                toolMesh.draw();
                 glDisable(GL_BLEND);
             }
         }
 #endif
 
-#if YGG_HAS_OPENVDB
-        // ── MicroGrid point cloud rendering ──
-        if (showMicroGrid && billet.microGrid) {
-            if (ptDirty) {
-                // Extract surfel positions + colors
-                std::vector<float> ptData; // x,y,z,r,g,b per point
-                auto& tree = billet.microGrid->tree();
-                auto& xf = billet.microGrid->transform();
-                for (auto leaf = tree.cbeginLeaf(); leaf; ++leaf) {
-                    auto leafOrigin = leaf->origin();
-                    auto& attrSet = leaf->attributeSet();
-                    auto* posArr = attrSet.get("P");
-                    auto* activeArr = attrSet.get("active");
-                    if (!posArr || !activeArr) continue;
-                    auto ph = openvdb::points::AttributeHandle<openvdb::Vec3f>::create(*posArr);
-                    auto ah = openvdb::points::AttributeHandle<uint8_t>::create(*activeArr);
+        // ── Pass 2: Transparent objects (depth test ON, depth write OFF) ──
+        if (showOrigBillet && billetOrigMesh.count>0) {
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glDepthMask(GL_FALSE);
 
-                    for (openvdb::Index vIdx = 0; vIdx < 512; ++vIdx) {
-                        openvdb::Index end = static_cast<openvdb::Index>(leaf->getValue(vIdx));
-                        openvdb::Index start = (vIdx==0) ? openvdb::Index(0) :
-                            static_cast<openvdb::Index>(leaf->getValue(vIdx-1));
-                        openvdb::Coord lc((vIdx>>6)&7,(vIdx>>3)&7,vIdx&7);
-                        openvdb::Coord vc = leafOrigin + lc;
-                        for (openvdb::Index i = start; i < end; ++i) {
-                            auto p = ph->get(i);
-                            auto wp = xf.indexToWorld(openvdb::Vec3d(
-                                vc.x()+p.x(), vc.y()+p.y(), vc.z()+p.z()));
-                            ptData.push_back(float(wp.x()));
-                            ptData.push_back(float(wp.y()));
-                            ptData.push_back(float(wp.z()));
-                            if (ah->get(i) == 1) {
-                                ptData.push_back(microColorActive[0]);
-                                ptData.push_back(microColorActive[1]);
-                                ptData.push_back(microColorActive[2]);
-                            } else {
-                                ptData.push_back(microColorInactive[0]);
-                                ptData.push_back(microColorInactive[1]);
-                                ptData.push_back(microColorInactive[2]);
-                            }
-                        }
-                    }
-                }
-                ptCount = (int)(ptData.size() / 6);
-                if (!ptVAO) { glGenVertexArrays(1, &ptVAO); glGenBuffers(1, &ptVBO); }
-                glBindVertexArray(ptVAO);
-                glBindBuffer(GL_ARRAY_BUFFER, ptVBO);
-                glBufferData(GL_ARRAY_BUFFER, ptData.size()*sizeof(float), ptData.data(), GL_DYNAMIC_DRAW);
-                glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6*sizeof(float), (void*)0);
-                glEnableVertexAttribArray(0);
-                glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6*sizeof(float), (void*)(3*sizeof(float)));
-                glEnableVertexAttribArray(1);
-                ptDirty = false;
-            }
-            if (ptCount > 0) {
-                float mvp[16], nm[9];
-                buildMVP(cam, w, h, mvp, nm);
-                glUseProgram(g_prog);
-                glUniformMatrix4fv(glGetUniformLocation(g_prog,"uMVP"),1,GL_FALSE,mvp);
-                glUniform3f(glGetUniformLocation(g_prog,"uLightDir"),0,0,1);
-                glPointSize(pointSize);
-                glEnable(GL_PROGRAM_POINT_SIZE);
-                glBindVertexArray(ptVAO);
-                // Use vertex color as uColor trick: set uColor to white, multiply in shader
-                glUniform3f(glGetUniformLocation(g_prog,"uColor"), 1.0f, 1.0f, 1.0f);
-                glDrawArrays(GL_POINTS, 0, ptCount);
-            }
+            glUseProgram(meshProg);
+            glUniformMatrix4fv(glGetUniformLocation(meshProg,"uMVP"),1,GL_FALSE,mvp);
+            glUniformMatrix3fv(glGetUniformLocation(meshProg,"uNormalMat"),1,GL_FALSE,nm);
+            glUniform3f(glGetUniformLocation(meshProg,"uLightDir"),0.30f,0.51f,0.81f);
+            glUniform3f(glGetUniformLocation(meshProg,"uColor"),origColor[0],origColor[1],origColor[2]);
+            glUniform1f(glGetUniformLocation(meshProg,"uAlpha"),origAlpha);
+            billetOrigMesh.draw();
+
+            glDepthMask(GL_TRUE);
+            glDisable(GL_BLEND);
         }
-#endif
 
+        // ── Pass 3: Overlay (ImGui) ──
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         glfwSwapBuffers(win);
     }
