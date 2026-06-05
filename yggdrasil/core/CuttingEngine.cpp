@@ -214,7 +214,7 @@ static void cutSingleTrack(BilletModel& billet, const ToolSweepSDF& toolSDF, Cut
     }
 }
 
-// ─── Phase 2 helper: inject a batch of surfels into existing microGrid incrementally ───
+// ─── Phase 2 helper: inject surfels into microGrid (safe rebuild if exists) ───
 static void injectSurfels(BilletModel& billet,
                           const std::vector<openvdb::Vec3R>& positions,
                           const std::vector<openvdb::Vec3f>& normals,
@@ -223,13 +223,50 @@ static void injectSurfels(BilletModel& billet,
     openvdb::points::TypedAttributeArray<openvdb::Vec3f>::registerType();
     openvdb::points::TypedAttributeArray<uint8_t>::registerType();
 
-    // Build a temporary PointDataGrid for the new surfels
-    auto newGrid = openvdb::points::createPointDataGrid<
-        openvdb::points::NullCodec, openvdb::points::PointDataGrid>(positions, xform);
+    // Collect existing active points if microGrid exists
+    std::vector<openvdb::Vec3R> allPos;
+    std::vector<openvdb::Vec3f> allNorm;
 
-    // Attach attributes to new grid
+    if (billet.microGrid) {
+        for (auto leaf = billet.microGrid->tree().cbeginLeaf(); leaf; ++leaf) {
+            auto lo = leaf->origin();
+            auto& as = leaf->attributeSet();
+            auto* posArr = as.get("P");
+            auto* normArr = as.get("normal");
+            auto* actArr = as.get("active");
+            if (!posArr) continue;
+            auto ph = openvdb::points::AttributeHandle<openvdb::Vec3f>::create(*posArr);
+            auto nh = normArr ? openvdb::points::AttributeHandle<openvdb::Vec3f>::create(*normArr) : nullptr;
+            auto ah = actArr ? openvdb::points::AttributeHandle<uint8_t>::create(*actArr) : nullptr;
+            for (openvdb::Index vIdx = 0; vIdx < 512; ++vIdx) {
+                openvdb::Index end = static_cast<openvdb::Index>(leaf->getValue(vIdx));
+                openvdb::Index start = (vIdx==0) ? openvdb::Index(0) :
+                    static_cast<openvdb::Index>(leaf->getValue(vIdx-1));
+                if (start==end) continue;
+                openvdb::Coord vc = lo + openvdb::Coord((vIdx>>6)&7,(vIdx>>3)&7,vIdx&7);
+                for (openvdb::Index i = start; i < end; ++i) {
+                    if (ah && ah->get(i)==0) continue; // skip inactive
+                    auto p = ph->get(i);
+                    allPos.push_back(xform.indexToWorld(
+                        Vec3d(vc.x()+p.x(), vc.y()+p.y(), vc.z()+p.z())));
+                    allNorm.push_back(nh ? nh->get(i) : openvdb::Vec3f(0,0,1));
+                }
+            }
+        }
+    }
+
+    // Append new points
+    allPos.insert(allPos.end(), positions.begin(), positions.end());
+    allNorm.insert(allNorm.end(), normals.begin(), normals.end());
+
+    // Build fresh PointDataGrid
+    auto grid = openvdb::points::createPointDataGrid<
+        openvdb::points::NullCodec, openvdb::points::PointDataGrid>(allPos, xform);
+    grid->setName("micro_surfels");
+
+    // Attach attributes
     size_t idx = 0;
-    for (auto leaf = newGrid->tree().beginLeaf(); leaf; ++leaf) {
+    for (auto leaf = grid->tree().beginLeaf(); leaf; ++leaf) {
         auto as = leaf->stealAttributeSet();
         if (as->descriptor().find("normal") == openvdb::points::AttributeSet::INVALID_POS)
             as->appendAttribute("normal",
@@ -245,20 +282,13 @@ static void injectSurfels(BilletModel& billet,
         auto whN = openvdb::points::AttributeWriteHandle<openvdb::Vec3f>::create(*as2->get("normal"));
         auto whA = openvdb::points::AttributeWriteHandle<uint8_t>::create(*as2->get("active"));
         for (size_t i = 0; i < whN->size(); ++i, ++idx) {
-            whN->set(i, idx < normals.size() ? normals[idx] : openvdb::Vec3f(0));
+            whN->set(i, idx < allNorm.size() ? allNorm[idx] : openvdb::Vec3f(0));
             whA->set(i, 1);
         }
         leaf->replaceAttributeSet(as2.release(), true);
     }
 
-    if (!billet.microGrid) {
-        billet.microGrid = newGrid;
-        billet.microGrid->setName("micro_surfels");
-    } else {
-        // Incremental merge: steal new leaves into existing tree
-        // Only works when new leaves occupy previously empty coords
-        billet.microGrid->tree().merge(newGrid->tree());
-    }
+    billet.microGrid = grid;
 }
 
 // 双轨切削：工业级 4-phase（增量注入 + 并行裁剪 + 分块采样）
@@ -340,28 +370,32 @@ static void cutDualTrack(BilletModel& billet, const ToolSweepSDF& toolSDF) {
     printf("[DualTrack] Phase1: %zu dirty voxels\n", dirtyVoxels.size());
     fflush(stdout);
 
-    // ═══ Phase 2: Chunked surfel generation + incremental injection ═══
+    // ═══ Phase 2: Chunked surfel generation + single injection ═══
     if (!dirtyVoxels.empty()) {
         const int N = billet.config.N;
         const double d_v = billet.config.d_v;
-        const size_t CHUNK = 256; // process this many voxels at a time to bound memory
-        size_t totalGenerated = 0;
+        const size_t CHUNK = 256;
+
+        // Collect all surfels from all chunks
+        std::vector<openvdb::Vec3R> allPos;
+        std::vector<openvdb::Vec3f> allNorm;
 
         for (size_t start = 0; start < dirtyVoxels.size(); start += CHUNK) {
             size_t end = std::min(start + CHUNK, dirtyVoxels.size());
             std::vector<openvdb::Coord> chunk(dirtyVoxels.begin() + start,
                                               dirtyVoxels.begin() + end);
-
             auto batch = SurfelGenerator::sampleToolSurface(toolSDF, chunk, xform, d_v, N);
-            totalGenerated += batch.positions.size();
-
-            // Incremental injection (no full rebuild)
-            injectSurfels(billet, batch.positions, batch.normals, xform);
+            allPos.insert(allPos.end(), batch.positions.begin(), batch.positions.end());
+            allNorm.insert(allNorm.end(), batch.normals.begin(), batch.normals.end());
         }
 
-        printf("[DualTrack] Phase2: %zu surfels injected (N=%d, chunks=%zu)\n",
-            totalGenerated, N, (dirtyVoxels.size()+CHUNK-1)/CHUNK);
+        printf("[DualTrack] Phase2: %zu surfels generated (N=%d)\n", allPos.size(), N);
         fflush(stdout);
+
+        // Single injection
+        if (!allPos.empty()) {
+            injectSurfels(billet, allPos, allNorm, xform);
+        }
     }
 
     // ═══ Phase 3: Parallel surfel clipping ═══
