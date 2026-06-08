@@ -465,7 +465,8 @@ double computeVolume(const openvdb::FloatGrid::Ptr& grid) {
 
 openvdb::FloatGrid::Ptr buildLocalCutSurface(
     const BilletModel& billet, const ToolSweepSDF& lastTool) {
-    // Render ONLY the tool's zero-isosurface inside the billet (= newly exposed cut face)
+    // Show ONLY the newly exposed cut face: where the CSG result surface
+    // is determined by the tool (not the original billet boundary)
     double displayVs = std::max(billet.config.d_v, 0.05);
     float bandWidth = 3.0f * static_cast<float>(displayVs);
 
@@ -479,7 +480,7 @@ openvdb::FloatGrid::Ptr buildLocalCutSurface(
     auto minIdx = xform->worldToIndexCellCentered(bbox.min());
     auto maxIdx = xform->worldToIndexCellCentered(bbox.max());
 
-    auto& billetXform = billet.sdfGrid->transform();
+    auto& geo = billet.geometry;
     auto acc = grid->getAccessor();
 
     openvdb::Coord ijk;
@@ -488,21 +489,28 @@ openvdb::FloatGrid::Ptr buildLocalCutSurface(
             for (ijk[2] = minIdx[2]; ijk[2] <= maxIdx[2]; ++ijk[2]) {
                 Vec3d wp = xform->indexToWorld(ijk);
 
-                // Tool SDF (positive outside tool, negative inside)
-                float toolSdf = static_cast<float>(lastTool.eval(wp));
+                // Billet signed distance (analytic box)
+                double dx = std::max(geo.origin.x()-wp.x(), wp.x()-(geo.origin.x()+geo.dims.x()));
+                double dy = std::max(geo.origin.y()-wp.y(), wp.y()-(geo.origin.y()+geo.dims.y()));
+                double dz = std::max(geo.origin.z()-wp.z(), wp.z()-(geo.origin.z()+geo.dims.z()));
+                float billetSdf;
+                if (dx<=0 && dy<=0 && dz<=0)
+                    billetSdf = (float)std::max({dx,dy,dz});
+                else {
+                    double ex=std::max(dx,0.0), ey=std::max(dy,0.0), ez=std::max(dz,0.0);
+                    billetSdf = (float)std::sqrt(ex*ex+ey*ey+ez*ez);
+                }
 
-                // Check if point is inside the ORIGINAL billet (before cut)
-                // Use billet geometry definition for exact inside test
-                auto& geo = billet.geometry;
-                bool insideBillet = (wp.x() > geo.origin.x() && wp.x() < geo.origin.x()+geo.dims.x() &&
-                                    wp.y() > geo.origin.y() && wp.y() < geo.origin.y()+geo.dims.y() &&
-                                    wp.z() > geo.origin.z() && wp.z() < geo.origin.z()+geo.dims.z());
+                float toolSdf = -(float)lastTool.eval(wp); // negated: inside tool = positive
 
-                if (!insideBillet) continue; // only show cut surface inside billet
+                // CSG difference: max(billet, -tool)
+                float csgSdf = std::max(billetSdf, toolSdf);
 
-                // The cut surface IS the tool's zero-isosurface
-                if (std::abs(toolSdf) < bandWidth)
-                    acc.setValue(ijk, toolSdf);
+                // Only write if near the CSG surface AND the surface is
+                // determined by the tool (not the original billet face)
+                if (std::abs(csgSdf) < bandWidth && toolSdf >= billetSdf) {
+                    acc.setValue(ijk, csgSdf);
+                }
             }
         }
     }
