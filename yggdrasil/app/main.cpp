@@ -18,6 +18,23 @@
 #include <cstdint>
 #include <string>
 #include <chrono>
+#include <ctime>
+#include <thread>
+#include <atomic>
+
+// ─── helper: current local timestamp as [YYYY/MM/DD HH:MM:SS.mmm] ───
+static std::string ts() {
+    auto now = std::chrono::system_clock::now();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now.time_since_epoch()) % 1000;
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    std::tm* tm = std::localtime(&t);
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "[%04d/%02d/%02d %02d:%02d:%02d.%03d]",
+        tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
+        tm->tm_hour, tm->tm_min, tm->tm_sec, static_cast<int>(ms.count()));
+    return buf;
+}
 
 // ═══════════════════════════════════════════════════════════════
 // Shaders
@@ -317,6 +334,16 @@ int main() {
     float memBudgetMB = 500.0f;
     GPUMesh toolMesh;
 
+    // Async mesh rebuild state
+    std::thread rebuildThread;
+    std::atomic<bool> rebuildRunning{false};
+    std::atomic<bool> rebuildPendingUpload{false};
+    ygg::MeshData pendingSdfMesh;
+    std::vector<float> pendingMacroLines;
+    ygg::MeshData pendingMicroMesh;
+    bool pendingHasMacro = false;
+    bool pendingHasMicro = false;
+
     // Build original billet mesh (analytic box)
     {
         std::vector<float> v; std::vector<uint32_t> i;
@@ -362,30 +389,63 @@ int main() {
         }
 
 #if YGG_HAS_OPENVDB
-        // ── Rebuild layers when dirty ──
-        if (layersDirty) {
-            // SDF mesh
-            auto mesh = ygg::vdbToMesh(billet.sdfGrid);
-            sdfMesh.upload(mesh.vertices.data(), mesh.vertices.size()*sizeof(float),
-                           mesh.indices.data(), mesh.indices.size()*sizeof(uint32_t),
-                           (int)mesh.indices.size());
-            // MacroGrid lines
-            if (showMacroGrid) {
-                std::vector<float> lines;
-                buildMacroGridLines(billet.sdfGrid, macroLod, lines);
-                macroLines.upload(lines.data(), lines.size()*sizeof(float), (int)lines.size()/3);
-            }
-            // MicroGrid detail (from buildLocalCutSurface if dual track + cut done)
-            if (showMicroDetail && cutCount > 0 && billet.isDualTrack()) {
-                ygg::ToolSweepSDF lastTool(ygg::ToolType::BALL_END, cutR, 0, 20,
-                    {2,(double)cutY,(double)cutZ}, {billetSize[0]-2.0,(double)cutY,(double)cutZ});
-                auto csGrid = ygg::buildLocalCutSurface(billet, lastTool);
-                auto csMesh = ygg::vdbToMesh(csGrid);
-                microDetailMesh.upload(csMesh.vertices.data(), csMesh.vertices.size()*sizeof(float),
-                                       csMesh.indices.data(), csMesh.indices.size()*sizeof(uint32_t),
-                                       (int)csMesh.indices.size());
-            }
+        // ── Trigger async mesh rebuild when dirty ──
+        if (layersDirty && !rebuildRunning) {
+            rebuildRunning = true;
+            rebuildPendingUpload = false;
+            if (rebuildThread.joinable()) rebuildThread.join();
+
+            auto* billetPtr = &billet;
+            int currentMacroLod = macroLod;
+            bool currentShowMacro = showMacroGrid;
+            bool currentShowMicro = showMicroDetail;
+            int currentCutCount = cutCount;
+            float currentCutR = cutR;
+            float currentCutY = cutY;
+            float currentCutZ = cutZ;
+            float currentBilletSizeX = billetSize[0];
+
+            rebuildThread = std::thread([=, &pendingSdfMesh, &pendingMacroLines, &pendingMicroMesh,
+                                         &pendingHasMacro, &pendingHasMicro,
+                                         &rebuildRunning, &rebuildPendingUpload]() {
+                pendingSdfMesh = ygg::vdbToMesh(billetPtr->sdfGrid);
+
+                pendingHasMacro = currentShowMacro;
+                if (currentShowMacro) {
+                    buildMacroGridLines(billetPtr->sdfGrid, currentMacroLod, pendingMacroLines);
+                }
+
+                pendingHasMicro = (currentShowMicro && currentCutCount > 0 && billetPtr->isDualTrack());
+                if (pendingHasMicro) {
+                    ygg::ToolSweepSDF lastTool(ygg::ToolType::BALL_END, currentCutR, 0, 20,
+                        {2, (double)currentCutY, (double)currentCutZ},
+                        {(double)currentBilletSizeX - 2.0, (double)currentCutY, (double)currentCutZ});
+                    auto csGrid = ygg::buildLocalCutSurface(*billetPtr, lastTool);
+                    pendingMicroMesh = ygg::vdbToMesh(csGrid);
+                }
+
+                rebuildPendingUpload = true;
+                rebuildRunning = false;
+            });
+
             layersDirty = false;
+        }
+
+        // ── Upload completed results (main thread only for OpenGL) ──
+        if (rebuildPendingUpload) {
+            sdfMesh.upload(pendingSdfMesh.vertices.data(), pendingSdfMesh.vertices.size()*sizeof(float),
+                           pendingSdfMesh.indices.data(), pendingSdfMesh.indices.size()*sizeof(uint32_t),
+                           (int)pendingSdfMesh.indices.size());
+            if (pendingHasMacro) {
+                macroLines.upload(pendingMacroLines.data(), pendingMacroLines.size()*sizeof(float),
+                                  (int)pendingMacroLines.size()/3);
+            }
+            if (pendingHasMicro) {
+                microDetailMesh.upload(pendingMicroMesh.vertices.data(), pendingMicroMesh.vertices.size()*sizeof(float),
+                                       pendingMicroMesh.indices.data(), pendingMicroMesh.indices.size()*sizeof(uint32_t),
+                                       (int)pendingMicroMesh.indices.size());
+            }
+            rebuildPendingUpload = false;
         }
 #endif
 
@@ -505,8 +565,11 @@ int main() {
                 }
                 ImGui::TextWrapped("%s", cutInfo.c_str());
 
+                if (rebuildRunning) {
+                    ImGui::BeginDisabled();
+                }
                 if (ImGui::Button("Execute Cut")) {
-                    printf("[Cut] Computing... %s\n", cutInfo.c_str());
+                    printf("%s [Cut] Computing... %s\n", ts().c_str(), cutInfo.c_str());
                     fflush(stdout);
                     auto t0=std::chrono::high_resolution_clock::now();
                     ygg::CuttingEngine engine;
@@ -518,6 +581,9 @@ int main() {
                     cutCount++;
                     layersDirty = true;
                     cutMs=std::chrono::duration<double,std::milli>(t1-t0).count();
+                }
+                if (rebuildRunning) {
+                    ImGui::EndDisabled();
                 }
                 ImGui::SameLine();
                 if (ImGui::Button("Reset")) {
@@ -658,6 +724,11 @@ int main() {
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
+
+#if YGG_HAS_OPENVDB
+    if (rebuildThread.joinable()) rebuildThread.join();
+#endif
+
     glfwDestroyWindow(win);
     glfwTerminate();
     return 0;

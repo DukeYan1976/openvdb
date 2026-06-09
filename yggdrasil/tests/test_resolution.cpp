@@ -4,11 +4,12 @@
 using namespace ygg;
 
 TEST(ResolutionSolver, SingleTrack_WhenNLessThan2) {
-    // t=10 → d_v=5, R_min=1 → D_upper=min(0.5,20)=0.5 < d_v=5 → N_ideal=0 → SINGLE_TRACK
+    // t=10 → d_v=5, R_min=1 → D_upper=min(0.5,20)=0.5 < d_v=5 → N_ideal=0
+    // 不降级为 SINGLE_TRACK（避免全分辨率灾难），使用最小 DUAL_TRACK (N=2)
     auto cfg = solveResolution(10.0, 1.0, 20.0, {100, 100, 100});
-    EXPECT_EQ(cfg.mode, ResolutionConfig::SINGLE_TRACK);
-    EXPECT_EQ(cfg.N, 1);
-    EXPECT_DOUBLE_EQ(cfg.D_v, cfg.d_v);
+    EXPECT_EQ(cfg.mode, ResolutionConfig::DUAL_TRACK);
+    EXPECT_EQ(cfg.N, 2);
+    EXPECT_DOUBLE_EQ(cfg.D_v, 2.0 * cfg.d_v);
 }
 
 TEST(ResolutionSolver, DualTrack_DefaultForN2OrMore) {
@@ -31,8 +32,8 @@ TEST(ResolutionSolver, DualTrack_HighPrecisionLargePart) {
     auto cfg = solveResolution(0.01, 5.0, 1.0, {500, 500, 200});
     EXPECT_EQ(cfg.mode, ResolutionConfig::DUAL_TRACK);
     EXPECT_DOUBLE_EQ(cfg.d_v, 0.005);
-    EXPECT_EQ(cfg.N, 128);
-    EXPECT_DOUBLE_EQ(cfg.D_v, 0.64);
+    EXPECT_EQ(cfg.N, 64);  // N_MAX limit
+    EXPECT_DOUBLE_EQ(cfg.D_v, 0.32);
 }
 
 TEST(ResolutionSolver, Atlas_UltraPrecision) {
@@ -43,17 +44,18 @@ TEST(ResolutionSolver, Atlas_UltraPrecision) {
 }
 
 TEST(ResolutionSolver, BoundaryCase_DupperLessThanDv) {
-    // t=10 → d_v=5, D_upper=0.5 < d_v → N_ideal=0 < 2 → SINGLE_TRACK
+    // t=10 → d_v=5, D_upper=0.5 < d_v → N_ideal=0 < 2
+    // 不降级为 SINGLE_TRACK，使用最小 DUAL_TRACK (N=2)
     auto cfg = solveResolution(10.0, 1.0, 0.5, {100, 100, 100});
-    EXPECT_EQ(cfg.mode, ResolutionConfig::SINGLE_TRACK);
-    EXPECT_EQ(cfg.N, 1);
-    EXPECT_DOUBLE_EQ(cfg.D_v, cfg.d_v);
+    EXPECT_EQ(cfg.mode, ResolutionConfig::DUAL_TRACK);
+    EXPECT_EQ(cfg.N, 2);
+    EXPECT_DOUBLE_EQ(cfg.D_v, 2.0 * cfg.d_v);
 }
 
 TEST(ResolutionSolver, NisPowerOfTwo) {
     auto cfg = solveResolution(0.01, 5.0, 1.0, {500, 500, 200});
-    EXPECT_EQ(cfg.N, 128);
-    EXPECT_EQ(cfg.n, 7);
+    EXPECT_EQ(cfg.N, 64);  // N_MAX limit
+    EXPECT_EQ(cfg.n, 6);
     EXPECT_EQ(cfg.N & (cfg.N - 1), 0);
 }
 

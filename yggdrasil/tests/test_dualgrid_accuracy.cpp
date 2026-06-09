@@ -161,19 +161,21 @@ TEST_F(DualGridAccuracyTest, DualVsSingle_SmallPart_Comparable) {
 }
 
 TEST_F(DualGridAccuracyTest, DISABLED_BoundaryInjection_FineSurfelsOnToolSurface) {
-    // Known limitation: tree.merge() cannot add points to existing leaf nodes
-    // Requires OpenVDB PointMerge or leaf-rebuild strategy (future iteration)
+    // injectSurfels merge bug is FIXED (rebuild-from-scratch).
+    // This test remains disabled because it requires a "precision" attribute
+    // (FINE vs COARSE surfels) that is not yet implemented in the codebase.
     ResolutionConfig cfg;
     cfg.mode = ResolutionConfig::DUAL_TRACK;
     cfg.d_v = 0.5; cfg.D_v = 4.0; cfg.N = 8;
 
     auto billet = buildBillet(cfg, {0,0,0}, {30, 30, 20});
-    size_t ptBefore = openvdb::points::pointCount(billet.microGrid->tree());
+    size_t ptBefore = billet.microGrid ? openvdb::points::pointCount(billet.microGrid->tree()) : 0;
 
     ToolSweepSDF tool(ToolType::BALL_END, 5.0, 0, 30, {5,15,22}, {25,15,22});
     CuttingEngine engine;
     engine.cut(billet, tool);
 
+    ASSERT_TRUE(billet.microGrid != nullptr);
     size_t ptAfter = openvdb::points::pointCount(billet.microGrid->tree());
     // 边界注入后总点数应增加
     EXPECT_GT(ptAfter, ptBefore);

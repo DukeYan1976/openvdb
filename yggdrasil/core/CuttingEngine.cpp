@@ -14,8 +14,25 @@
 #include <cstdio>
 #include <algorithm>
 #include <vector>
+#include <chrono>
+#include <ctime>
+#include <string>
 
 namespace ygg {
+
+// ─── helper: current local timestamp as [YYYY/MM/DD HH:MM:SS.mmm] ───
+static std::string ts() {
+    auto now = std::chrono::system_clock::now();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now.time_since_epoch()) % 1000;
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    std::tm* tm = std::localtime(&t);
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "[%04d/%02d/%02d %02d:%02d:%02d.%03d]",
+        tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
+        tm->tm_hour, tm->tm_min, tm->tm_sec, static_cast<int>(ms.count()));
+    return buf;
+}
 
 // ═══════════════════════════════════════════════════════════════════════
 // 单轨切削策略评估代码（4种方案，精度一致，比较效率和内存）
@@ -214,57 +231,9 @@ static void cutSingleTrack(BilletModel& billet, const ToolSweepSDF& toolSDF, Cut
     }
 }
 
-// ─── Phase 2 helper: inject surfels into microGrid (safe rebuild if exists) ───
-static void injectSurfels(BilletModel& billet,
-                          const std::vector<openvdb::Vec3R>& positions,
-                          const std::vector<openvdb::Vec3f>& normals,
-                          const openvdb::math::Transform& xform) {
-    if (positions.empty()) return;
-    openvdb::points::TypedAttributeArray<openvdb::Vec3f>::registerType();
-    openvdb::points::TypedAttributeArray<uint8_t>::registerType();
-
-    // Collect existing active points if microGrid exists
-    std::vector<openvdb::Vec3R> allPos;
-    std::vector<openvdb::Vec3f> allNorm;
-
-    if (billet.microGrid) {
-        for (auto leaf = billet.microGrid->tree().cbeginLeaf(); leaf; ++leaf) {
-            auto lo = leaf->origin();
-            auto& as = leaf->attributeSet();
-            auto* posArr = as.get("P");
-            auto* normArr = as.get("normal");
-            auto* actArr = as.get("active");
-            if (!posArr) continue;
-            auto ph = openvdb::points::AttributeHandle<openvdb::Vec3f>::create(*posArr);
-            auto nh = normArr ? openvdb::points::AttributeHandle<openvdb::Vec3f>::create(*normArr) : nullptr;
-            auto ah = actArr ? openvdb::points::AttributeHandle<uint8_t>::create(*actArr) : nullptr;
-            for (openvdb::Index vIdx = 0; vIdx < 512; ++vIdx) {
-                openvdb::Index end = static_cast<openvdb::Index>(leaf->getValue(vIdx));
-                openvdb::Index start = (vIdx==0) ? openvdb::Index(0) :
-                    static_cast<openvdb::Index>(leaf->getValue(vIdx-1));
-                if (start==end) continue;
-                openvdb::Coord vc = lo + openvdb::Coord((vIdx>>6)&7,(vIdx>>3)&7,vIdx&7);
-                for (openvdb::Index i = start; i < end; ++i) {
-                    if (ah && ah->get(i)==0) continue; // skip inactive
-                    auto p = ph->get(i);
-                    allPos.push_back(xform.indexToWorld(
-                        Vec3d(vc.x()+p.x(), vc.y()+p.y(), vc.z()+p.z())));
-                    allNorm.push_back(nh ? nh->get(i) : openvdb::Vec3f(0,0,1));
-                }
-            }
-        }
-    }
-
-    // Append new points
-    allPos.insert(allPos.end(), positions.begin(), positions.end());
-    allNorm.insert(allNorm.end(), normals.begin(), normals.end());
-
-    // Build fresh PointDataGrid
-    auto grid = openvdb::points::createPointDataGrid<
-        openvdb::points::NullCodec, openvdb::points::PointDataGrid>(allPos, xform);
-    grid->setName("micro_surfels");
-
-    // Attach attributes
+// Helper: attach normal and active attributes to a PointDataGrid
+static void attachAttributes(openvdb::points::PointDataGrid::Ptr& grid,
+                             const std::vector<openvdb::Vec3f>& normals) {
     size_t idx = 0;
     for (auto leaf = grid->tree().beginLeaf(); leaf; ++leaf) {
         auto as = leaf->stealAttributeSet();
@@ -282,17 +251,105 @@ static void injectSurfels(BilletModel& billet,
         auto whN = openvdb::points::AttributeWriteHandle<openvdb::Vec3f>::create(*as2->get("normal"));
         auto whA = openvdb::points::AttributeWriteHandle<uint8_t>::create(*as2->get("active"));
         for (size_t i = 0; i < whN->size(); ++i, ++idx) {
-            whN->set(i, idx < allNorm.size() ? allNorm[idx] : openvdb::Vec3f(0));
+            whN->set(i, idx < normals.size() ? normals[idx] : openvdb::Vec3f(0));
             whA->set(i, 1);
         }
         leaf->replaceAttributeSet(as2.release(), true);
     }
+}
 
+// Helper: extract active points from an existing leaf
+static void extractActivePointsFromLeaf(
+    const openvdb::points::PointDataTree::LeafNodeType* leaf,
+    const openvdb::math::Transform& xform,
+    std::vector<openvdb::Vec3R>& outPos,
+    std::vector<openvdb::Vec3f>& outNorm) {
+
+    auto lo = leaf->origin();
+    auto& as = leaf->attributeSet();
+    auto* posArr = as.get("P");
+    auto* normArr = as.get("normal");
+    auto* actArr = as.get("active");
+    if (!posArr) return;
+
+    auto ph = openvdb::points::AttributeHandle<openvdb::Vec3f>::create(*posArr);
+    auto nh = normArr ? openvdb::points::AttributeHandle<openvdb::Vec3f>::create(*normArr) : nullptr;
+    auto ah = actArr ? openvdb::points::AttributeHandle<uint8_t>::create(*actArr) : nullptr;
+
+    for (openvdb::Index vIdx = 0; vIdx < 512; ++vIdx) {
+        openvdb::Index end = static_cast<openvdb::Index>(leaf->getValue(vIdx));
+        openvdb::Index start = (vIdx==0) ? openvdb::Index(0) :
+            static_cast<openvdb::Index>(leaf->getValue(vIdx-1));
+        if (start==end) continue;
+        openvdb::Coord vc = lo + openvdb::Coord((vIdx>>6)&7,(vIdx>>3)&7,vIdx&7);
+        for (openvdb::Index i = start; i < end; ++i) {
+            if (ah && ah->get(i)==0) continue;
+            auto p = ph->get(i);
+            outPos.push_back(xform.indexToWorld(
+                Vec3d(vc.x()+p.x(), vc.y()+p.y(), vc.z()+p.z())));
+            outNorm.push_back(nh ? nh->get(i) : openvdb::Vec3f(0,0,1));
+        }
+    }
+}
+
+// ─── Phase 2 helper: extract active points from entire PointDataGrid ───
+static void extractActivePointsFromGrid(
+    const openvdb::points::PointDataGrid::Ptr& grid,
+    const openvdb::math::Transform& xform,
+    std::vector<openvdb::Vec3R>& outPos,
+    std::vector<openvdb::Vec3f>& outNorm) {
+    if (!grid) return;
+    for (auto leaf = grid->tree().cbeginLeaf(); leaf; ++leaf) {
+        extractActivePointsFromLeaf(&*leaf, xform, outPos, outNorm);
+    }
+}
+
+// ─── Phase 2 helper: bulk surfel injection via rebuild-from-scratch ───
+// WARNING: OpenVDB's tree().merge() CANNOT add points to existing PointDataLeafNodes.
+// It silently drops overlapping leaves and is O(N²) slow. We rebuild from all active
+// points instead — createPointDataGrid is well-optimized and this avoids both the
+// correctness bug and the 100+ second merge stalls.
+static void injectSurfels(BilletModel& billet,
+                          const std::vector<openvdb::Vec3R>& positions,
+                          const std::vector<openvdb::Vec3f>& normals,
+                          const openvdb::math::Transform& xform) {
+    if (positions.empty()) return;
+    openvdb::points::TypedAttributeArray<openvdb::Vec3f>::registerType();
+    openvdb::points::TypedAttributeArray<uint8_t>::registerType();
+
+    if (!billet.microGrid) {
+        auto grid = openvdb::points::createPointDataGrid<
+            openvdb::points::NullCodec, openvdb::points::PointDataGrid>(positions, xform);
+        grid->setName("micro_surfels");
+        attachAttributes(grid, normals);
+        billet.microGrid = grid;
+        return;
+    }
+
+    // Rebuild strategy: extract active points from existing grid + append new points,
+    // then create a fresh grid. This is O(total_points log total_points) and CORRECT,
+    // whereas tree().merge() is O(N²) and drops points on overlapping leaves.
+    std::vector<openvdb::Vec3R> allPos;
+    std::vector<openvdb::Vec3f> allNorm;
+    allPos.reserve(openvdb::points::pointCount(billet.microGrid->tree()) + positions.size());
+    allNorm.reserve(allPos.capacity());
+
+    extractActivePointsFromGrid(billet.microGrid, xform, allPos, allNorm);
+    allPos.insert(allPos.end(), positions.begin(), positions.end());
+    allNorm.insert(allNorm.end(), normals.begin(), normals.end());
+
+    auto grid = openvdb::points::createPointDataGrid<
+        openvdb::points::NullCodec, openvdb::points::PointDataGrid>(allPos, xform);
+    grid->setName("micro_surfels");
+    attachAttributes(grid, allNorm);
     billet.microGrid = grid;
 }
 
 // 双轨切削：工业级 4-phase（增量注入 + 并行裁剪 + 分块采样）
 static void cutDualTrack(BilletModel& billet, const ToolSweepSDF& toolSDF) {
+    using Clock = std::chrono::high_resolution_clock;
+    auto t0_total = Clock::now();
+
     using TreeT = openvdb::FloatGrid::TreeType;
     auto& sdfGrid = billet.sdfGrid;
     auto& xform = sdfGrid->transform();
@@ -303,11 +360,16 @@ static void cutDualTrack(BilletModel& billet, const ToolSweepSDF& toolSDF) {
     auto minIdx = xform.worldToIndexCellCentered(bbox.min()) - openvdb::Coord(1);
     auto maxIdx = xform.worldToIndexCellCentered(bbox.max()) + openvdb::Coord(1);
 
-    printf("[DualTrack] D_v=%.4f d_v=%.4f N=%d\n", D_v, billet.config.d_v, billet.config.N);
+    printf("%s [DualTrack] D_v=%.4f d_v=%.4f N=%d BBox=[%d,%d,%d]..[%d,%d,%d]\n",
+        ts().c_str(), D_v, billet.config.d_v, billet.config.N,
+        minIdx.x(), minIdx.y(), minIdx.z(), maxIdx.x(), maxIdx.y(), maxIdx.z());
     fflush(stdout);
 
     // ═══ Phase 1: SDF CSG diff (TBB parallel) + dirty region ═══
-    // Activate inactive negative voxels in tool BBox
+    auto t0_p1 = Clock::now();
+
+    // Activate inactive negative voxels in tool BBox (serial for thread safety)
+    auto t0_p1a = Clock::now();
     {
         auto acc = sdfGrid->getAccessor();
         openvdb::Coord ijk;
@@ -318,8 +380,10 @@ static void cutDualTrack(BilletModel& billet, const ToolSweepSDF& toolSDF) {
                     if (v < 0 && !acc.isValueOn(ijk)) acc.setValueOn(ijk, v);
                 }
     }
+    auto t1_p1a = Clock::now();
 
     // TBB parallel SDF update + dirty voxel collection
+    auto t0_p1b = Clock::now();
     openvdb::tree::LeafManager<TreeT> leafMgr(sdfGrid->tree());
     using DirtyVec = std::vector<openvdb::Coord>;
     tbb::enumerable_thread_specific<DirtyVec> tlsDirty;
@@ -347,8 +411,6 @@ static void cutDualTrack(BilletModel& billet, const ToolSweepSDF& toolSDF) {
                         float newVal = std::max(oldVal, static_cast<float>(-toolDist));
                         if (newVal != oldVal) {
                             it.setValue(newVal);
-                            // Dirty criteria: tool interior + near new surface
-                            // Catches deep penetration (oldVal was background positive)
                             if (toolDist <= 0.0 && std::abs(newVal) < bandWidth)
                                 localDirty.push_back(coord);
                         }
@@ -356,8 +418,10 @@ static void cutDualTrack(BilletModel& billet, const ToolSweepSDF& toolSDF) {
                 }
             }
         });
+    auto t1_p1b = Clock::now();
 
     // Merge + dedup dirty voxels
+    auto t0_p1c = Clock::now();
     std::vector<openvdb::Coord> dirtyVoxels;
     for (auto& v : tlsDirty) {
         for (auto& coord : v) {
@@ -366,20 +430,31 @@ static void cutDualTrack(BilletModel& billet, const ToolSweepSDF& toolSDF) {
             dirtyVoxels.push_back(coord);
         }
     }
+    auto t1_p1c = Clock::now();
 
-    printf("[DualTrack] Phase1: %zu dirty voxels\n", dirtyVoxels.size());
+    double ms_p1a = std::chrono::duration<double, std::milli>(t1_p1a - t0_p1a).count();
+    double ms_p1b = std::chrono::duration<double, std::milli>(t1_p1b - t0_p1b).count();
+    double ms_p1c = std::chrono::duration<double, std::milli>(t1_p1c - t0_p1c).count();
+
+    printf("%s [DualTrack] Phase1: activate=%.1fms tbb_sdf=%.1fms dirty_merge=%.1fms dirty_count=%zu\n",
+        ts().c_str(), ms_p1a, ms_p1b, ms_p1c, dirtyVoxels.size());
     fflush(stdout);
 
     // ═══ Phase 2: Chunked surfel generation + single injection ═══
+    auto t0_p2 = Clock::now();
+    size_t totalSurfels = 0;
+    size_t totalChunks = 0;
     if (!dirtyVoxels.empty()) {
         const int N = billet.config.N;
         const double d_v = billet.config.d_v;
         const size_t CHUNK = 256;
 
-        // Collect all surfels from all chunks
         std::vector<openvdb::Vec3R> allPos;
         std::vector<openvdb::Vec3f> allNorm;
+        allPos.reserve(dirtyVoxels.size() * N * N);
+        allNorm.reserve(dirtyVoxels.size() * N * N);
 
+        auto t0_p2a = Clock::now();
         for (size_t start = 0; start < dirtyVoxels.size(); start += CHUNK) {
             size_t end = std::min(start + CHUNK, dirtyVoxels.size());
             std::vector<openvdb::Coord> chunk(dirtyVoxels.begin() + start,
@@ -387,46 +462,87 @@ static void cutDualTrack(BilletModel& billet, const ToolSweepSDF& toolSDF) {
             auto batch = SurfelGenerator::sampleToolSurface(toolSDF, chunk, xform, d_v, N);
             allPos.insert(allPos.end(), batch.positions.begin(), batch.positions.end());
             allNorm.insert(allNorm.end(), batch.normals.begin(), batch.normals.end());
+            totalChunks++;
         }
+        auto t1_p2a = Clock::now();
+        totalSurfels = allPos.size();
 
-        printf("[DualTrack] Phase2: %zu surfels generated (N=%d)\n", allPos.size(), N);
-        fflush(stdout);
-
-        // Single injection
+        auto t0_p2b = Clock::now();
         if (!allPos.empty()) {
             injectSurfels(billet, allPos, allNorm, xform);
         }
+        auto t1_p2b = Clock::now();
+
+        double ms_p2a = std::chrono::duration<double, std::milli>(t1_p2a - t0_p2a).count();
+        double ms_p2b = std::chrono::duration<double, std::milli>(t1_p2b - t0_p2b).count();
+        printf("%s [DualTrack] Phase2: surfel_gen=%.1fms inject=%.1fms surfels=%zu chunks=%zu\n",
+            ts().c_str(), ms_p2a, ms_p2b, totalSurfels, totalChunks);
+        fflush(stdout);
     }
+    auto t1_p2 = Clock::now();
+    double ms_p2 = std::chrono::duration<double, std::milli>(t1_p2 - t0_p2).count();
 
-    // ═══ Phase 3: Parallel surfel clipping ═══
+    // ═══ Phase 3: Parallel surfel clipping (BBox-local leaves only) ═══
+    auto t0_p3 = Clock::now();
+    int affectedLeaves = 0;
+    int skippedLeaves = 0;
     if (billet.microGrid) {
-        using PtTreeT = openvdb::points::PointDataGrid::TreeType;
-        openvdb::tree::LeafManager<PtTreeT> ptLeafMgr(billet.microGrid->tree());
+        openvdb::Coord leafMin(
+            (minIdx.x() >> 3) << 3,
+            (minIdx.y() >> 3) << 3,
+            (minIdx.z() >> 3) << 3
+        );
+        openvdb::Coord leafMax(
+            (maxIdx.x() >> 3) << 3,
+            (maxIdx.y() >> 3) << 3,
+            (maxIdx.z() >> 3) << 3
+        );
 
-        tbb::parallel_for(ptLeafMgr.leafRange(),
-            [&](const openvdb::tree::LeafManager<PtTreeT>::LeafRange& range) {
-                for (auto leafIt = range.begin(); leafIt; ++leafIt) {
-                    auto& leaf = *leafIt;
-                    auto lo = leaf.origin();
+        int leafCountX = (leafMax.x() - leafMin.x()) / 8 + 1;
+        int leafCountY = (leafMax.y() - leafMin.y()) / 8 + 1;
+        int leafCountZ = (leafMax.z() - leafMin.z()) / 8 + 1;
+        int totalLeaves = leafCountX * leafCountY * leafCountZ;
+
+        tbb::enumerable_thread_specific<std::pair<int,int>> tlsLeafStats;
+
+        tbb::parallel_for(tbb::blocked_range<int>(0, totalLeaves),
+            [&](const tbb::blocked_range<int>& r) {
+                auto& stats = tlsLeafStats.local();
+                for (int lin = r.begin(); lin != r.end(); ++lin) {
+                    int ix = lin / (leafCountY * leafCountZ);
+                    int iy = (lin / leafCountZ) % leafCountY;
+                    int iz = lin % leafCountZ;
+                    openvdb::Coord leafOrigin(
+                        leafMin.x() + ix * 8,
+                        leafMin.y() + iy * 8,
+                        leafMin.z() + iz * 8
+                    );
+                    auto* leaf = billet.microGrid->tree().probeLeaf(leafOrigin);
+                    if (!leaf) continue;
+
+                    auto lo = leaf->origin();
                     Vec3d lw = xform.indexToWorld(lo);
                     Vec3d lmax = lw + Vec3d(8.0 * D_v);
                     if (lw.x()>bbox.max().x()+D_v || lmax.x()<bbox.min().x()-D_v ||
                         lw.y()>bbox.max().y()+D_v || lmax.y()<bbox.min().y()-D_v ||
-                        lw.z()>bbox.max().z()+D_v || lmax.z()<bbox.min().z()-D_v) continue;
+                        lw.z()>bbox.max().z()+D_v || lmax.z()<bbox.min().z()-D_v) {
+                        stats.second++;
+                        continue;
+                    }
+                    stats.first++;
 
-                    // Each leaf is independent; steal its attribute set for mutable access
-                    auto as = leaf.stealAttributeSet();
+                    auto as = leaf->stealAttributeSet();
                     auto* posArr = as->get("P");
                     auto* actArr = as->get("active");
-                    if (!posArr || !actArr) { leaf.replaceAttributeSet(as.release(), true); continue; }
+                    if (!posArr || !actArr) { leaf->replaceAttributeSet(as.release(), true); continue; }
 
                     auto ph = openvdb::points::AttributeHandle<openvdb::Vec3f>::create(*posArr);
                     auto wh = openvdb::points::AttributeWriteHandle<uint8_t>::create(*actArr);
 
                     for (openvdb::Index vIdx = 0; vIdx < 512; ++vIdx) {
-                        openvdb::Index endI = static_cast<openvdb::Index>(leaf.getValue(vIdx));
+                        openvdb::Index endI = static_cast<openvdb::Index>(leaf->getValue(vIdx));
                         openvdb::Index startI = (vIdx==0) ? openvdb::Index(0) :
-                            static_cast<openvdb::Index>(leaf.getValue(vIdx-1));
+                            static_cast<openvdb::Index>(leaf->getValue(vIdx-1));
                         if (startI == endI) continue;
                         openvdb::Coord vc = lo + openvdb::Coord((vIdx>>6)&7,(vIdx>>3)&7,vIdx&7);
                         for (openvdb::Index i = startI; i < endI; ++i) {
@@ -437,17 +553,33 @@ static void cutDualTrack(BilletModel& billet, const ToolSweepSDF& toolSDF) {
                             if (toolSDF.eval(wp) <= 0.0) wh->set(i, 0);
                         }
                     }
-                    leaf.replaceAttributeSet(as.release(), true);
+                    leaf->replaceAttributeSet(as.release(), true);
                 }
             });
 
-        printf("[DualTrack] Phase3: parallel clip done\n"); fflush(stdout);
+        for (auto& s : tlsLeafStats) {
+            affectedLeaves += s.first;
+            skippedLeaves += s.second;
+        }
     }
+    auto t1_p3 = Clock::now();
+    double ms_p3 = std::chrono::duration<double, std::milli>(t1_p3 - t0_p3).count();
+    printf("%s [DualTrack] Phase3: clip=%.1fms affected=%d skipped=%d\n",
+        ts().c_str(), ms_p3, affectedLeaves, skippedLeaves);
+    fflush(stdout);
 
     // ═══ Phase 4: Prune + clear ═══
+    auto t0_p4 = Clock::now();
     openvdb::tools::pruneLevelSet(sdfGrid->tree());
     billet.dirtyMask->clear();
-    printf("[DualTrack] Done.\n"); fflush(stdout);
+    auto t1_p4 = Clock::now();
+    double ms_p4 = std::chrono::duration<double, std::milli>(t1_p4 - t0_p4).count();
+
+    auto t1_total = Clock::now();
+    double ms_total = std::chrono::duration<double, std::milli>(t1_total - t0_total).count();
+
+    printf("%s [DualTrack] Phase4: prune=%.1fms | TOTAL=%.1fms\n", ts().c_str(), ms_p4, ms_total);
+    fflush(stdout);
 }
 
 void CuttingEngine::cut(BilletModel& billet, const ToolSweepSDF& toolSDF) {
