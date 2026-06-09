@@ -344,6 +344,14 @@ int main() {
     bool pendingHasMacro = false;
     bool pendingHasMicro = false;
 
+    // ── Voxel Inspector state ──
+    bool inspectorActive = false;
+    openvdb::Coord inspVoxel{0,0,0};
+    int inspDepth = 0;
+    bool inspValid = false;
+    GPULines inspVoxelWire;  // yellow box
+    GPULines inspLeafWire;   // blue box
+
     // Build original billet mesh (analytic box)
     {
         std::vector<float> v; std::vector<uint32_t> i;
@@ -387,6 +395,72 @@ int main() {
                 lx=mx;ly=my;
             } else drag=false;
         }
+
+#if YGG_HAS_OPENVDB
+        // ── Voxel Inspector: ray pick ──
+        if (inspectorActive && showMicroDetail && billet.sdfGrid) {
+            double mx, my; glfwGetCursorPos(win, &mx, &my);
+            int vw, vh; glfwGetFramebufferSize(win, &vw, &vh);
+            // Ortho unproject: screen → world (simplified for ortho)
+            float asp = (float)vw/(float)vh;
+            float ndcX = (float)(2.0*mx/vw - 1.0);
+            float ndcY = (float)(1.0 - 2.0*my/vh);
+            float yr = cam.yaw*3.14159f/180.f, pr = cam.pitch*3.14159f/180.f;
+            // Right and up in world space
+            float rx = -sinf(yr), ry = cosf(yr), rz = 0;
+            float ux = -sinf(pr)*cosf(yr), uy = -sinf(pr)*sinf(yr), uz = cosf(pr);
+            float worldX = cam.tx + ndcX*asp*cam.orthoSize*rx + ndcY*cam.orthoSize*ux;
+            float worldY = cam.ty + ndcX*asp*cam.orthoSize*ry + ndcY*cam.orthoSize*uy;
+            float worldZ = cam.tz + ndcX*asp*cam.orthoSize*rz + ndcY*cam.orthoSize*uz;
+
+            // Find voxel coord at this world position (use SDF grid transform)
+            auto& xf = billet.sdfGrid->transform();
+            auto idx = xf.worldToIndexCellCentered(ygg::Vec3d(worldX, worldY, worldZ));
+
+            // Walk along view direction to find N-th surface voxel
+            float fwdX = cosf(pr)*cosf(yr), fwdY = cosf(pr)*sinf(yr), fwdZ = sinf(pr);
+            inspValid = false;
+            int found = 0;
+            double D_v = xf.voxelSize()[0];
+            auto sdfAcc = billet.sdfGrid->getConstAccessor();
+            for (int step = -50; step <= 50; ++step) {
+                ygg::Vec3d probe(worldX - fwdX*step*D_v,
+                                 worldY - fwdY*step*D_v,
+                                 worldZ - fwdZ*step*D_v);
+                auto c = xf.worldToIndexCellCentered(probe);
+                if (billet.sdfGrid->tree().isValueOn(c)) {
+                    float sv = sdfAcc.getValue(c);
+                    // Boundary voxel: SDF near zero (sign change with neighbors)
+                    if (std::abs(sv) < (float)D_v) {
+                        if (found == inspDepth) {
+                            inspVoxel = c; inspValid = true;
+                            break;
+                        }
+                        found++;
+                    }
+                }
+            }
+
+            // Left click: advance depth
+            static bool lmbWasPressed = false;
+            bool lmbNow = glfwGetMouseButton(win, GLFW_MOUSE_BUTTON_LEFT)==GLFW_PRESS;
+            if (lmbNow && !lmbWasPressed && !ImGui::GetIO().WantCaptureMouse) inspDepth++;
+            lmbWasPressed = lmbNow;
+
+            // Build wireframe boxes for hovered voxel
+            if (inspValid) {
+                auto wp = xf.indexToWorld(inspVoxel);
+                std::vector<float> vlines, llines;
+                addWireBox(vlines, wp.x(), wp.y(), wp.z(), D_v);
+                inspVoxelWire.upload(vlines.data(), vlines.size()*sizeof(float), (int)vlines.size()/3);
+                // Leaf bbox (8³ aligned)
+                openvdb::Coord leafOrigin(inspVoxel.x()&~7, inspVoxel.y()&~7, inspVoxel.z()&~7);
+                auto lwp = xf.indexToWorld(leafOrigin);
+                addWireBox(llines, lwp.x(), lwp.y(), lwp.z(), D_v*8);
+                inspLeafWire.upload(llines.data(), llines.size()*sizeof(float), (int)llines.size()/3);
+            }
+        }
+#endif
 
 #if YGG_HAS_OPENVDB
         // ── Trigger async mesh rebuild when dirty ──
@@ -491,6 +565,11 @@ int main() {
                     ImGui::Checkbox("Auto Focus (follow cut)", &autoFocus);
                     ImGui::SliderFloat("Focus Radius (mm)", &focusRadius, 5.0f, 50.0f);
                     ImGui::ColorEdit3("Color##micro", microColor, ImGuiColorEditFlags_NoInputs);
+                    ImGui::Checkbox("Voxel Inspector (hover)", &inspectorActive);
+                    if (inspectorActive) {
+                        ImGui::SameLine(); ImGui::Text("Depth:%d", inspDepth);
+                        ImGui::SameLine(); if(ImGui::SmallButton("Reset##insp")) inspDepth=0;
+                    }
                 }
                 ImGui::Spacing();
 
@@ -622,6 +701,111 @@ int main() {
         ImGui::Text("OpenVDB not enabled.");
 #endif
         ImGui::End();
+
+#if YGG_HAS_OPENVDB
+        // ── Voxel Inspector Tooltip ──
+        if (inspectorActive && inspValid && billet.sdfGrid) {
+            auto& xf = billet.sdfGrid->transform();
+            double D_v = xf.voxelSize()[0];
+            auto wp = xf.indexToWorld(inspVoxel);
+            float sdfVal = billet.sdfGrid->getConstAccessor().getValue(inspVoxel);
+
+            // Count surfels in this voxel
+            int totalSurfels=0, activeSurfels=0;
+            int leafTotal=0, leafActive=0;
+            if (billet.microGrid) {
+                openvdb::Coord leafOrigin(inspVoxel.x()&~7, inspVoxel.y()&~7, inspVoxel.z()&~7);
+                auto* leaf = billet.microGrid->tree().probeConstLeaf(leafOrigin);
+                if (leaf) {
+                    auto& as = leaf->attributeSet();
+                    auto* actArr = as.get("active");
+                    auto ah = actArr ? openvdb::points::AttributeHandle<uint8_t>::create(*actArr) : nullptr;
+                    // Count per-voxel
+                    openvdb::Coord lc = inspVoxel - leafOrigin;
+                    int vIdx = (lc.x()<<6) | (lc.y()<<3) | lc.z();
+                    openvdb::Index endI = static_cast<openvdb::Index>(leaf->getValue(vIdx));
+                    openvdb::Index startI = (vIdx==0)?0:static_cast<openvdb::Index>(leaf->getValue(vIdx-1));
+                    for (openvdb::Index i=startI; i<endI; ++i) {
+                        totalSurfels++;
+                        if (!ah || ah->get(i)==1) activeSurfels++;
+                    }
+                    // Leaf totals
+                    for (openvdb::Index v=0; v<512; ++v) {
+                        openvdb::Index e = static_cast<openvdb::Index>(leaf->getValue(v));
+                        openvdb::Index s = (v==0)?0:static_cast<openvdb::Index>(leaf->getValue(v-1));
+                        for (openvdb::Index i=s; i<e; ++i) {
+                            leafTotal++;
+                            if (!ah || ah->get(i)==1) leafActive++;
+                        }
+                    }
+                }
+            }
+
+            ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().MousePos.x+15, ImGui::GetIO().MousePos.y+15), ImGuiCond_Always);
+            ImGui::Begin("##VoxelInspector", nullptr,
+                ImGuiWindowFlags_NoTitleBar|ImGuiWindowFlags_NoResize|ImGuiWindowFlags_AlwaysAutoResize|
+                ImGuiWindowFlags_NoMove|ImGuiWindowFlags_NoSavedSettings);
+            ImGui::TextColored(ImVec4(1,0.9f,0.3f,1), "Voxel Inspector");
+            ImGui::Text("Coord: (%d, %d, %d)", inspVoxel.x(), inspVoxel.y(), inspVoxel.z());
+            ImGui::Text("World: (%.3f, %.3f, %.3f) mm", wp.x(), wp.y(), wp.z());
+            ImGui::Text("BBox: [%.3f,%.3f,%.3f]-[%.3f,%.3f,%.3f]",
+                wp.x(),wp.y(),wp.z(), wp.x()+D_v,wp.y()+D_v,wp.z()+D_v);
+            ImGui::Text("D_v: %.4f mm", D_v);
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(0.6f,0.8f,1,1), "SDF (MacroGrid)");
+            const char* state = sdfVal < -0.01f ? "INSIDE" : sdfVal > 0.01f ? "OUTSIDE" : "SURFACE";
+            ImGui::Text("Value: %.4f (%s)", sdfVal, state);
+            ImGui::Text("Narrowband: %s", std::abs(sdfVal)<3.0f*(float)D_v?"YES":"NO");
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(0.3f,1,0.5f,1), "MicroGrid (this voxel)");
+            ImGui::Text("Surfels: %d total | %d active | %d inactive",
+                totalSurfels, activeSurfels, totalSurfels-activeSurfels);
+            if (totalSurfels>0)
+                ImGui::Text("Coverage: %.1f%%", 100.0f*activeSurfels/totalSurfels);
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(0.5f,0.7f,1,1), "LeafNode (8x8x8 = 512 voxels)");
+            ImGui::Text("Leaf surfels: %d total | %d active", leafTotal, leafActive);
+            ImGui::Separator();
+            ImGui::TextDisabled("LClick=next depth | Depth=%d", inspDepth);
+            ImGui::End();
+
+            // Console dump on Ctrl+Click
+            static bool ctrlClickPrev = false;
+            bool ctrlClick = glfwGetMouseButton(win,GLFW_MOUSE_BUTTON_LEFT)==GLFW_PRESS &&
+                             glfwGetKey(win,GLFW_KEY_LEFT_CONTROL)==GLFW_PRESS;
+            if (ctrlClick && !ctrlClickPrev) {
+                printf("\n[Inspector] Voxel (%d,%d,%d) World(%.3f,%.3f,%.3f)\n",
+                    inspVoxel.x(),inspVoxel.y(),inspVoxel.z(), wp.x(),wp.y(),wp.z());
+                printf("  SDF=%.4f | Surfels: %d active/%d total | Leaf: %d/%d\n",
+                    sdfVal, activeSurfels, totalSurfels, leafActive, leafTotal);
+                // Sample up to 8 surfel positions
+                if (billet.microGrid && totalSurfels > 0) {
+                    openvdb::Coord leafOrigin(inspVoxel.x()&~7, inspVoxel.y()&~7, inspVoxel.z()&~7);
+                    auto* leaf = billet.microGrid->tree().probeConstLeaf(leafOrigin);
+                    if (leaf) {
+                        auto& as = leaf->attributeSet();
+                        auto* posArr = as.get("P");
+                        if (posArr) {
+                            auto ph = openvdb::points::AttributeHandle<openvdb::Vec3f>::create(*posArr);
+                            openvdb::Coord lc = inspVoxel - leafOrigin;
+                            int vIdx = (lc.x()<<6)|(lc.y()<<3)|lc.z();
+                            openvdb::Index endI = static_cast<openvdb::Index>(leaf->getValue(vIdx));
+                            openvdb::Index startI = (vIdx==0)?0:static_cast<openvdb::Index>(leaf->getValue(vIdx-1));
+                            int shown = 0;
+                            for (openvdb::Index i=startI; i<endI && shown<8; ++i, ++shown) {
+                                auto p = ph->get(i);
+                                auto swp = xf.indexToWorld(ygg::Vec3d(
+                                    inspVoxel.x()+p.x(), inspVoxel.y()+p.y(), inspVoxel.z()+p.z()));
+                                printf("  [%d] pos=(%.4f,%.4f,%.4f)\n", shown, swp.x(),swp.y(),swp.z());
+                            }
+                            if (totalSurfels > 8) printf("  ... (%d more)\n", totalSurfels-8);
+                        }
+                    }
+                }
+            }
+            ctrlClickPrev = ctrlClick;
+        }
+#endif
         ImGui::Render();
 
         // ═══════════════════════════════════════════════════════════
@@ -670,6 +854,79 @@ int main() {
             glLineWidth(macroLineWidth);
             macroLines.draw();
         }
+
+#if YGG_HAS_OPENVDB
+        // Inspector wireframe boxes + surfel points
+        if (inspectorActive && inspValid) {
+            glUseProgram(lineProg);
+            glUniformMatrix4fv(glGetUniformLocation(lineProg,"uMVP"),1,GL_FALSE,mvp);
+            // Yellow box: hovered voxel
+            if (inspVoxelWire.count>0) {
+                glUniform3f(glGetUniformLocation(lineProg,"uColor"),1.0f,0.9f,0.2f);
+                glUniform1f(glGetUniformLocation(lineProg,"uAlpha"),1.0f);
+                glLineWidth(2.5f);
+                inspVoxelWire.draw();
+            }
+            // Blue box: leaf node
+            if (inspLeafWire.count>0) {
+                glUniform3f(glGetUniformLocation(lineProg,"uColor"),0.3f,0.5f,1.0f);
+                glUniform1f(glGetUniformLocation(lineProg,"uAlpha"),0.7f);
+                glLineWidth(1.5f);
+                inspLeafWire.draw();
+            }
+
+            // Render surfel points in this voxel (green = active, red = inactive)
+            if (billet.microGrid) {
+                static GLuint inspPtVAO=0, inspPtVBO=0;
+                static int inspPtCount=0;
+                static openvdb::Coord lastInspVoxel{-9999,-9999,-9999};
+                if (inspVoxel != lastInspVoxel) {
+                    lastInspVoxel = inspVoxel;
+                    std::vector<float> ptData; // x,y,z per point
+                    auto& xf2 = billet.microGrid->transform();
+                    openvdb::Coord leafOrig(inspVoxel.x()&~7, inspVoxel.y()&~7, inspVoxel.z()&~7);
+                    auto* leaf = billet.microGrid->tree().probeConstLeaf(leafOrig);
+                    if (leaf) {
+                        auto& as = leaf->attributeSet();
+                        auto* posArr = as.get("P");
+                        if (posArr) {
+                            auto ph = openvdb::points::AttributeHandle<openvdb::Vec3f>::create(*posArr);
+                            openvdb::Coord lc = inspVoxel - leafOrig;
+                            int vIdx = (lc.x()<<6)|(lc.y()<<3)|lc.z();
+                            openvdb::Index endI = static_cast<openvdb::Index>(leaf->getValue(vIdx));
+                            openvdb::Index startI = (vIdx==0)?0:static_cast<openvdb::Index>(leaf->getValue(vIdx-1));
+                            // Sample: show up to 512 points (skip if more)
+                            int step = std::max(1, (int)(endI-startI)/512);
+                            for (openvdb::Index i=startI; i<endI; i+=step) {
+                                auto p = ph->get(i);
+                                auto swp = xf2.indexToWorld(ygg::Vec3d(
+                                    inspVoxel.x()+p.x(), inspVoxel.y()+p.y(), inspVoxel.z()+p.z()));
+                                ptData.push_back((float)swp.x());
+                                ptData.push_back((float)swp.y());
+                                ptData.push_back((float)swp.z());
+                            }
+                        }
+                    }
+                    inspPtCount = (int)ptData.size()/3;
+                    if (!inspPtVAO) { glGenVertexArrays(1,&inspPtVAO); glGenBuffers(1,&inspPtVBO); }
+                    glBindVertexArray(inspPtVAO);
+                    glBindBuffer(GL_ARRAY_BUFFER, inspPtVBO);
+                    glBufferData(GL_ARRAY_BUFFER, ptData.size()*sizeof(float), ptData.data(), GL_DYNAMIC_DRAW);
+                    glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,3*sizeof(float),(void*)0);
+                    glEnableVertexAttribArray(0);
+                }
+                if (inspPtCount > 0) {
+                    glUseProgram(lineProg);
+                    glUniformMatrix4fv(glGetUniformLocation(lineProg,"uMVP"),1,GL_FALSE,mvp);
+                    glUniform3f(glGetUniformLocation(lineProg,"uColor"),0.1f,1.0f,0.4f);
+                    glUniform1f(glGetUniformLocation(lineProg,"uAlpha"),1.0f);
+                    glPointSize(5.0f);
+                    glBindVertexArray(inspPtVAO);
+                    glDrawArrays(GL_POINTS, 0, inspPtCount);
+                }
+            }
+        }
+#endif
 
 #if YGG_HAS_OPENVDB
         // Tool visualization (sphere at last path endpoint)

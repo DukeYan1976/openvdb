@@ -234,27 +234,24 @@ static void cutSingleTrack(BilletModel& billet, const ToolSweepSDF& toolSDF, Cut
 // Helper: attach normal and active attributes to a PointDataGrid
 static void attachAttributes(openvdb::points::PointDataGrid::Ptr& grid,
                              const std::vector<openvdb::Vec3f>& normals) {
-    size_t idx = 0;
-    for (auto leaf = grid->tree().beginLeaf(); leaf; ++leaf) {
-        auto as = leaf->stealAttributeSet();
-        if (as->descriptor().find("normal") == openvdb::points::AttributeSet::INVALID_POS)
-            as->appendAttribute("normal",
-                openvdb::points::TypedAttributeArray<openvdb::Vec3f>::attributeType(),
-                static_cast<openvdb::Index>(leaf->pointCount()));
-        if (as->descriptor().find("active") == openvdb::points::AttributeSet::INVALID_POS)
-            as->appendAttribute("active",
-                openvdb::points::TypedAttributeArray<uint8_t>::attributeType(),
-                static_cast<openvdb::Index>(leaf->pointCount()));
-        leaf->replaceAttributeSet(as.release(), true);
+    auto& tree = grid->tree();
 
-        auto as2 = leaf->stealAttributeSet();
-        auto whN = openvdb::points::AttributeWriteHandle<openvdb::Vec3f>::create(*as2->get("normal"));
-        auto whA = openvdb::points::AttributeWriteHandle<uint8_t>::create(*as2->get("active"));
-        for (size_t i = 0; i < whN->size(); ++i, ++idx) {
+    // Use tree-level API to append attributes uniformly across all leaves
+    openvdb::points::appendAttribute<openvdb::Vec3f>(tree, "normal");
+    openvdb::points::appendAttribute<uint8_t>(tree, "active");
+
+    // Fill values per-leaf
+    size_t idx = 0;
+    for (auto leaf = tree.beginLeaf(); leaf; ++leaf) {
+        auto whN = openvdb::points::AttributeWriteHandle<openvdb::Vec3f>::create(
+            leaf->attributeArray("normal"));
+        auto whA = openvdb::points::AttributeWriteHandle<uint8_t>::create(
+            leaf->attributeArray("active"));
+        const openvdb::Index count = leaf->pointCount();
+        for (openvdb::Index i = 0; i < count; ++i, ++idx) {
             whN->set(i, idx < normals.size() ? normals[idx] : openvdb::Vec3f(0));
             whA->set(i, 1);
         }
-        leaf->replaceAttributeSet(as2.release(), true);
     }
 }
 
@@ -317,32 +314,48 @@ static void injectSurfels(BilletModel& billet,
     openvdb::points::TypedAttributeArray<openvdb::Vec3f>::registerType();
     openvdb::points::TypedAttributeArray<uint8_t>::registerType();
 
+    printf("%s   [inject] positions=%zu normals=%zu existing_grid=%s\n",
+        ts().c_str(), positions.size(), normals.size(),
+        billet.microGrid ? "yes" : "no");
+    fflush(stdout);
+
     if (!billet.microGrid) {
+        printf("%s   [inject] createPointDataGrid (first time)...\n", ts().c_str()); fflush(stdout);
         auto grid = openvdb::points::createPointDataGrid<
             openvdb::points::NullCodec, openvdb::points::PointDataGrid>(positions, xform);
         grid->setName("micro_surfels");
+        printf("%s   [inject] grid created, leaves=%zu, attaching attrs...\n",
+            ts().c_str(), grid->tree().leafCount()); fflush(stdout);
         attachAttributes(grid, normals);
         billet.microGrid = grid;
+        printf("%s   [inject] done (first inject)\n", ts().c_str()); fflush(stdout);
         return;
     }
 
-    // Rebuild strategy: extract active points from existing grid + append new points,
-    // then create a fresh grid. This is O(total_points log total_points) and CORRECT,
-    // whereas tree().merge() is O(N²) and drops points on overlapping leaves.
+    // Rebuild strategy: extract active points from existing grid + append new points
+    size_t existingCount = openvdb::points::pointCount(billet.microGrid->tree());
+    printf("%s   [inject] rebuild: existing=%zu + new=%zu\n",
+        ts().c_str(), existingCount, positions.size()); fflush(stdout);
+
     std::vector<openvdb::Vec3R> allPos;
     std::vector<openvdb::Vec3f> allNorm;
-    allPos.reserve(openvdb::points::pointCount(billet.microGrid->tree()) + positions.size());
+    allPos.reserve(existingCount + positions.size());
     allNorm.reserve(allPos.capacity());
 
     extractActivePointsFromGrid(billet.microGrid, xform, allPos, allNorm);
+    printf("%s   [inject] extracted %zu active points\n", ts().c_str(), allPos.size()); fflush(stdout);
+
     allPos.insert(allPos.end(), positions.begin(), positions.end());
     allNorm.insert(allNorm.end(), normals.begin(), normals.end());
 
+    printf("%s   [inject] createPointDataGrid (total=%zu)...\n", ts().c_str(), allPos.size()); fflush(stdout);
     auto grid = openvdb::points::createPointDataGrid<
         openvdb::points::NullCodec, openvdb::points::PointDataGrid>(allPos, xform);
     grid->setName("micro_surfels");
+    printf("%s   [inject] attaching attrs to %zu leaves...\n", ts().c_str(), grid->tree().leafCount()); fflush(stdout);
     attachAttributes(grid, allNorm);
     billet.microGrid = grid;
+    printf("%s   [inject] done\n", ts().c_str()); fflush(stdout);
 }
 
 // 双轨切削：工业级 4-phase（增量注入 + 并行裁剪 + 分块采样）

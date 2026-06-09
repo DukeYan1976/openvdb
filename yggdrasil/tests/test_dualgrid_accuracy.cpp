@@ -232,8 +232,8 @@ TEST_F(DualGridAccuracyTest, DISABLED_LargePart_MemoryFeasible) {
     ASSERT_EQ(cfg.mode, ResolutionConfig::DUAL_TRACK);
 
     auto billet = buildBillet(cfg, {0,0,0}, {500, 500, 200});
-    ASSERT_NE(billet.sdfGrid, nullptr);
-    ASSERT_NE(billet.microGrid, nullptr);
+    ASSERT_TRUE(billet.sdfGrid != nullptr);
+    ASSERT_TRUE(billet.microGrid != nullptr);
 
     MemoryStats stats;
     stats.update(billet.sdfGrid, billet.microGrid);

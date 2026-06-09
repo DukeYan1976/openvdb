@@ -8,36 +8,41 @@ ResolutionConfig solveResolution(double t, double R_min, double F_min,
                                  const Vec3d& dims, size_t memBudget) {
     ResolutionConfig cfg;
 
-    // Step 1: 微观基准
+    // ═══ Step 1: Micro precision (non-negotiable) ═══
     cfg.d_v = 0.5 * t;
 
-    // Step 2: 宏观体素物理上界
-    double D_upper = std::min(0.5 * R_min, F_min);
+    // ═══ Step 2: D_v Nash equilibrium ═══
+    // Target: driven by tool radius (optimal for cut-zone filtering)
+    double D_v_target = std::min(0.5 * R_min, F_min);
 
-    // Step 3: 理想面元密度因子
-    int N_ideal = static_cast<int>(std::floor(D_upper / cfg.d_v));
+    // Floor: minimum N=4 to maintain meaningful macro partitioning
+    const int N_MIN = 4;
+    const int N_MAX = 16;
+    double D_v_floor = N_MIN * cfg.d_v;   // 2t
+    double D_v_ceil  = N_MAX * cfg.d_v;   // 8t
 
-    // 边界情况：D_upper < d_v → 不降级为 SINGLE_TRACK（避免全分辨率灾难）
-    // 而是使用最小 DUAL_TRACK (N=2)，保持双轨分离的内存/计算优势
-    if (N_ideal < 2) {
-        cfg.mode = ResolutionConfig::DUAL_TRACK;
-        cfg.n = 1;  // N = 2^1 = 2
-        cfg.N = 2;
-        cfg.D_v = cfg.N * cfg.d_v;
+    // Clamp: balance tool-driven target with precision/performance bounds
+    double D_v_clamped = std::clamp(D_v_target, D_v_floor, D_v_ceil);
+
+    // ═══ Step 3: Align N to power-of-2 ═══
+    int N_ideal = static_cast<int>(std::floor(D_v_clamped / cfg.d_v));
+    if (N_ideal < N_MIN) {
+        // Cannot form meaningful macro partition → SINGLE_TRACK
+        cfg.mode = ResolutionConfig::SINGLE_TRACK;
+        cfg.D_v = cfg.d_v;
+        cfg.N = 1;
+        cfg.n = 0;
         return cfg;
     }
 
-    // Step 4: 对齐到 2 的幂，并限制上限防止内存/计算爆炸
-    const int N_MAX = 64; // 上限：每 dirty voxel 最多 4096 surfel
     cfg.n = static_cast<int>(std::floor(std::log2(static_cast<double>(N_ideal))));
-    if (cfg.n > 6) cfg.n = 6; // log2(64) = 6
+    cfg.n = std::max(cfg.n, 2); // enforce N >= 4
     cfg.N = 1 << cfg.n;
-    if (cfg.N > N_MAX) cfg.N = N_MAX;
 
-    // Step 5: 最终共享体素尺寸
+    // ═══ Step 4: Final D_v ═══
     cfg.D_v = cfg.N * cfg.d_v;
 
-    // Step 6: 模式判定 — DUAL_TRACK 是默认主路径
+    // ═══ Step 5: Mode selection ═══
     double L_max = std::max({dims.x(), dims.y(), dims.z()});
 
     if ((L_max / cfg.d_v) > 1.67e7) {
