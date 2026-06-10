@@ -45,11 +45,12 @@ layout(location=0) in vec3 aPos;
 layout(location=1) in vec3 aNorm;
 uniform mat4 uMVP;
 uniform mat3 uNormalMat;
+uniform float uPointSize;
 out vec3 vNorm;
 void main(){
     gl_Position = uMVP * vec4(aPos, 1.0);
     vNorm = normalize(uNormalMat * aNorm);
-    gl_PointSize = 4.0;
+    gl_PointSize = uPointSize;
 })";
 
 static const char* g_fragSrc = R"(
@@ -301,6 +302,10 @@ int main() {
     GPUMesh microDetailMesh;  // Layer 3: focus area detail
     GPULines macroLines;      // Layer 2: wireframe
 
+    // Surfel point cloud (all active surfels)
+    GLuint surfelPtVAO=0, surfelPtVBO=0;
+    int surfelPtCount=0;
+
     // Visibility & appearance
     bool showOrigBillet = true;
     float origAlpha = 0.5f;
@@ -313,8 +318,9 @@ int main() {
 
     bool showMicroDetail = false;
     float microColor[3] = {0.2f, 0.85f, 0.35f};
-    float focusRadius = 15.0f;
-    bool autoFocus = true;
+
+    float surfelPointSize = 3.0f;
+    float surfelPtColor[3] = {1.0f, 0.6f, 0.1f};
 
     bool showSdfMesh = true;
     float sdfColor[3] = {0.7f, 0.75f, 0.8f};
@@ -343,6 +349,8 @@ int main() {
     ygg::MeshData pendingMicroMesh;
     bool pendingHasMacro = false;
     bool pendingHasMicro = false;
+    std::vector<float> pendingSurfelPts; // interleaved pos+normal (6 floats per pt)
+    bool pendingHasSurfelPts = false;
 
     // ── Voxel Inspector state ──
     bool inspectorActive = false;
@@ -397,42 +405,68 @@ int main() {
         }
 
 #if YGG_HAS_OPENVDB
-        // ── Voxel Inspector: ray pick ──
-        if (inspectorActive && showMicroDetail && billet.sdfGrid) {
+        // ── Voxel Inspector: ray pick (切削边界 voxels only) ──
+        if (inspectorActive && billet.microGrid) {
             double mx, my; glfwGetCursorPos(win, &mx, &my);
             int vw, vh; glfwGetFramebufferSize(win, &vw, &vh);
-            // Ortho unproject: screen → world (simplified for ortho)
             float asp = (float)vw/(float)vh;
             float ndcX = (float)(2.0*mx/vw - 1.0);
             float ndcY = (float)(1.0 - 2.0*my/vh);
             float yr = cam.yaw*3.14159f/180.f, pr = cam.pitch*3.14159f/180.f;
-            // Right and up in world space
             float rx = -sinf(yr), ry = cosf(yr), rz = 0;
             float ux = -sinf(pr)*cosf(yr), uy = -sinf(pr)*sinf(yr), uz = cosf(pr);
             float worldX = cam.tx + ndcX*asp*cam.orthoSize*rx + ndcY*cam.orthoSize*ux;
             float worldY = cam.ty + ndcX*asp*cam.orthoSize*ry + ndcY*cam.orthoSize*uy;
             float worldZ = cam.tz + ndcX*asp*cam.orthoSize*rz + ndcY*cam.orthoSize*uz;
 
-            // Find voxel coord at this world position (use SDF grid transform)
             auto& xf = billet.sdfGrid->transform();
-            auto idx = xf.worldToIndexCellCentered(ygg::Vec3d(worldX, worldY, worldZ));
-
-            // Walk along view direction to find N-th surface voxel
             float fwdX = cosf(pr)*cosf(yr), fwdY = cosf(pr)*sinf(yr), fwdZ = sinf(pr);
             inspValid = false;
             int found = 0;
+            int totalFound = 0;
             double D_v = xf.voxelSize()[0];
-            auto sdfAcc = billet.sdfGrid->getConstAccessor();
+
+            // First pass: count total surfel voxels along ray
+            openvdb::Coord lastFoundCoord{0,0,0};
             for (int step = -50; step <= 50; ++step) {
                 ygg::Vec3d probe(worldX - fwdX*step*D_v,
                                  worldY - fwdY*step*D_v,
                                  worldZ - fwdZ*step*D_v);
                 auto c = xf.worldToIndexCellCentered(probe);
-                if (billet.sdfGrid->tree().isValueOn(c)) {
-                    float sv = sdfAcc.getValue(c);
-                    // Boundary voxel: SDF near zero (sign change with neighbors)
-                    if (std::abs(sv) < (float)D_v) {
-                        if (found == inspDepth) {
+                openvdb::Coord leafOrig(c.x()&~7, c.y()&~7, c.z()&~7);
+                auto* leaf = billet.microGrid->tree().probeConstLeaf(leafOrig);
+                if (leaf) {
+                    openvdb::Coord lc = c - leafOrig;
+                    int vIdx = (lc.x()<<6)|(lc.y()<<3)|lc.z();
+                    openvdb::Index endI = static_cast<openvdb::Index>(leaf->getValue(vIdx));
+                    openvdb::Index startI = (vIdx==0)?0:static_cast<openvdb::Index>(leaf->getValue(vIdx-1));
+                    if (endI > startI) {
+                        if (totalFound == (inspDepth % std::max(1, totalFound + 1))) {
+                            // will be selected on second pass
+                        }
+                        totalFound++;
+                    }
+                }
+            }
+
+            // Wrap depth to cycle
+            int effectiveDepth = (totalFound > 0) ? (inspDepth % totalFound) : 0;
+
+            // Second pass: find the voxel at effectiveDepth
+            for (int step = -50; step <= 50; ++step) {
+                ygg::Vec3d probe(worldX - fwdX*step*D_v,
+                                 worldY - fwdY*step*D_v,
+                                 worldZ - fwdZ*step*D_v);
+                auto c = xf.worldToIndexCellCentered(probe);
+                openvdb::Coord leafOrig(c.x()&~7, c.y()&~7, c.z()&~7);
+                auto* leaf = billet.microGrid->tree().probeConstLeaf(leafOrig);
+                if (leaf) {
+                    openvdb::Coord lc = c - leafOrig;
+                    int vIdx = (lc.x()<<6)|(lc.y()<<3)|lc.z();
+                    openvdb::Index endI = static_cast<openvdb::Index>(leaf->getValue(vIdx));
+                    openvdb::Index startI = (vIdx==0)?0:static_cast<openvdb::Index>(leaf->getValue(vIdx-1));
+                    if (endI > startI) {
+                        if (found == effectiveDepth) {
                             inspVoxel = c; inspValid = true;
                             break;
                         }
@@ -441,7 +475,7 @@ int main() {
                 }
             }
 
-            // Left click: advance depth
+            // Left click: cycle depth
             static bool lmbWasPressed = false;
             bool lmbNow = glfwGetMouseButton(win, GLFW_MOUSE_BUTTON_LEFT)==GLFW_PRESS;
             if (lmbNow && !lmbWasPressed && !ImGui::GetIO().WantCaptureMouse) inspDepth++;
@@ -473,6 +507,7 @@ int main() {
             int currentMacroLod = macroLod;
             bool currentShowMacro = showMacroGrid;
             bool currentShowMicro = showMicroDetail;
+            bool currentShowSurfelPts = showMicroDetail;
             int currentCutCount = cutCount;
             float currentCutR = cutR;
             float currentCutY = cutY;
@@ -481,6 +516,7 @@ int main() {
 
             rebuildThread = std::thread([=, &pendingSdfMesh, &pendingMacroLines, &pendingMicroMesh,
                                          &pendingHasMacro, &pendingHasMicro,
+                                         &pendingSurfelPts, &pendingHasSurfelPts,
                                          &rebuildRunning, &rebuildPendingUpload]() {
                 pendingSdfMesh = ygg::vdbToMesh(billetPtr->sdfGrid);
 
@@ -494,8 +530,51 @@ int main() {
                     ygg::ToolSweepSDF lastTool(ygg::ToolType::BALL_END, currentCutR, 0, 20,
                         {2, (double)currentCutY, (double)currentCutZ},
                         {(double)currentBilletSizeX - 2.0, (double)currentCutY, (double)currentCutZ});
-                    auto csGrid = ygg::buildLocalCutSurface(*billetPtr, lastTool);
-                    pendingMicroMesh = ygg::vdbToMesh(csGrid);
+                    auto surfelGrid = ygg::buildSurfelMesh(*billetPtr, lastTool);
+                    if (surfelGrid) pendingMicroMesh = ygg::vdbToMesh(surfelGrid);
+                    else pendingHasMicro = false;
+                }
+
+                // Extract all active surfel points (pos+normal interleaved)
+                pendingHasSurfelPts = (currentShowSurfelPts && currentCutCount > 0 &&
+                                       billetPtr->isDualTrack() && billetPtr->microGrid);
+                if (pendingHasSurfelPts) {
+                    pendingSurfelPts.clear();
+                    auto& xf = billetPtr->microGrid->transform();
+                    for (auto leaf = billetPtr->microGrid->tree().cbeginLeaf(); leaf; ++leaf) {
+                        auto& as = leaf->attributeSet();
+                        auto* posArr = as.get("P");
+                        auto* normArr = as.get("normal");
+                        auto* actArr = as.get("active");
+                        if (!posArr) continue;
+                        auto ph = openvdb::points::AttributeHandle<openvdb::Vec3f>::create(*posArr);
+                        auto nh = normArr ? openvdb::points::AttributeHandle<openvdb::Vec3f>::create(*normArr) : nullptr;
+                        auto ah = actArr ? openvdb::points::AttributeHandle<uint8_t>::create(*actArr) : nullptr;
+                        auto lo = leaf->origin();
+                        for (openvdb::Index vIdx = 0; vIdx < 512; ++vIdx) {
+                            openvdb::Index end = static_cast<openvdb::Index>(leaf->getValue(vIdx));
+                            openvdb::Index start = (vIdx==0)?0:static_cast<openvdb::Index>(leaf->getValue(vIdx-1));
+                            if (start==end) continue;
+                            openvdb::Coord vc = lo + openvdb::Coord((vIdx>>6)&7,(vIdx>>3)&7,vIdx&7);
+                            for (openvdb::Index i = start; i < end; ++i) {
+                                if (ah && ah->get(i)==0) continue; // skip inactive
+                                auto p = ph->get(i);
+                                auto wp = xf.indexToWorld(ygg::Vec3d(vc.x()+p.x(), vc.y()+p.y(), vc.z()+p.z()));
+                                pendingSurfelPts.push_back((float)wp.x());
+                                pendingSurfelPts.push_back((float)wp.y());
+                                pendingSurfelPts.push_back((float)wp.z());
+                                if (nh) {
+                                    auto n = nh->get(i);
+                                    pendingSurfelPts.push_back(n.x());
+                                    pendingSurfelPts.push_back(n.y());
+                                    pendingSurfelPts.push_back(n.z());
+                                } else {
+                                    pendingSurfelPts.push_back(0); pendingSurfelPts.push_back(0); pendingSurfelPts.push_back(1);
+                                }
+                            }
+                        }
+                    }
+                    if (pendingSurfelPts.empty()) pendingHasSurfelPts = false;
                 }
 
                 rebuildPendingUpload = true;
@@ -518,6 +597,19 @@ int main() {
                 microDetailMesh.upload(pendingMicroMesh.vertices.data(), pendingMicroMesh.vertices.size()*sizeof(float),
                                        pendingMicroMesh.indices.data(), pendingMicroMesh.indices.size()*sizeof(uint32_t),
                                        (int)pendingMicroMesh.indices.size());
+            }
+            if (pendingHasSurfelPts) {
+                if (!surfelPtVAO) { glGenVertexArrays(1,&surfelPtVAO); glGenBuffers(1,&surfelPtVBO); }
+                surfelPtCount = (int)pendingSurfelPts.size() / 6;
+                glBindVertexArray(surfelPtVAO);
+                glBindBuffer(GL_ARRAY_BUFFER, surfelPtVBO);
+                glBufferData(GL_ARRAY_BUFFER, pendingSurfelPts.size()*sizeof(float), pendingSurfelPts.data(), GL_DYNAMIC_DRAW);
+                glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,6*sizeof(float),(void*)0);
+                glEnableVertexAttribArray(0);
+                glVertexAttribPointer(1,3,GL_FLOAT,GL_FALSE,6*sizeof(float),(void*)(3*sizeof(float)));
+                glEnableVertexAttribArray(1);
+            } else if (showMicroDetail) {
+                surfelPtCount = 0;
             }
             rebuildPendingUpload = false;
         }
@@ -559,17 +651,32 @@ int main() {
                 }
                 ImGui::Spacing();
 
-                ImGui::TextColored(ImVec4(0.2f,0.9f,0.4f,1), "Layer 3: MicroGrid Detail Surface");
-                if (ImGui::Checkbox("Show##micro", &showMicroDetail)) layersDirty = true;
-                if (showMicroDetail) {
-                    ImGui::Checkbox("Auto Focus (follow cut)", &autoFocus);
-                    ImGui::SliderFloat("Focus Radius (mm)", &focusRadius, 5.0f, 50.0f);
+                ImGui::TextColored(ImVec4(0.2f,0.9f,0.4f,1), "Layer 3: MicroGrid Cut Surface");
+                bool canShowMicro = (cutCount > 0 && billet.isDualTrack());
+                if (!canShowMicro) ImGui::BeginDisabled();
+                if (ImGui::Checkbox("Show Mesh##micro", &showMicroDetail)) {
+                    if (showMicroDetail) layersDirty = true;
+                }
+                ImGui::SameLine();
+                ImGui::Checkbox("Voxel Inspector##insp", &inspectorActive);
+                if (inspectorActive) {
+                    ImGui::SameLine(); ImGui::Text("Depth:%d", inspDepth);
+                    ImGui::SameLine(); if(ImGui::SmallButton("Reset##insp")) inspDepth=0;
+                }
+                if (!canShowMicro) ImGui::EndDisabled();
+                if (showMicroDetail && canShowMicro) {
                     ImGui::ColorEdit3("Color##micro", microColor, ImGuiColorEditFlags_NoInputs);
-                    ImGui::Checkbox("Voxel Inspector (hover)", &inspectorActive);
-                    if (inspectorActive) {
-                        ImGui::SameLine(); ImGui::Text("Depth:%d", inspDepth);
-                        ImGui::SameLine(); if(ImGui::SmallButton("Reset##insp")) inspDepth=0;
-                    }
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(80);
+                    ImGui::SliderFloat("Pt Size##surfel", &surfelPointSize, 1.0f, 10.0f);
+                    ImGui::SameLine();
+                    ImGui::ColorEdit3("##surfelcol", surfelPtColor, ImGuiColorEditFlags_NoInputs);
+                    if (surfelPtCount > 0)
+                        ImGui::Text("Surfel points: %d", surfelPtCount);
+                    else
+                        ImGui::TextColored(ImVec4(1,0.5f,0,1), "Surfels: 0 (mode=%s, microGrid=%s)",
+                            billet.isDualTrack()?"DUAL":"SINGLE",
+                            billet.microGrid?"yes":"null");
                 }
                 ImGui::Spacing();
 
@@ -693,6 +800,7 @@ int main() {
                 ImGui::Text("SDF Mesh: %d triangles", sdfMesh.count/3);
                 ImGui::Text("MacroGrid: %d line segments", macroLines.count/2);
                 ImGui::Text("MicroDetail: %d triangles", microDetailMesh.count/3);
+                ImGui::Text("Surfel Points: %d", surfelPtCount);
                 ImGui::EndTabItem();
             }
             ImGui::EndTabBar();
@@ -834,8 +942,10 @@ int main() {
             sdfMesh.draw();
         }
 
-        // MicroGrid detail surface
+        // MicroGrid cut surface (single-sided, no thickness appearance)
         if (showMicroDetail && microDetailMesh.count>0) {
+            glEnable(GL_CULL_FACE);
+            glCullFace(GL_BACK);
             glUseProgram(meshProg);
             glUniformMatrix4fv(glGetUniformLocation(meshProg,"uMVP"),1,GL_FALSE,mvp);
             glUniformMatrix3fv(glGetUniformLocation(meshProg,"uNormalMat"),1,GL_FALSE,nm);
@@ -843,6 +953,25 @@ int main() {
             glUniform3f(glGetUniformLocation(meshProg,"uColor"),microColor[0],microColor[1],microColor[2]);
             glUniform1f(glGetUniformLocation(meshProg,"uAlpha"),1.0f);
             microDetailMesh.draw();
+            glDisable(GL_CULL_FACE);
+        }
+
+        // All active surfel points (rendered with normal-based shading)
+        // Points lie on the mesh surface — disable depth test to ensure visibility
+        if (showMicroDetail && surfelPtCount>0) {
+            glEnable(GL_PROGRAM_POINT_SIZE);
+            glDisable(GL_DEPTH_TEST);
+            glUseProgram(meshProg);
+            glUniformMatrix4fv(glGetUniformLocation(meshProg,"uMVP"),1,GL_FALSE,mvp);
+            glUniformMatrix3fv(glGetUniformLocation(meshProg,"uNormalMat"),1,GL_FALSE,nm);
+            glUniform3f(glGetUniformLocation(meshProg,"uLightDir"),0.30f,0.51f,0.81f);
+            glUniform3f(glGetUniformLocation(meshProg,"uColor"),surfelPtColor[0],surfelPtColor[1],surfelPtColor[2]);
+            glUniform1f(glGetUniformLocation(meshProg,"uAlpha"),1.0f);
+            glUniform1f(glGetUniformLocation(meshProg,"uPointSize"),surfelPointSize);
+            glBindVertexArray(surfelPtVAO);
+            glDrawArrays(GL_POINTS, 0, surfelPtCount);
+            glEnable(GL_DEPTH_TEST);
+            glDisable(GL_PROGRAM_POINT_SIZE);
         }
 
         // MacroGrid wireframe
@@ -875,52 +1004,61 @@ int main() {
                 inspLeafWire.draw();
             }
 
-            // Render surfel points in this voxel (green = active, red = inactive)
+            // Render ALL surfel points in this voxel (green = active, red = inactive)
             if (billet.microGrid) {
-                static GLuint inspPtVAO=0, inspPtVBO=0;
+                static GLuint inspPtVAO=0, inspPtVBO=0, inspPtCBO=0;
                 static int inspPtCount=0;
                 static openvdb::Coord lastInspVoxel{-9999,-9999,-9999};
                 if (inspVoxel != lastInspVoxel) {
                     lastInspVoxel = inspVoxel;
                     std::vector<float> ptData; // x,y,z per point
+                    std::vector<float> ptColor; // r,g,b per point
                     auto& xf2 = billet.microGrid->transform();
                     openvdb::Coord leafOrig(inspVoxel.x()&~7, inspVoxel.y()&~7, inspVoxel.z()&~7);
                     auto* leaf = billet.microGrid->tree().probeConstLeaf(leafOrig);
                     if (leaf) {
                         auto& as = leaf->attributeSet();
                         auto* posArr = as.get("P");
+                        auto* actArr = as.get("active");
                         if (posArr) {
                             auto ph = openvdb::points::AttributeHandle<openvdb::Vec3f>::create(*posArr);
+                            auto ah = actArr ? openvdb::points::AttributeHandle<uint8_t>::create(*actArr) : nullptr;
                             openvdb::Coord lc = inspVoxel - leafOrig;
                             int vIdx = (lc.x()<<6)|(lc.y()<<3)|lc.z();
                             openvdb::Index endI = static_cast<openvdb::Index>(leaf->getValue(vIdx));
                             openvdb::Index startI = (vIdx==0)?0:static_cast<openvdb::Index>(leaf->getValue(vIdx-1));
-                            // Sample: show up to 512 points (skip if more)
-                            int step = std::max(1, (int)(endI-startI)/512);
-                            for (openvdb::Index i=startI; i<endI; i+=step) {
+                            for (openvdb::Index i=startI; i<endI; ++i) {
                                 auto p = ph->get(i);
                                 auto swp = xf2.indexToWorld(ygg::Vec3d(
                                     inspVoxel.x()+p.x(), inspVoxel.y()+p.y(), inspVoxel.z()+p.z()));
                                 ptData.push_back((float)swp.x());
                                 ptData.push_back((float)swp.y());
                                 ptData.push_back((float)swp.z());
+                                bool active = !ah || ah->get(i)==1;
+                                ptColor.push_back(active ? 0.1f : 1.0f);
+                                ptColor.push_back(active ? 1.0f : 0.2f);
+                                ptColor.push_back(active ? 0.4f : 0.1f);
                             }
                         }
                     }
                     inspPtCount = (int)ptData.size()/3;
-                    if (!inspPtVAO) { glGenVertexArrays(1,&inspPtVAO); glGenBuffers(1,&inspPtVBO); }
+                    if (!inspPtVAO) { glGenVertexArrays(1,&inspPtVAO); glGenBuffers(1,&inspPtVBO); glGenBuffers(1,&inspPtCBO); }
                     glBindVertexArray(inspPtVAO);
                     glBindBuffer(GL_ARRAY_BUFFER, inspPtVBO);
                     glBufferData(GL_ARRAY_BUFFER, ptData.size()*sizeof(float), ptData.data(), GL_DYNAMIC_DRAW);
                     glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,3*sizeof(float),(void*)0);
                     glEnableVertexAttribArray(0);
+                    glBindBuffer(GL_ARRAY_BUFFER, inspPtCBO);
+                    glBufferData(GL_ARRAY_BUFFER, ptColor.size()*sizeof(float), ptColor.data(), GL_DYNAMIC_DRAW);
+                    glVertexAttribPointer(1,3,GL_FLOAT,GL_FALSE,3*sizeof(float),(void*)0);
+                    glEnableVertexAttribArray(1);
                 }
                 if (inspPtCount > 0) {
                     glUseProgram(lineProg);
                     glUniformMatrix4fv(glGetUniformLocation(lineProg,"uMVP"),1,GL_FALSE,mvp);
                     glUniform3f(glGetUniformLocation(lineProg,"uColor"),0.1f,1.0f,0.4f);
                     glUniform1f(glGetUniformLocation(lineProg,"uAlpha"),1.0f);
-                    glPointSize(5.0f);
+                    glPointSize(4.0f);
                     glBindVertexArray(inspPtVAO);
                     glDrawArrays(GL_POINTS, 0, inspPtCount);
                 }

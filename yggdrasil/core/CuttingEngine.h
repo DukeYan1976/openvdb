@@ -20,4 +20,8 @@ double computeVolume(const openvdb::FloatGrid::Ptr& grid);
 openvdb::FloatGrid::Ptr buildLocalCutSurface(
     const BilletModel& billet, const ToolSweepSDF& lastTool);
 
+/// 从刀具BBox范围内的 active surfels 构建 level set mesh
+openvdb::FloatGrid::Ptr buildSurfelMesh(
+    const BilletModel& billet, const ToolSweepSDF& lastTool);
+
 } // namespace ygg

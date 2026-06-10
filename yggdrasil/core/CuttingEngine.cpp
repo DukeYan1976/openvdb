@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <algorithm>
 #include <vector>
+#include <unordered_map>
 #include <chrono>
 #include <ctime>
 #include <string>
@@ -301,11 +302,9 @@ static void extractActivePointsFromGrid(
     }
 }
 
-// ─── Phase 2 helper: bulk surfel injection via rebuild-from-scratch ───
-// WARNING: OpenVDB's tree().merge() CANNOT add points to existing PointDataLeafNodes.
-// It silently drops overlapping leaves and is O(N²) slow. We rebuild from all active
-// points instead — createPointDataGrid is well-optimized and this avoids both the
-// correctness bug and the 100+ second merge stalls.
+// ─── Phase 2 helper: Leaf-Local Splice incremental injection ───
+// Only rebuilds leaves that receive new points. Untouched leaves = zero cost.
+// Complexity: O(dirty_leaves × points_per_leaf) instead of O(total_points).
 static void injectSurfels(BilletModel& billet,
                           const std::vector<openvdb::Vec3R>& positions,
                           const std::vector<openvdb::Vec3f>& normals,
@@ -314,48 +313,114 @@ static void injectSurfels(BilletModel& billet,
     openvdb::points::TypedAttributeArray<openvdb::Vec3f>::registerType();
     openvdb::points::TypedAttributeArray<uint8_t>::registerType();
 
-    printf("%s   [inject] positions=%zu normals=%zu existing_grid=%s\n",
-        ts().c_str(), positions.size(), normals.size(),
-        billet.microGrid ? "yes" : "no");
+    printf("%s   [inject] positions=%zu existing_grid=%s\n",
+        ts().c_str(), positions.size(), billet.microGrid ? "yes" : "no");
     fflush(stdout);
 
+    // First injection: build from scratch
     if (!billet.microGrid) {
-        printf("%s   [inject] createPointDataGrid (first time)...\n", ts().c_str()); fflush(stdout);
         auto grid = openvdb::points::createPointDataGrid<
             openvdb::points::NullCodec, openvdb::points::PointDataGrid>(positions, xform);
         grid->setName("micro_surfels");
-        printf("%s   [inject] grid created, leaves=%zu, attaching attrs...\n",
-            ts().c_str(), grid->tree().leafCount()); fflush(stdout);
         attachAttributes(grid, normals);
         billet.microGrid = grid;
-        printf("%s   [inject] done (first inject)\n", ts().c_str()); fflush(stdout);
+        printf("%s   [inject] first done, leaves=%zu\n",
+            ts().c_str(), grid->tree().leafCount()); fflush(stdout);
         return;
     }
 
-    // Rebuild strategy: extract active points from existing grid + append new points
-    size_t existingCount = openvdb::points::pointCount(billet.microGrid->tree());
-    printf("%s   [inject] rebuild: existing=%zu + new=%zu\n",
-        ts().c_str(), existingCount, positions.size()); fflush(stdout);
+    // ── Step 1: Bucket new points by leaf origin ──
+    struct LeafBucket {
+        openvdb::Coord origin;
+        std::vector<openvdb::Vec3R> pos;
+        std::vector<openvdb::Vec3f> norm;
+    };
+    std::unordered_map<int64_t, size_t> originToIdx;
+    std::vector<LeafBucket> buckets;
 
-    std::vector<openvdb::Vec3R> allPos;
-    std::vector<openvdb::Vec3f> allNorm;
-    allPos.reserve(existingCount + positions.size());
-    allNorm.reserve(allPos.capacity());
+    for (size_t i = 0; i < positions.size(); ++i) {
+        auto idx = xform.worldToIndexCellCentered(positions[i]);
+        openvdb::Coord lo((idx.x() >> 3) << 3, (idx.y() >> 3) << 3, (idx.z() >> 3) << 3);
+        int64_t key = (int64_t(lo.x()) << 20) ^ (int64_t(lo.y()) << 10) ^ int64_t(lo.z());
+        auto it = originToIdx.find(key);
+        if (it == originToIdx.end()) {
+            originToIdx[key] = buckets.size();
+            buckets.push_back({lo, {positions[i]}, {normals[i]}});
+        } else {
+            buckets[it->second].pos.push_back(positions[i]);
+            buckets[it->second].norm.push_back(normals[i]);
+        }
+    }
 
-    extractActivePointsFromGrid(billet.microGrid, xform, allPos, allNorm);
-    printf("%s   [inject] extracted %zu active points\n", ts().c_str(), allPos.size()); fflush(stdout);
+    printf("%s   [inject] splice: %zu pts → %zu dirty leaves / %zu total\n",
+        ts().c_str(), positions.size(), buckets.size(),
+        billet.microGrid->tree().leafCount()); fflush(stdout);
 
-    allPos.insert(allPos.end(), positions.begin(), positions.end());
-    allNorm.insert(allNorm.end(), normals.begin(), normals.end());
+    // ── Step 2: Per dirty leaf: extract existing + merge new → build mini grid ──
+    struct LeafResult {
+        openvdb::Coord origin;
+        std::vector<openvdb::Vec3R> allPos;
+        std::vector<openvdb::Vec3f> allNorm;
+    };
+    std::vector<LeafResult> results(buckets.size());
 
-    printf("%s   [inject] createPointDataGrid (total=%zu)...\n", ts().c_str(), allPos.size()); fflush(stdout);
-    auto grid = openvdb::points::createPointDataGrid<
-        openvdb::points::NullCodec, openvdb::points::PointDataGrid>(allPos, xform);
-    grid->setName("micro_surfels");
-    printf("%s   [inject] attaching attrs to %zu leaves...\n", ts().c_str(), grid->tree().leafCount()); fflush(stdout);
-    attachAttributes(grid, allNorm);
-    billet.microGrid = grid;
-    printf("%s   [inject] done\n", ts().c_str()); fflush(stdout);
+    tbb::parallel_for(tbb::blocked_range<size_t>(0, buckets.size()),
+        [&](const tbb::blocked_range<size_t>& r) {
+            for (size_t bi = r.begin(); bi != r.end(); ++bi) {
+                auto& b = buckets[bi];
+                auto& res = results[bi];
+                res.origin = b.origin;
+
+                // Extract existing active points from this leaf
+                auto* existingLeaf = billet.microGrid->tree().probeConstLeaf(b.origin);
+                if (existingLeaf) {
+                    extractActivePointsFromLeaf(existingLeaf, xform, res.allPos, res.allNorm);
+                }
+                // Append new
+                res.allPos.insert(res.allPos.end(), b.pos.begin(), b.pos.end());
+                res.allNorm.insert(res.allNorm.end(), b.norm.begin(), b.norm.end());
+            }
+        });
+
+    // ── Step 3: Collect all points from dirty leaves, build a single mini grid ──
+    // (createPointDataGrid handles bin-sorting into correct leaves)
+    std::vector<openvdb::Vec3R> dirtyPos;
+    std::vector<openvdb::Vec3f> dirtyNorm;
+    size_t totalDirtyPts = 0;
+    for (auto& res : results) totalDirtyPts += res.allPos.size();
+    dirtyPos.reserve(totalDirtyPts);
+    dirtyNorm.reserve(totalDirtyPts);
+    for (auto& res : results) {
+        dirtyPos.insert(dirtyPos.end(), res.allPos.begin(), res.allPos.end());
+        dirtyNorm.insert(dirtyNorm.end(), res.allNorm.begin(), res.allNorm.end());
+    }
+
+    auto dirtyGrid = openvdb::points::createPointDataGrid<
+        openvdb::points::NullCodec, openvdb::points::PointDataGrid>(dirtyPos, xform);
+    attachAttributes(dirtyGrid, dirtyNorm);
+
+    // ── Step 4: Splice dirty leaves into main tree ──
+    auto& mainTree = billet.microGrid->tree();
+    for (auto leaf = dirtyGrid->tree().beginLeaf(); leaf; ++leaf) {
+        // addLeaf replaces existing leaf at same origin or inserts new
+        using LeafT = openvdb::points::PointDataTree::LeafNodeType;
+        mainTree.addLeaf(new LeafT(*leaf));
+    }
+
+    // Ensure descriptor consistency: all leaves must share same descriptor
+    // After addLeaf, new leaves may have a different descriptor. Fix by
+    // re-appending attributes (no-op for leaves that already have them)
+    auto firstLeaf = mainTree.cbeginLeaf();
+    if (firstLeaf) {
+        auto& desc = firstLeaf->attributeSet().descriptor();
+        bool hasNormal = desc.find("normal") != openvdb::points::AttributeSet::INVALID_POS;
+        bool hasActive = desc.find("active") != openvdb::points::AttributeSet::INVALID_POS;
+        if (!hasNormal) openvdb::points::appendAttribute<openvdb::Vec3f>(mainTree, "normal");
+        if (!hasActive) openvdb::points::appendAttribute<uint8_t>(mainTree, "active");
+    }
+
+    printf("%s   [inject] splice done, dirty_pts=%zu total_leaves=%zu\n",
+        ts().c_str(), totalDirtyPts, mainTree.leafCount()); fflush(stdout);
 }
 
 // 双轨切削：工业级 4-phase（增量注入 + 并行裁剪 + 分块采样）
@@ -370,8 +435,9 @@ static void cutDualTrack(BilletModel& billet, const ToolSweepSDF& toolSDF) {
     float bandWidth = 3.0f * static_cast<float>(D_v);
 
     auto bbox = toolSDF.getBoundingBox();
-    auto minIdx = xform.worldToIndexCellCentered(bbox.min()) - openvdb::Coord(1);
-    auto maxIdx = xform.worldToIndexCellCentered(bbox.max()) + openvdb::Coord(1);
+    //将工具包围盒在索引空间中向外扩张一个完整的窄带宽度，确保 CSG 操作不会遗漏或破坏边界处的有效 SDF 数据。
+    auto minIdx = xform.worldToIndexCellCentered(bbox.min()) - openvdb::Coord(3);
+    auto maxIdx = xform.worldToIndexCellCentered(bbox.max()) + openvdb::Coord(3);
 
     printf("%s [DualTrack] D_v=%.4f d_v=%.4f N=%d BBox=[%d,%d,%d]..[%d,%d,%d]\n",
         ts().c_str(), D_v, billet.config.d_v, billet.config.N,
@@ -395,22 +461,64 @@ static void cutDualTrack(BilletModel& billet, const ToolSweepSDF& toolSDF) {
     }
     auto t1_p1a = Clock::now();
 
+
+    //备注duke
+    // 被激活的swepttool bbbox中的voxel， 意味着原来未被切削， 所有需要构建其中的高精度切削表面。 
+    // 这个voxel在macrogrid中， 按照D_v Voxelsize，与swepttool做csgdifference计算， 可以形成D_v粒度的切削表面窄带， 这个窄带可以做粗略显示（碰撞检测精度）。
+    // 但在microgrid中， 需要按照d_v精度，来构建高精度的切削表面（带法向的点集），存储在microgrid的voxel中。 
+    // macrogrid和microgrid时刻保持相同的node结构以及voxel状态，唯一的不同是microgrid负责在切削后的边界的voxel中，存储高精度点集切削面。 
+    // 这个切削面构建后， 会驻留在内存中，下一次该voxel中的切削需要使用。 
+    //问题：  macrogrid和microgrid有一个node状态同步的过程？ 这个有方法可以瞬时同步吗，microgri是跟随的。 以macrogrid为主。 
+
+    //phase1 ： 1   Activate inactive negative voxels in tool BBox
+    //case1_1: 如果voxel是inactive negative的，说明没有被切削过，先激活。 
+    //case1_2: 如果voxel是active的，说明有毛坯的表面或者切削表面（意味着有窄带SDF， macrogrid中是D_v粒度，而microgrid中有对应的精确点集）。
+/*
+    phase 2:  Dual Cut
+            
+    case1_1:   swepttool与完整voxel的csgdifference问题。
+    case1_2:   swepttool与voxel+volumn with pointdata surface的csgdifference问题。 
+               
+           output：
+               macrogrid： 直接与swepttool csgdifference后的新的voxel with narrowband；
+               microgrid： 计算出的新的volumn with pointdata surface
+
+               这一步是关键， 如何在合理管控内存的情况下高效高精完成？  挑战是： 在设定的精度要求下，在规定的cycletime中完成，否则会引起整个pipeline的性能问题。 
+                1 构建一个临时的高精度openvdb，与swepttool执行csddifference？ 还是利用microgrid中的 volumn with pointdata surface，来设计算法来完成？ 
+                2 考虑到脏区的voxel随着swepttool的规模（bbox），数目也增长， 是所有的脏区voxel一起计算，还是单个计算（可并行或者GPU）？
+
+    这一步要注意： 确定哪些voxel被影响并记录， 后面的流程需要用到
+                1 voxel可能被完全切除；  macrogrid的voxel被设为inactive nagative，  microgrid中的pointdata被删掉，对应的voxel被设为inactive nagative
+                2 大概率被部分切除，原表面被完全抹去，形成新的表面；原表面被部分抹去，形成新的表面； 
+                  macrogrid中形成新的narrowband，  microgrid中，形成新的pointdata； 
+
+                问题：在视图渲染中，意味着有被从视图中删除的部分，也有新增加的部分， 如何记录并处理？ 
+                
+*/
+          
+    //phase 3: 对脏区的voxel做重整，确保数据一直和精炼，并异步构建渲染数据（ 低resolution情况下，显示macrogrid的边界， 高resolution情况下，显示micro的曲面）
+
+
+
     // TBB parallel SDF update + dirty voxel collection
     auto t0_p1b = Clock::now();
     openvdb::tree::LeafManager<TreeT> leafMgr(sdfGrid->tree());
     using DirtyVec = std::vector<openvdb::Coord>;
     tbb::enumerable_thread_specific<DirtyVec> tlsDirty;
 
+    //并行遍历 sdfGrid 所有 active leaf nodes:
     tbb::parallel_for(leafMgr.leafRange(),
         [&](const openvdb::tree::LeafManager<TreeT>::LeafRange& range) {
             auto& localDirty = tlsDirty.local();
+            //所有的leafnode
             for (auto leafIt = range.begin(); leafIt; ++leafIt) {
                 auto& leaf = *leafIt;
                 auto lo = leaf.origin();
                 if (lo.x()+8<minIdx.x() || lo.x()>maxIdx.x() ||
                     lo.y()+8<minIdx.y() || lo.y()>maxIdx.y() ||
-                    lo.z()+8<minIdx.z() || lo.z()>maxIdx.z()) continue;
-
+                    lo.z()+8<minIdx.z() || lo.z()>maxIdx.z()) continue;// 跳过不在 tool BBox 范围的 leaf
+                
+                //对于在toolbbox范围内部的leaf（而且是valueon，被激活的node），
                 for (auto it = leaf.beginValueOn(); it; ++it) {
                     auto coord = it.getCoord();
                     if (coord.x()<minIdx.x() || coord.x()>maxIdx.x() ||
@@ -424,9 +532,11 @@ static void cutDualTrack(BilletModel& billet, const ToolSweepSDF& toolSDF) {
                         float newVal = std::max(oldVal, static_cast<float>(-toolDist));
                         if (newVal != oldVal) {
                             it.setValue(newVal);
-                            if (toolDist <= 0.0 && std::abs(newVal) < bandWidth)
-                                localDirty.push_back(coord);
                         }
+                        // Dirty = tool surface passes through this voxel:
+                        // toolDist in [-bandWidth, D_v] and voxel is in narrowband
+                        if (toolDist < D_v && std::abs(newVal) < bandWidth)
+                            localDirty.push_back(coord);
                     }
                 }
             }
@@ -438,7 +548,6 @@ static void cutDualTrack(BilletModel& billet, const ToolSweepSDF& toolSDF) {
     std::vector<openvdb::Coord> dirtyVoxels;
     for (auto& v : tlsDirty) {
         for (auto& coord : v) {
-            if (billet.microGrid && billet.microGrid->tree().isValueOn(coord)) continue;
             billet.dirtyMask->getAccessor().setValueOn(coord);
             dirtyVoxels.push_back(coord);
         }
@@ -472,7 +581,7 @@ static void cutDualTrack(BilletModel& billet, const ToolSweepSDF& toolSDF) {
             size_t end = std::min(start + CHUNK, dirtyVoxels.size());
             std::vector<openvdb::Coord> chunk(dirtyVoxels.begin() + start,
                                               dirtyVoxels.begin() + end);
-            auto batch = SurfelGenerator::sampleToolSurface(toolSDF, chunk, xform, d_v, N);
+            auto batch = SurfelGenerator::sampleToolSurface(toolSDF, chunk, xform, d_v, N, &billet.geometry);
             allPos.insert(allPos.end(), batch.positions.begin(), batch.positions.end());
             allNorm.insert(allNorm.end(), batch.normals.begin(), batch.normals.end());
             totalChunks++;
@@ -659,6 +768,60 @@ openvdb::FloatGrid::Ptr buildLocalCutSurface(
             }
         }
     }
+    return grid;
+}
+
+openvdb::FloatGrid::Ptr buildSurfelMesh(
+    const BilletModel& billet, const ToolSweepSDF& lastTool) {
+    if (!billet.microGrid) return nullptr;
+
+    // Use d_v precision for the cut surface mesh (surfel-level accuracy)
+    const double d_v = billet.config.d_v;
+    const float bandWidth = 3.0f * static_cast<float>(d_v);
+
+    auto xform = openvdb::math::Transform::createLinearTransform(d_v);
+    auto grid = openvdb::FloatGrid::create(bandWidth);
+    grid->setTransform(xform);
+    grid->setGridClass(openvdb::GRID_LEVEL_SET);
+
+    // Only reconstruct within tool BBox (avoids full-domain rebuild)
+    auto bbox = lastTool.getBoundingBox();
+    bbox.expand(d_v * 3);
+    auto minIdx = xform->worldToIndexCellCentered(bbox.min());
+    auto maxIdx = xform->worldToIndexCellCentered(bbox.max());
+
+    auto& geo = billet.geometry;
+    auto acc = grid->getAccessor();
+
+    openvdb::Coord ijk;
+    for (ijk[0] = minIdx[0]; ijk[0] <= maxIdx[0]; ++ijk[0]) {
+        for (ijk[1] = minIdx[1]; ijk[1] <= maxIdx[1]; ++ijk[1]) {
+            for (ijk[2] = minIdx[2]; ijk[2] <= maxIdx[2]; ++ijk[2]) {
+                Vec3d wp = xform->indexToWorld(ijk);
+
+                // Billet signed distance (analytic box)
+                double dx = std::max(geo.origin.x()-wp.x(), wp.x()-(geo.origin.x()+geo.dims.x()));
+                double dy = std::max(geo.origin.y()-wp.y(), wp.y()-(geo.origin.y()+geo.dims.y()));
+                double dz = std::max(geo.origin.z()-wp.z(), wp.z()-(geo.origin.z()+geo.dims.z()));
+                float billetSdf;
+                if (dx<=0 && dy<=0 && dz<=0)
+                    billetSdf = (float)std::max({dx,dy,dz});
+                else {
+                    double ex=std::max(dx,0.0), ey=std::max(dy,0.0), ez=std::max(dz,0.0);
+                    billetSdf = (float)std::sqrt(ex*ex+ey*ey+ez*ez);
+                }
+
+                float toolSdf = -(float)lastTool.eval(wp);
+
+                // CSG difference surface: only where tool determines the surface
+                float csgSdf = std::max(billetSdf, toolSdf);
+                if (std::abs(csgSdf) < bandWidth && toolSdf >= billetSdf) {
+                    acc.setValue(ijk, csgSdf);
+                }
+            }
+        }
+    }
+
     return grid;
 }
 

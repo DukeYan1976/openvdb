@@ -9,7 +9,8 @@ SurfelBatch SurfelGenerator::sampleToolSurface(
     const ToolSweepSDF& tool,
     const std::vector<openvdb::Coord>& dirtyVoxels,
     const openvdb::math::Transform& xform,
-    double d_v, int N)
+    double d_v, int N,
+    const GeometryDef* billetGeo)
 {
     using BatchTLS = tbb::enumerable_thread_specific<SurfelBatch>;
     BatchTLS tlsBatches;
@@ -42,6 +43,15 @@ SurfelBatch SurfelGenerator::sampleToolSurface(
                         candidate -= dist * normal;
 
                         if (std::abs(tool.eval(candidate)) < 0.5 * d_v) {
+                            // Filter out surfels outside billet boundary
+                            if (billetGeo && billetGeo->type == GeometryDef::BOX) {
+                                const auto& o = billetGeo->origin;
+                                const auto& d = billetGeo->dims;
+                                if (candidate.x() < o.x() || candidate.x() > o.x() + d.x() ||
+                                    candidate.y() < o.y() || candidate.y() > o.y() + d.y() ||
+                                    candidate.z() < o.z() || candidate.z() > o.z() + d.z())
+                                    continue;
+                            }
                             batch.positions.push_back(candidate);
                             batch.normals.emplace_back(
                                 float(normal.x()), float(normal.y()), float(normal.z()));
