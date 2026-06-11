@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DualGrid 8x8 LeafNode 并排拓扑图 v1.4</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { background-color: #0f172a; color: #e2e8f0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        .canvas-container { background-color: #1e293b; border: 1px solid #334155; border-radius: 0.5rem; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.3); }
+        input[type=range] { accent-color: #10b981; }
+        .grid-title { font-family: 'Consolas', monospace; letter-spacing: 0.05em; }
+    </style>
+</head>
+<body class="min-h-screen flex flex-col items-center justify-center p-6">
+
+    <div class="max-w-[1400px] w-full bg-slate-800 p-8 rounded-xl shadow-2xl">
+        <div class="mb-6 border-b border-slate-600 pb-4">
+            <h1 class="text-2xl font-bold text-white mb-2">DualGrid 底层架构：OpenVDB 8x8 叶节点同构映射</h1>
+            <p class="text-slate-400 text-sm">
+                <b>严格对照：</b>标准 $8 \times 8$ LeafNode 视角，Narrow Band half-width = $3.0\Delta x$。左侧执行 <b>宏观拓扑过滤 (Phase 1-2)</b>，右侧执行 <b>微观面元按需注入 (Phase 4)</b>。
+            </p>
+        </div>
+
+        <div class="flex flex-col xl:flex-row gap-6 justify-center">
+            
+            <!-- 左侧：MacroGrid (FloatGrid) -->
+            <div class="flex flex-col items-center bg-slate-900/50 p-4 rounded-xl border border-slate-700">
+                <div class="flex justify-between w-full mb-3 px-2">
+                    <h2 class="text-red-400 font-bold grid-title text-lg">MacroGrid (FloatGrid)</h2>
+                    <span class="text-xs text-slate-400 bg-slate-800 px-2 py-1 rounded border border-slate-600">拓扑/分类</span>
+                </div>
+                <div class="canvas-container relative">
+                    <canvas id="macroCanvas" width="480" height="480"></canvas>
+                </div>
+                <div class="w-full mt-4 space-y-2 text-xs text-slate-300 px-2">
+                    <div class="flex items-center"><span class="w-3 h-3 inline-block bg-[#1e293b] border border-slate-500 mr-2"></span> 非活跃 (Inactive, >3Δx) - 极省内存</div>
+                    <div class="flex items-center"><span class="w-3 h-3 inline-block bg-red-900/30 border border-red-500/50 mr-2"></span> 活跃外部 (Active, SDF > 0)</div>
+                    <div class="flex items-center"><span class="w-3 h-3 inline-block bg-blue-900/30 border border-blue-500/50 mr-2"></span> 活跃内部 (Active, SDF < 0)</div>
+                    <div class="flex items-center"><span class="w-3 h-3 inline-block bg-amber-500/20 border-2 border-amber-500 mr-2"></span> <b>边界体素 (Boundary, SDF≈0)</b></div>
+                </div>
+            </div>
+
+            <!-- 逻辑连接符 -->
+            <div class="hidden xl:flex flex-col justify-center items-center px-2 text-slate-500">
+                <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
+                <span class="text-xs font-mono mt-2 transform -rotate-90 origin-center absolute translate-x-8">共享索引 (i,j,k)</span>
+            </div>
+
+            <!-- 右侧：MicroGrid (PointDataGrid) -->
+            <div class="flex flex-col items-center bg-slate-900/50 p-4 rounded-xl border border-slate-700">
+                <div class="flex justify-between w-full mb-3 px-2">
+                    <h2 class="text-emerald-400 font-bold grid-title text-lg">MicroGrid (PointDataGrid)</h2>
+                    <span class="text-xs text-slate-400 bg-slate-800 px-2 py-1 rounded border border-slate-600">几何/面元</span>
+                </div>
+                <div class="canvas-container relative">
+                    <canvas id="microCanvas" width="480" height="480"></canvas>
+                </div>
+                <div class="w-full mt-4 space-y-2 text-xs text-slate-300 px-2">
+                    <div class="flex items-center"><span class="w-3 h-3 inline-block bg-[#0f172a] border border-slate-700 mr-2"></span> 无数据 (Empty Vector) - 零内存开销</div>
+                    <div class="flex items-center"><span class="w-3 h-3 inline-block bg-emerald-900/10 border-2 border-amber-500/30 mr-2"></span> 激活容器 (Allocated Array)</div>
+                    <div class="flex items-center"><span class="w-3 h-3 rounded-full bg-emerald-500 inline-block mr-2"></span> 高精度 Surfels (附带法向矢量)</div>
+                    <div class="flex items-center mt-2 justify-between">
+                        <span>注入密度 (Points / Voxel)</span>
+                        <input type="range" id="densitySlider" min="1" max="8" value="3" class="w-24">
+                        <span id="densityVal" class="font-mono text-emerald-400">3</span>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+
+        <div class="mt-8 bg-slate-700 p-5 rounded-lg border border-slate-600 shadow-inner">
+            <h3 class="text-md font-semibold text-white mb-2 border-b border-slate-500 pb-2">算法管线数据流映射 (Dataflow Map)</h3>
+            <ul class="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm text-slate-300">
+                <li>
+                    <b class="text-red-400">FloatGrid 角色：</b>它是整个系统的寻址主干。图左中，那些红蓝相间的 Narrow Band 体素构成了防穿透的护城河，而<b>亮黄色的边界体素</b>则是触发高精度处理的开关。
+                </li>
+                <li>
+                    <b class="text-emerald-400">PointDataGrid 角色：</b>它是依附于主干的“载荷 (Payload)”。图右中，所有的非边界体素数组全为空（极省内存）。仅在左侧黄框对应的坐标处，通过 <code class="text-slate-400">ToolSurfelTemplate</code> 注入绿色的面元。
+                </li>
+            </ul>
+        </div>
+    </div>
+
+    <script>
+        const canvasMacro = document.getElementById('macroCanvas');
+        const ctxMacro = canvasMacro.getContext('2d');
+        const canvasMicro = document.getElementById('microCanvas');
+        const ctxMicro = canvasMicro.getContext('2d');
+        
+        const densitySlider = document.getElementById('densitySlider');
+        const densityVal = document.getElementById('densityVal');
+
+        // --- 核心物理参数 ---
+        const GRID_SIZE = 8; // 8x8 LeafNode
+        const CELL_SIZE = 480 / GRID_SIZE; // 每个 Voxel 60px
+        const NARROW_BAND_WIDTH = 3.0;     // 窄带半宽 3.0
+
+        // 解析几何参数 (调整以穿过 8x8 且显示曲率)
+        const R = 4.5;
+        const arcCx = 1.0;
+        const arcCy = 7.0;
+
+        function getSDF(x, y) {
+            return Math.sqrt(Math.pow(x - arcCx, 2) + Math.pow(y - arcCy, 2)) - R;
+        }
+
+        // 求线段与圆的交点 (用于限制面元严格在 voxel 内部)
+        function getLineCircleIntersections(x1, y1, x2, y2) {
+            let dx = x2 - x1, dy = y2 - y1;
+            let a = dx*dx + dy*dy;
+            let b = 2 * (dx * (x1 - arcCx) + dy * (y1 - arcCy));
+            let c = Math.pow(x1 - arcCx, 2) + Math.pow(y1 - arcCy, 2) - R*R;
+            let delta = b*b - 4*a*c;
+            
+            let intersections = [];
+            if (delta >= 0) {
+                let t1 = (-b + Math.sqrt(delta)) / (2*a);
+                let t2 = (-b - Math.sqrt(delta)) / (2*a);
+                if (t1 >= 0 && t1 <= 1) intersections.push({x: x1 + t1*dx, y: y1 + t1*dy});
+                if (t2 >= 0 && t2 <= 1) intersections.push({x: x1 + t2*dx, y: y1 + t2*dy});
+            }
+            return intersections;
+        }
+
+        let voxels = [];
+
+        function buildData() {
+            voxels = [];
+            for (let row = 0; row < GRID_SIZE; row++) {
+                for (let col = 0; col < GRID_SIZE; col++) {
+                    // 中心点坐标 (用于判断 SDF)
+                    let cx = col + 0.5;
+                    let cy = row + 0.5;
+                    let centerSDF = getSDF(cx, cy);
+                    
+                    // 判断是否在 Narrow Band
+                    let isActive = Math.abs(centerSDF) <= NARROW_BAND_WIDTH;
+                    
+                    // 判断是否是 Boundary (检查四个角点是否有异号)
+                    let dTL = getSDF(col, row);
+                    let dTR = getSDF(col+1, row);
+                    let dBL = getSDF(col, row+1);
+                    let dBR = getSDF(col+1, row+1);
+                    
+                    let signs = [Math.sign(dTL), Math.sign(dTR), Math.sign(dBL), Math.sign(dBR)];
+                    let isBoundary = signs.some(s => s > 0) && signs.some(s => s < 0);
+                    // 修正：边界必须同时在 Narrow Band 内（理论上必然，这里做强制收敛）
+                    isBoundary = isBoundary && isActive;
+
+                    // 计算该 Voxel 内部的圆弧段 (用于生成 Surfels)
+                    let entryExitAngles = [];
+                    if (isBoundary) {
+                        let pts = [];
+                        pts.push(...getLineCircleIntersections(col, row, col+1, row)); // Top
+                        pts.push(...getLineCircleIntersections(col, row+1, col+1, row+1)); // Bottom
+                        pts.push(...getLineCircleIntersections(col, row, col, row+1)); // Left
+                        pts.push(...getLineCircleIntersections(col+1, row, col+1, row+1)); // Right
+                        
+                        // 去重
+                        let uniquePts = [];
+                        pts.forEach(p => {
+                            if (!uniquePts.some(u => Math.abs(u.x-p.x)<1e-4 && Math.abs(u.y-p.y)<1e-4)) {
+                                uniquePts.push(p);
+                            }
+                        });
+
+                        if (uniquePts.length === 2) {
+                            entryExitAngles.push(Math.atan2(uniquePts[0].y - arcCy, uniquePts[0].x - arcCx));
+                            entryExitAngles.push(Math.atan2(uniquePts[1].y - arcCy, uniquePts[1].x - arcCx));
+                        }
+                    }
+
+                    voxels.push({
+                        col: col, row: row,
+                        centerSDF: centerSDF,
+                        isActive: isActive,
+                        isBoundary: isBoundary,
+                        angles: entryExitAngles
+                    });
+                }
+            }
+        }
+
+        function drawMacro() {
+            ctxMacro.clearRect(0, 0, 480, 480);
+            ctxMacro.font = "12px Consolas";
+            ctxMacro.textAlign = "center";
+            ctxMacro.textBaseline = "middle";
+
+            voxels.forEach(v => {
+                let px = v.col * CELL_SIZE;
+                let py = v.row * CELL_SIZE;
+
+                // 1. 绘制背景色 (Active / Inactive)
+                if (!v.isActive) {
+                    ctxMacro.fillStyle = "#1e293b"; // Inactive
+                } else if (v.centerSDF > 0) {
+                    ctxMacro.fillStyle = "rgba(239, 68, 68, 0.15)"; // Red-ish outside
+                } else {
+                    ctxMacro.fillStyle = "rgba(59, 130, 246, 0.15)"; // Blue-ish inside
+                }
+                ctxMacro.fillRect(px, py, CELL_SIZE, CELL_SIZE);
+
+                // 2. 绘制边界 Voxel 高亮
+                if (v.isBoundary) {
+                    ctxMacro.fillStyle = "rgba(245, 158, 11, 0.2)"; // Amber glow
+                    ctxMacro.fillRect(px, py, CELL_SIZE, CELL_SIZE);
+                    ctxMacro.strokeStyle = "#f59e0b"; // Amber border
+                    ctxMacro.lineWidth = 2.5;
+                    ctxMacro.strokeRect(px + 1, py + 1, CELL_SIZE - 2, CELL_SIZE - 2);
+                } else {
+                    ctxMacro.strokeStyle = "#334155";
+                    ctxMacro.lineWidth = 1;
+                    ctxMacro.strokeRect(px, py, CELL_SIZE, CELL_SIZE);
+                }
+
+                // 3. 绘制中心 SDF 数值或 Bg
+                let text = "";
+                if (!v.isActive) {
+                    ctxMacro.fillStyle = "#475569";
+                    text = v.centerSDF > 0 ? "+Bg" : "-Bg";
+                } else {
+                    ctxMacro.fillStyle = v.centerSDF > 0 ? "#fca5a5" : "#93c5fd";
+                    text = (v.centerSDF > 0 ? "+" : "") + v.centerSDF.toFixed(1);
+                }
+                ctxMacro.fillText(text, px + CELL_SIZE/2, py + CELL_SIZE/2);
+            });
+
+            // 绘制真实隐式表面作为参考
+            ctxMacro.beginPath();
+            ctxMacro.arc(arcCx * CELL_SIZE, arcCy * CELL_SIZE, R * CELL_SIZE, 0, Math.PI * 2);
+            ctxMacro.strokeStyle = "rgba(255,255,255,0.2)";
+            ctxMacro.lineWidth = 2;
+            ctxMacro.setLineDash([5, 5]);
+            ctxMacro.stroke();
+            ctxMacro.setLineDash([]);
+        }
+
+        function drawMicro() {
+            ctxMicro.clearRect(0, 0, 480, 480);
+            let numPoints = parseInt(densitySlider.value);
+
+            // 绘制基础暗色网格与背景
+            voxels.forEach(v => {
+                let px = v.col * CELL_SIZE;
+                let py = v.row * CELL_SIZE;
+                
+                ctxMicro.fillStyle = "#0f172a"; // 极黑底色代表无数组分配
+                ctxMicro.fillRect(px, py, CELL_SIZE, CELL_SIZE);
+
+                if (v.isBoundary) {
+                    // 同步左侧边界，显示微弱底色代表数组已分配
+                    ctxMicro.fillStyle = "rgba(16, 185, 129, 0.05)"; 
+                    ctxMicro.fillRect(px, py, CELL_SIZE, CELL_SIZE);
+                    ctxMicro.strokeStyle = "rgba(245, 158, 11, 0.3)"; 
+                    ctxMicro.lineWidth = 1.5;
+                    ctxMicro.strokeRect(px + 1, py + 1, CELL_SIZE - 2, CELL_SIZE - 2);
+                } else {
+                    ctxMicro.strokeStyle = "#1e293b";
+                    ctxMicro.lineWidth = 1;
+                    ctxMicro.strokeRect(px, py, CELL_SIZE, CELL_SIZE);
+                }
+            });
+
+            // 渲染点云 (Surfels) - 仅在 Boundary Voxels 内
+            voxels.forEach(v => {
+                if (v.isBoundary && v.angles.length === 2) {
+                    let a1 = v.angles[0];
+                    let a2 = v.angles[1];
+                    
+                    // 确保短弧路径
+                    let span = a2 - a1;
+                    if (span > Math.PI) span -= 2*Math.PI;
+                    if (span < -Math.PI) span += 2*Math.PI;
+
+                    // 为了使面元均匀散布在 Voxel 内部，不含刚好贴在边框上的点
+                    for (let i = 1; i <= numPoints; i++) {
+                        let t = i / (numPoints + 1);
+                        let a = a1 + t * span;
+                        
+                        let pX = arcCx + R * Math.cos(a);
+                        let pY = arcCy + R * Math.sin(a);
+                        let nX = Math.cos(a);
+                        let nY = Math.sin(a);
+
+                        let drawX = pX * CELL_SIZE;
+                        let drawY = pY * CELL_SIZE;
+
+                        // 画局部法向
+                        ctxMicro.beginPath();
+                        ctxMicro.moveTo(drawX, drawY);
+                        ctxMicro.lineTo(drawX + nX * 18, drawY + nY * 18);
+                        ctxMicro.strokeStyle = "rgba(250, 204, 21, 0.8)"; // 黄色法向
+                        ctxMicro.lineWidth = 1.5;
+                        ctxMicro.stroke();
+
+                        // 画 Surfel 实体点
+                        ctxMicro.beginPath();
+                        ctxMicro.arc(drawX, drawY, 3.5, 0, Math.PI*2);
+                        ctxMicro.fillStyle = "#10b981"; // 翠绿点
+                        ctxMicro.fill();
+                    }
+                }
+            });
+        }
+
+        function renderAll() {
+            buildData();
+            drawMacro();
+            drawMicro();
+        }
+
+        // 绑定事件
+        densitySlider.addEventListener('input', (e) => {
+            densityVal.innerText = e.target.value;
+            drawMicro();
+        });
+
+        // 启动
+        renderAll();
+
+    </script>
+</body>
+</html>

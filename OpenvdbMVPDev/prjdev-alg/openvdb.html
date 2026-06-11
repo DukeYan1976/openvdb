@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OpenVDB LeafNode & Narrow Band 物理边界隐式重构图 v1.1</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { background-color: #0f172a; color: #e2e8f0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        canvas { background-color: #1e293b; border: 1px solid #334155; border-radius: 0.5rem; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); }
+        .legend-box { width: 1rem; height: 1rem; display: inline-block; border-radius: 0.25rem; margin-right: 0.5rem; vertical-align: middle; }
+    </style>
+</head>
+<body class="min-h-screen flex flex-col items-center justify-center p-6">
+
+    <div class="max-w-7xl w-full bg-slate-800 p-8 rounded-xl shadow-2xl">
+        <div class="mb-6 border-b border-slate-600 pb-4">
+            <h1 class="text-2xl font-bold text-white mb-2">OpenVDB: 法向推导与几何弦截差 (Deflection) 分析</h1>
+            <p class="text-slate-400 text-sm">
+                模型已引入中心差分计算离散梯度 $\nabla d$ 以推导表面法向。左上角展示了 Voxel 分辨率与几何精度的严格数学关联。
+            </p>
+        </div>
+
+        <div class="flex flex-col xl:flex-row gap-8">
+            <!-- Canvas 区域 -->
+            <div class="flex-shrink-0 relative">
+                <canvas id="sdfCanvas" width="640" height="640"></canvas>
+            </div>
+
+            <!-- 图例与原理解析区域 -->
+            <div class="flex flex-col justify-start space-y-5 flex-grow">
+                
+                <div class="bg-slate-700 p-5 rounded-lg border border-slate-600 shadow-inner">
+                    <h3 class="text-md font-semibold text-white mb-3 border-b border-slate-500 pb-2">几何图例 (Legend)</h3>
+                    <ul class="space-y-2 text-sm text-slate-300">
+                        <li class="flex items-center"><span class="legend-box border-2 border-amber-500 bg-transparent"></span> 叶节点 LeafNode (8x8 内存边界)</li>
+                        <li class="flex items-center"><span class="legend-box" style="background-color: rgba(239, 68, 68, 0.25);"></span> / <span class="legend-box" style="background-color: rgba(59, 130, 246, 0.25);"></span> Narrow Band 活跃体素 (+/- d)</li>
+                        <li class="flex items-center">
+                            <svg class="w-4 h-4 mr-2 inline" viewBox="0 0 20 20"><line x1="0" y1="10" x2="20" y2="10" stroke="#94a3b8" stroke-width="2" stroke-dasharray="4,2"/></svg> 
+                            <b>解析基准 (Ground Truth)</b>：完美的理论圆弧。
+                        </li>
+                        <li class="flex items-center">
+                            <svg class="w-4 h-4 mr-2 inline" viewBox="0 0 20 20"><line x1="0" y1="10" x2="20" y2="10" stroke="#10b981" stroke-width="3"/></svg> 
+                            <b>重构面 (Reconstructed)</b>：线性插值形成的连续折线。
+                        </li>
+                        <li class="flex items-center">
+                            <svg class="w-4 h-4 mr-2 inline" viewBox="0 0 20 20"><path d="M2,10 L14,10 M14,10 L10,6 M14,10 L10,14" stroke="#eab308" stroke-width="2" fill="none"/></svg> 
+                            <b>法向量 (Normal)</b>：$\vec{n} = \nabla d / \|\nabla d\|$
+                        </li>
+                    </ul>
+                </div>
+
+                <div class="bg-slate-700 p-5 rounded-lg border border-slate-600 shadow-inner">
+                    <h3 class="text-md font-semibold text-white mb-3 border-b border-slate-500 pb-2">1. 法向推导机制 (Normal Derivation)</h3>
+                    <p class="text-sm text-slate-300 mb-2 leading-relaxed">
+                        由于 Voxel 仅存标量 $d$，法向必须通过<b>中心差分 (Central Difference)</b> 提取梯度求得：<br>
+                        <code class="block bg-slate-900 p-2 rounded text-emerald-400 font-mono text-xs my-2">
+                            ∂d/∂x ≈ (d[x+1] - d[x-1]) / 2Δx
+                        </code>
+                        <b>性能代价：</b> 获取一个点的法向，需要跨越内存读取周围 6 个相邻体素（在3D中）。如果跨越了黄色的 LeafNode 边界，极易引发 CPU Cache Miss。
+                    </p>
+                </div>
+
+                <div class="bg-slate-700 p-5 rounded-lg border border-slate-600 shadow-inner">
+                    <h3 class="text-md font-semibold text-white mb-3 border-b border-slate-500 pb-2">2. 精度悖论：弦截差 (Deflection, δ)</h3>
+                    <p class="text-sm text-slate-300 leading-relaxed mb-3">
+                        插值表面是分段线性的（折线）。折线与理论圆弧之间产生的最大偏离距离称为弦截差 $\delta$。其极限数学关系为：
+                    </p>
+                    <div class="bg-slate-900 p-3 rounded flex justify-center items-center mb-3 border border-slate-600">
+                        <span class="text-amber-400 font-serif text-lg">δ ≈ Δx² / (8R)</span>
+                    </div>
+                    <ul class="space-y-1 text-xs text-slate-400 list-disc pl-4 marker:text-slate-500">
+                        <li><b>R</b>: 刀具表面局部曲率半径。</li>
+                        <li><b>Δx</b>: Voxel 分辨率（网格尺寸）。</li>
+                        <li><b>核心结论 (O(n²) 定律)</b>: 精度偏离与体素尺寸的平方成正比。若要将切削表面精度提高 10 倍（δ 缩小10倍），Voxel 尺寸 $\Delta x$ 只需缩小 $\approx 3.16$ 倍。这解释了为何 OpenVDB 能够在保证高精度的同时，内存增长远低于传统的 Octree。</li>
+                    </ul>
+                </div>
+
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('sdfCanvas');
+        const ctx = canvas.getContext('2d');
+        const width = canvas.width;
+        const height = canvas.height;
+
+        // --- 核心网格参数 ---
+        const gridSize = 16;
+        const leafNodeSize = 8;
+        const cellSize = width / gridSize;
+        const narrowBandHalfWidth = 2.5; 
+        
+        // 模拟刀具圆弧方程 
+        const cx = 5.5;
+        const cy = 6.5;
+        const radius = 6.8;
+
+        // --- 1. 构建 SDF 数据场 ---
+        let gridData = [];
+        for (let y = 0; y <= gridSize; y++) {
+            let row = [];
+            for (let x = 0; x <= gridSize; x++) {
+                const dist = Math.sqrt(Math.pow(x - cx, 2) + Math.pow(y - cy, 2)) - radius;
+                row.push({
+                    x: x, y: y,
+                    d: dist,
+                    isActive: Math.abs(dist) <= narrowBandHalfWidth,
+                    gradX: 0, gradY: 0 // 预留梯度位置
+                });
+            }
+            gridData.push(row);
+        }
+
+        // --- 2. 计算离散梯度 (Central Difference) ---
+        for (let y = 0; y <= gridSize; y++) {
+            for (let x = 0; x <= gridSize; x++) {
+                if (gridData[y][x].isActive) {
+                    // x 偏导
+                    if (x > 0 && x < gridSize) {
+                        gridData[y][x].gradX = (gridData[y][x+1].d - gridData[y][x-1].d) / 2.0;
+                    }
+                    // y 偏导
+                    if (y > 0 && y < gridSize) {
+                        gridData[y][x].gradY = (gridData[y+1][x].d - gridData[y-1][x].d) / 2.0;
+                    }
+                }
+            }
+        }
+
+        // ================= 渲染函数 =================
+
+        function drawGrid() {
+            ctx.font = "11px Consolas, monospace";
+            ctx.textAlign = "center";
+            ctx.textBaseline = "middle";
+
+            for (let y = 0; y < gridSize; y++) {
+                for (let x = 0; x < gridSize; x++) {
+                    const node = gridData[y][x];
+                    const px = x * cellSize;
+                    const py = y * cellSize;
+
+                    if (!node.isActive) {
+                        ctx.fillStyle = "#1e293b"; 
+                        ctx.fillRect(px, py, cellSize, cellSize);
+                    } else {
+                        ctx.fillStyle = node.d > 0 ? "rgba(239, 68, 68, 0.15)" : "rgba(59, 130, 246, 0.15)"; 
+                        ctx.fillRect(px, py, cellSize, cellSize);
+                        ctx.fillStyle = node.d > 0 ? "#fca5a5" : "#93c5fd";
+                        ctx.fillText((node.d > 0 ? "+" : "") + node.d.toFixed(1), px + cellSize/2, py + cellSize/2);
+                    }
+                    ctx.strokeStyle = "#334155";
+                    ctx.lineWidth = 1;
+                    ctx.strokeRect(px, py, cellSize, cellSize);
+                }
+            }
+        }
+
+        function drawLeafNodeBoundaries() {
+            ctx.strokeStyle = "#f59e0b"; 
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            for (let x = 0; x <= gridSize; x += leafNodeSize) { ctx.moveTo(x * cellSize, 0); ctx.lineTo(x * cellSize, height); }
+            for (let y = 0; y <= gridSize; y += leafNodeSize) { ctx.moveTo(0, y * cellSize); ctx.lineTo(width, y * cellSize); }
+            ctx.stroke();
+        }
+
+        function drawGroundTruth() {
+            ctx.beginPath();
+            ctx.arc(cx * cellSize, cy * cellSize, radius * cellSize, 0, Math.PI * 2);
+            ctx.strokeStyle = "rgba(148, 163, 184, 0.6)"; // 半透明灰白
+            ctx.lineWidth = 2;
+            ctx.setLineDash([6, 4]); // 虚线
+            ctx.stroke();
+            ctx.setLineDash([]); // 恢复实线
+        }
+
+        function drawImplicitSurfaceAndNormals() {
+            let points = [];
+
+            // --- 线性插值寻找零交叉点，并双线性插值获取法向 ---
+            const findCrossings = (n1, n2, x1, y1, x2, y2) => {
+                if (n1.isActive && n2.isActive && (n1.d * n2.d <= 0)) {
+                    let t = n1.d / (n1.d - n2.d);
+                    let px = x1 + (x2 - x1) * t;
+                    let py = y1 + (y2 - y1) * t;
+                    
+                    // 梯度的双线性插值
+                    let gx = n1.gradX * (1 - t) + n2.gradX * t;
+                    let gy = n1.gradY * (1 - t) + n2.gradY * t;
+                    let len = Math.sqrt(gx*gx + gy*gy);
+                    let nx = gx / (len || 1); // 防除零
+                    let ny = gy / (len || 1);
+
+                    points.push({
+                        x: px * cellSize + cellSize/2, 
+                        y: py * cellSize + cellSize/2, 
+                        nx: nx, ny: ny,
+                        angle: Math.atan2(py - cy, px - cx)
+                    });
+                }
+            };
+
+            for (let y = 0; y < gridSize; y++) {
+                for (let x = 0; x < gridSize - 1; x++) findCrossings(gridData[y][x], gridData[y][x+1], x, y, x+1, y);
+            }
+            for (let x = 0; x < gridSize; x++) {
+                for (let y = 0; y < gridSize - 1; y++) findCrossings(gridData[y][x], gridData[y+1][x], x, y, x, y+1);
+            }
+
+            points.sort((a, b) => a.angle - b.angle);
+
+            // 绘制重构折线
+            ctx.strokeStyle = "#10b981"; 
+            ctx.lineWidth = 3;
+            ctx.lineCap = "round";
+            ctx.lineJoin = "round";
+            ctx.beginPath();
+            if (points.length > 0) {
+                ctx.moveTo(points[0].x, points[0].y);
+                for (let i = 1; i < points.length; i++) ctx.lineTo(points[i].x, points[i].y);
+            }
+            ctx.stroke();
+
+            // 绘制法向矢量 (黄色小箭头)
+            ctx.strokeStyle = "#eab308";
+            ctx.lineWidth = 1.5;
+            const arrowLen = 14;
+            points.forEach(p => {
+                // 仅隔几个点绘制以防视觉杂乱
+                if (Math.random() > 0.3) { 
+                    ctx.beginPath();
+                    ctx.moveTo(p.x, p.y);
+                    let endX = p.x + p.nx * arrowLen;
+                    let endY = p.y + p.ny * arrowLen;
+                    ctx.lineTo(endX, endY);
+                    
+                    // 箭头
+                    let arrowAngle = Math.atan2(p.ny, p.nx);
+                    ctx.lineTo(endX - 4 * Math.cos(arrowAngle - Math.PI/6), endY - 4 * Math.sin(arrowAngle - Math.PI/6));
+                    ctx.moveTo(endX, endY);
+                    ctx.lineTo(endX - 4 * Math.cos(arrowAngle + Math.PI/6), endY - 4 * Math.sin(arrowAngle + Math.PI/6));
+                    ctx.stroke();
+                }
+                
+                // 绘制交点白点
+                ctx.fillStyle = "#ffffff";
+                ctx.beginPath();
+                ctx.arc(p.x, p.y, 2, 0, Math.PI * 2);
+                ctx.fill();
+            });
+        }
+
+        function drawDeflectionMagnifier() {
+            // 在左上角绘制一个局部放大的夸张示意图
+            const magX = 20, magY = 20, magW = 180, magH = 140;
+            
+            // 背景板
+            ctx.fillStyle = "rgba(15, 23, 42, 0.9)";
+            ctx.strokeStyle = "#475569";
+            ctx.lineWidth = 1;
+            ctx.fillRect(magX, magY, magW, magH);
+            ctx.strokeRect(magX, magY, magW, magH);
+            
+            // 标题
+            ctx.fillStyle = "#94a3b8";
+            ctx.font = "10px sans-serif";
+            ctx.textAlign = "left";
+            ctx.fillText("微观误差放大分析 (Deflection)", magX + 8, magY + 15);
+
+            // 绘制体素边界
+            ctx.strokeStyle = "#334155";
+            ctx.setLineDash([2, 2]);
+            ctx.beginPath();
+            ctx.moveTo(magX + magW/2, magY + 30); ctx.lineTo(magX + magW/2, magY + magH - 10);
+            ctx.moveTo(magX + 20, magY + magH/2 + 10); ctx.lineTo(magX + magW - 20, magY + magH/2 + 10);
+            ctx.stroke();
+            ctx.setLineDash([]);
+
+            // 绘制夸张的解析圆弧 (Ground Truth)
+            ctx.strokeStyle = "rgba(148, 163, 184, 0.8)";
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.arc(magX + magW/2, magY + 150, 100, -Math.PI*0.7, -Math.PI*0.3);
+            ctx.stroke();
+
+            // 绘制重构直线 (Interpolated)
+            const p1 = {x: magX + magW/2 - 58, y: magY + 150 - 81.3}; // 近似交点
+            const p2 = {x: magX + magW/2 + 58, y: magY + 150 - 81.3};
+            ctx.strokeStyle = "#10b981";
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(p1.x, p1.y);
+            ctx.lineTo(p2.x, p2.y);
+            ctx.stroke();
+
+            // 标记 Voxel Size Δx
+            ctx.fillStyle = "#cbd5e1";
+            ctx.beginPath(); ctx.arc(p1.x, p1.y, 3, 0, Math.PI*2); ctx.fill();
+            ctx.beginPath(); ctx.arc(p2.x, p2.y, 3, 0, Math.PI*2); ctx.fill();
+            ctx.strokeStyle = "#94a3b8"; ctx.lineWidth = 1;
+            ctx.beginPath(); ctx.moveTo(p1.x, p1.y - 15); ctx.lineTo(p2.x, p2.y - 15); ctx.stroke();
+            ctx.fillText("Δx (Voxel 跨度)", magX + magW/2 - 35, p1.y - 20);
+
+            // 标记弦截差 δ
+            ctx.strokeStyle = "#f43f5e"; // 玫瑰红
+            ctx.lineWidth = 1.5;
+            ctx.beginPath();
+            const midX = magX + magW/2;
+            const lineY = p1.y;
+            const arcY = magY + 150 - 100; // 顶点
+            
+            // 画误差线段
+            ctx.moveTo(midX, lineY);
+            ctx.lineTo(midX, arcY);
+            ctx.stroke();
+            
+            ctx.fillStyle = "#f43f5e";
+            ctx.fillText("δ (Deflection)", midX + 8, lineY - 8);
+        }
+
+        // 渲染管线
+        drawGrid();
+        drawLeafNodeBoundaries();
+        drawGroundTruth();
+        drawImplicitSurfaceAndNormals();
+        drawDeflectionMagnifier();
+
+    </script>
+</body>
+</html>

@@ -31,12 +31,25 @@
   FloatGrid[i,j,k]     → SDF 标量值（精度 ~D_v）
   PointDataGrid[i,j,k] → 该体素内的面元点集合（精度 ~d_v）
 
-### 2.2 面元密度
+### 2.2 面元密度（曲率自适应模型）
 
-N = D_v / d_v = 面元密度因子
-每个表面体素内约 N² 个面元（表面采样）
-IPW₀ 初始面元间距 = d_v_init ≥ 10×d_v（粗精度）
-切削后新表面面元间距 = d_v（仿真精度）
+**核心语义变更（v0.b.1）**：d_v 不再是"均匀面元间距"，而是"面元位置精度保证下界"。
+实际面元密度由曲率自适应公式决定：
+
+  ds(κ) = min( sqrt(8 · r_curv · τ),  ds_max )
+  ds_max = D_v / 2
+  ds_min = τ（仅交线处使用）
+
+N = D_v / τ 仍然有意义，但不是"每 voxel 面元数的平方根"，
+而是系统精度层级描述符（宏观/微观分辨率之比）。
+
+每个表面体素内的典型面元数：
+  - 平坦区：4~16（步长 = ds_max）
+  - 中等曲率区（球头）：20~80（步长 = ds(R)）
+  - 交线处：集中在一维线上，总量可控
+
+IPW₀ 初始面元间距 = ds_max（粗精度，保证弦高偏差 ≤ τ）
+切削后新表面面元间距 = ds(κ_local)（曲率自适应）
 
 ### 2.3 遍历规则
 
@@ -52,13 +65,21 @@ PointDataGrid 为从属树，按需触发延迟注入
 
 ```cpp
 // 每个点的属性（SoA 布局由 OpenVDB PointDataGrid 自动管理）
+// 
+// 设计原则：面元自包含（Self-Contained）
+// - 不包含 sourceToolId / creationStep / precision 等历史追踪字段
+// - 每个 active 面元 (position, normal) 就是工件表面在该点的完整描述
+// - 面元一旦注入，位置和法向不再被修改，只有 active 标志变化（1→0，不可逆）
+// - 后续切削判定只看 toolSDF.eval(pos) ≤ 0，不需要知道面元来源
+//
 struct SurfelAttributes {
-    Vec3f position;    // 相对于体素中心的局部偏移（精度 d_v）
-    Vec3f normal;      // 表面法向量
-    uint8_t active;    // 1=材料存在, 0=已切除
-    uint8_t precision; // 0=COARSE(IPW₀), 1=FINE(切削后)
+    Vec3f position;    // 相对于体素中心的局部偏移（精度 ≤ τ）
+    Vec3f normal;      // 表面外法向量（单位向量）
+    uint8_t active;    // 1=材料存在, 0=已切除（不可逆 1→0）
 };
 ```
+
+**移除 `precision` 字段的理由**：面元精度在注入时就已由定位策略保证（解析投影 → 零误差；Mesh BVH → τ 级别）。运行时不需要区分"粗"面元和"精"面元——所有 active 面元都以相同方式参与切削判定和渲染。
 
 ### 3.2 内存监控结构
 
@@ -89,18 +110,21 @@ struct MemoryStats {
   1. 创建共享 Transform(D_v)
   2. 构建 FloatGrid SDF（长方体窄带，复用第一阶段代码）
   3. 创建 PointDataGrid（共享 Transform）
-  4. 注册属性描述符（position, normal, active, precision）
-  5. 为窄带表面体素注入 IPW₀ 粗面元（d_v_init = max(10*d_v, D_v)）
+  4. 注册属性描述符（position, normal, active）
+  5. 为窄带表面体素注入 IPW₀ 粗面元（步长 = ds_max = D_v/2）
   6. 记录初始内存
+
+注意：不再需要 precision 属性字段。面元自包含——位置精度在注入时确定，
+后续不需要区分"粗"或"精"。
 
 ### 4.2 IPW₀ 面元注入
 
 对每个表面体素 (i,j,k)（|SDF| < halfWidth * D_v 且 SDF 零交叉）:
   1. 确定表面定位策略（见 4.2.1）
-  2. 在体素表面区域按 d_v_init 间距生成 N_init² 个面元
-     N_init = max(2, floor(D_v / d_v_init))
+  2. 在体素表面区域按 ds_max = D_v/2 间距生成面元
+     （曲率自适应：平面区更稀疏，曲面区按 ds(κ) 加密）
   3. 面元位置通过精确表面定位获得（见 4.2.1 分类策略）
-  4. 标记 precision = COARSE
+  4. 面元注入后即成为工件表面的一部分，不记录来源
 
 #### 4.2.1 面元精度保障机制
 
@@ -212,31 +236,42 @@ struct BilletModel {
 | 解析几何优先？ | 是 | 零误差、零额外内存、零查询开销 |
 
 ### 4.3 DualGridCutter（扩展 CuttingEngine）
+
+**核心设计公理（v0.b.1）：面元自包含不变量**
+
+> 每个 active 面元 (pos, normal) 是工件表面在该点的完整描述。
+> 切削判定只使用 surfel.pos，不需要知道面元来自哪一刀。
+> 面元一旦注入不再被修改，只有 active 标志变化（1→0，不可逆）。
+
+这意味着第 K 刀可以切入任意历史刀具留下的复合表面，算法无需区分面元来源。
+
 ```
 输入: BilletModel(DUAL_TRACK), ToolSweepSDF
 流程:
-  Phase 1 - 宏观过滤:
-    遍历 FloatGrid 窄带体素
-    筛选在刀具 BBox 内且 SDF ≤ 0 的体素 → affectedVoxels
+  Phase 1 - 宏观 SDF CSG diff + dirty region 收集:
+    激活 tool BBox 内的 inactive negative voxels
+    TBB 并行对 FloatGrid 做 max(billetSDF, -toolSDF)
+    收集 dirty voxels（工具表面穿过的体素）
 
-  Phase 2 - 微观切削:
-    for each voxelCoord in affectedVoxels:
-      if PointDataGrid 该体素无数据:
-        触发延迟注入（从 SDF 梯度生成面元）
-      for each surfel in voxel:
-        if surfel.active == 0: continue
-        dist = toolSDF.eval(surfel.position_world)
-        if dist <= 0:
-          surfel.active = 0  // 剥离
+  Phase 2 - 微观 Clip（历史无关，纯点级判定）:
+    for each leaf in tool_bbox:
+      for each surfel where active == 1:
+        if toolSDF.eval(surfel.pos) ≤ 0:
+          surfel.active = 0    // 不关心面元来自第几刀
 
-  Phase 3 - 边界面元注入（N² 表面采样）:
-    对部分切削的体素，在刀具零等值面上注入精细面元
-    面元位置通过刀具解析几何精确定位（见 4.2.1 刀具表面解析投影）
-    precision = FINE
+  Phase 3 - 曲率自适应面元注入:
+    对 dirty voxels，在刀具零等值面上做曲率自适应采样：
+      ds(κ) = min(sqrt(8 · r_curv · τ), ds_max)
+    交线处（|phi_work| < 0.2·ds_min AND |phi_tool| < 0.2·ds_min）：
+      - 加密到 ds_min 级别
+      - 双向牛顿投影到交线
+      - 分裂法向对注入
+    注入后面元脱离刀具身份，成为工件表面的一部分。
 
-  Phase 4 - 宏观 SDF 保守更新:
-    activeCount == 0 → SDF = +D_v
-    activeCount > 0  → 保持原值不变
+  Phase 4 - 法向敏感去密 + 拓扑精炼:
+    对 dirty leaves 执行法向敏感双边滤波（去冗余、保锐边）
+    topologyIntersection 同步 macro/micro 拓扑
+    pruneLevelSet + compactAttributes
 
   Phase 5 - 内存统计:
     更新 MemoryStats
@@ -245,19 +280,23 @@ struct BilletModel {
 ### 4.4 延迟注入触发
 
 ```
-function injectOnDemand(microGrid, voxelCoord, sdfGrid, geometrySource, config):
+function injectOnDemand(microGrid, voxelCoord, sdfGrid, toolSDF, geometrySource, config):
     // 该体素首次被刀具接触，需要生成面元
     // 判断是 IPW₀ 表面还是内部首次暴露
 
     sdfVal = sdfGrid.getValue(voxelCoord)
     if |sdfVal| < halfWidth * D_v:
         // 表面体素：应该在初始化时已注入（IPW₀）
-        // 如果没有，补注入粗面元（使用 geometrySource 精确定位）
+        // 如果没有，补注入（使用 geometrySource 精确定位）
         injectSurfels_IPW0(microGrid, voxelCoord, geometrySource, config)
     else:
-        // 内部体素首次暴露：新表面来自刀具，用刀具解析几何注入精细面元
-        injectSurfels_Cut(microGrid, voxelCoord, toolGeometry, config)
+        // 内部体素首次暴露：新表面来自当前刀具
+        // 用刀具解析几何注入面元，曲率自适应密度
+        // 注入后面元即脱离刀具身份
+        injectSurfels_Cut(microGrid, voxelCoord, toolSDF, config)
 ```
+
+**注意**：延迟注入只在体素首次被接触时发生。注入后的面元与任何其他面元完全等价——后续切削对它们的 clip 判定不区分来源。
 
 ---
 
@@ -265,10 +304,17 @@ function injectOnDemand(microGrid, voxelCoord, sdfGrid, geometrySource, config):
 
 ### 5.1 面元级精度
 
-对切削后的活跃面元，计算其到理论切削表面的距离:
-  for each active surfel:
+对切削后的活跃面元，验证其位置精度：
+```
+for each active surfel:
+    // 验证面元是否精确落在工件表面上
+    // 方法：对最近一次切削的面元，用该刀具解析 SDF 评估
     dist_to_tool_surface = |toolSDF.eval(surfel.position)|
-    assert dist_to_tool_surface < d_v  // 面元精度
+    assert dist_to_tool_surface < τ  // 面元精度 ≤ 加工公差
+```
+
+注意：只能验证**当前刀具**注入的面元。对于历史面元，其精度在注入时已保证，
+运行时无需也无法回溯验证（这正是自包含设计的优势——无需追踪来源）。
 
 ### 5.2 与单轨对比
 
@@ -277,18 +323,35 @@ function injectOnDemand(microGrid, voxelCoord, sdfGrid, geometrySource, config):
   - 双轨 FloatGrid(D_v=0.64mm) + PointDataGrid
 比较两者的切削表面偏差
 
-### 5.3 面元定位精度验证（新增）
+### 5.3 面元定位精度验证
 
 验证 IPW₀ 面元是否精确落在原始几何表面：
 ```
-for each COARSE surfel:
+for each surfel in IPW₀ batch:
     if geometrySource.type == MESH:
         dist = meshBVH.closestDistance(surfel.position)
-        assert dist < d_v_init * 0.01  // 面元到原始 Mesh 距离应接近零
+        assert dist < τ * 0.01  // 面元到原始 Mesh 距离应接近零
     elif geometrySource.type == ANALYTIC_BOX:
         dist = analyticDistanceToBox(surfel.position, box)
         assert dist < 1e-10  // 解析几何应精确为零（浮点误差）
 ```
+
+### 5.4 复合历史表面的递归正确性验证（新增）
+
+验证经过多刀切削后面元系统仍然正确：
+```
+// 执行 K 刀切削后：
+for each active surfel:
+    // 1. 面元不应在任何已执行刀具内部（否则应已被 clip）
+    for tool_k in all_executed_tools:
+        assert tool_k.eval(surfel.pos) > 0  // 面元在所有刀具外部
+
+    // 2. 面元应在工件表面附近（macrogrid SDF ≈ 0）
+    sdf_val = interpolate(sdfGrid, surfel.pos)
+    assert |sdf_val| < D_v  // 面元在宏观窄带内
+```
+
+注意：验证 1 是 O(K·M) 的，仅用于离线测试/调试，不在实时路径中执行。
 
 ---
 
@@ -307,22 +370,41 @@ for each COARSE surfel:
 
 ## 7. 潜在风险点
 
-【不同见解】：PointDataGrid 的 appendAttribute 和动态点注入在 OpenVDB
-中不是零成本操作。每次注入新面元需要重新分配叶节点内存。高频切削时（每段都触发注入），可能产生严重的内存碎片。
+【风险1】：PointDataGrid 的动态点注入内存碎片。
+
+每次注入新面元需要重新分配叶节点内存。高频切削时可能产生碎片。
 
 缓解：
   1. 第二阶段先验证正确性，不追求性能
   2. 预分配策略：初始化时为所有窄带体素预留面元容量
   3. 后续引入 RCU 紧凑化
 
-【新增风险】：Mesh BVH 常驻内存开销。
+【风险2】：Mesh BVH 常驻内存开销。
 
 对于大型 STL 模型（百万三角面），BVH 可能占用数十 MB 内存。
 
 缓解：
   1. IPW₀ 批量注入完成后立即释放 BVH（geometrySource.releaseBVH()）
-  2. 延迟注入场景下，仅表面体素需要 BVH；内部体素新表面来自刀具解析几何，不需要 BVH
-  3. 若后续需要重建 BVH（如多次加工间的毛坯重置），采用惰性重建策略
+  2. 延迟注入场景下，仅表面体素需要 BVH；内部体素新表面来自刀具解析几何
+  3. 若后续需要重建 BVH，采用惰性重建策略
+
+【风险3（已解决）】：d_v 均匀密度导致的 N² 内存爆炸。
+
+原设计中每 voxel 注入 N² 个面元（N=D_v/d_v），当 τ 很小时 N 可达数百甚至上千。
+
+解决：采用曲率自适应密度模型（详见 §2.2 及 Crease Alignment 文档 §4.1）：
+  - 面元密度由 ds(κ) = min(sqrt(8·r_curv·τ), D_v/2) 决定，不由 τ 直接决定
+  - 每 voxel 典型面元数降至 4~80，即使 τ=0.001mm 也不会爆炸
+  - 只有交线（一维结构）处才收紧到 τ 级步长
+
+【风险4（设计保证）】：复合历史表面的正确切削。
+
+经过数千刀切削后，工件表面可能是任意历史刀具残余的拼接。
+
+保证：面元自包含不变量（详见 Crease Alignment 文档 §3.0）：
+  - 切削判定只看 toolSDF.eval(pos) ≤ 0，不需要面元来源信息
+  - 面元位置一旦注入不再修改，精度不退化
+  - macrogrid SDF 作为累积历史的粗近似，用于交线投影
 
 ---
 
@@ -331,4 +413,5 @@ for each COARSE surfel:
 | 版本 | 日期 | 修订内容 |
 |------|------|----------|
 | v0.a | 2026-06-01 | 初稿创建 |
-| v0.b | 2026-06-02 | 补充 4.2.1 面元精度保障机制：区分解析几何/Mesh/刀具表面三种定位策略；新增 4.2.2 几何来源管理结构；新增 4.2.3 设计决策权衡表；新增 5.3 面元定位精度验证；更新延迟注入接口签名 |
+| v0.b | 2026-06-02 | 补充 4.2.1 面元精度保障机制；新增 4.2.2 几何来源管理；新增 4.2.3 设计决策权衡表；新增 5.3 面元定位精度验证 |
+| v0.b.1 | 2026-06-11 | 重构 d_v 语义为精度保证下界；引入曲率自适应密度模型；新增面元自包含不变量；移除 precision 属性；更新 DualGridCutter 流程为历史无关版本；新增 §5.4 递归正确性验证 |
