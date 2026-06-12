@@ -5,6 +5,7 @@
 | v1.0 | 2026-06-11 | Gemini | 首次创建，详细设计边界交线投影、双边法向敏感滤波。 |
 | v1.a | 2026-06-11 | Gemini | 引入"点云密度与物理公差解耦"设计，增加 d_v_floor 刚性截断，并添加多段切削精度验证输出分析。 |
 | v1.1 | 2026-06-11 | Duke/Kiro | 新增§1.4复合历史表面问题；新增§3.0面元自包含不变量与历史无关性设计；重构d_v语义为"精度保证下界"而非"均匀存储密度"；补充面元参与后续切削的完备性论证。 |
+| v1.b | 2026-06-12 | Gemini | 补充精度问题分析与自适应迭代/非迭代投影方案，增加分级验证策略，并更新控制参数约束公式。 |
 
 ---
 
@@ -55,19 +56,23 @@
    * `tolerance` ($\tau$)：加工逼近公差（mm，如 $0.05\text{mm}$ 或极端的 $0.001\text{mm}$）。
    * `path_A`, `path_B`：当前切削路径的起点与终点。
 2. **控制超参数 (`HyperParameters`)**：
-   * `tau`：加工公差（mm）——**面元位置精度的保证下界**。每个注入面元的位置误差不超过 $\tau$。
-   * `ds_min`：面元最小步长（mm）——仅在交线（crease）附近使用，通常 `ds_min = tau`。
-   * `ds_max`：面元最大步长（mm）——平坦区上限，`ds_max = D_v / 2`。
-   * `D_v`：宏观网格体素尺寸（mm）。
-   * `gamma_step`：采样最大步长系数（默认 $0.5$）。
-   * `beta_long`：轴向平坦区稀疏系数（默认 $1.0$）。
+
+   | 参数 | 定义 | 典型值 | 要点 |
+   |------|------|--------|------|
+   | `tau` | 加工公差（mm） | 0.001~0.05 | 面元位置精度的**刚性上界**：每个注入面元的物理坐标偏差 ≤ τ。τ 决定精度等级，但**不决定面元密度**——密度由曲率自适应公式控制。 |
+   | `ds_min` | 面元最小步长（mm） | = τ | 仅在交线（crease）处使用。交线是一维结构，加密代价可控。意义：保证尖锐特征边的几何分辨率。 |
+   | `ds_max` | 面元最大步长（mm） | D_v / 2 | 平坦/低曲率区的步长上限。确保每个 voxel 内至少有 2×2 的采样覆盖（避免 voxel 级空洞）。取 D_v/2 而非 D_v 是为了在相邻 voxel 边界有重叠。 |
+   | `D_v` | 宏观体素尺寸（mm） | 0.4~1.0 | 决定 FloatGrid 的空间分辨率和内存占用。越大越省内存，但 macrogrid SDF 精度越粗。 |
+   | `gamma_step` | 采样步长安全系数 | 0.5 | 乘在自适应步长上的保守系数：`ds_actual = gamma_step × ds(κ)`。< 1.0 时增加采样密度、提高鲁棒性，代价是面元数增多。 |
+   | `beta_long` | 轴向稀疏系数 | 1.0 | 仅用于圆柱扫掠面的纵向（沿刀具路径方向）。该方向曲率 κ=0，步长 = beta_long × ds_max。β=1 时最稀疏；β<1 可在轴向加密（用于非线性路径或振动工况）。 |
+
+   **参数间的约束关系**：
+   $$ds_{\min} \leq ds(\kappa) \leq ds_{\max}, \quad ds(\kappa) = \gamma\_step \cdot \min\!\left(\sqrt{8 \cdot r_{curv} \cdot \tau},\; ds_{\max}\right)$$
    
-   **关键语义澄清**：`tau`（公差）不是均匀面元间距。实际面元密度由曲率自适应公式决定：
-   $$ds(\kappa) = \min\left(\sqrt{8 \cdot r_{curv} \cdot \tau},\ ds_{max}\right)$$
-   只有在交线处才收紧到 `ds_min` 级别。
+   实际面元密度完全由曲率 $\kappa = 1/r_{curv}$ 驱动。τ 只参与公式内部——它保证弦高偏差 ≤ τ，而非强制均匀 τ 间距。
 
 3. **当前毛坯模型状态 (`BilletModel`)**：
-   * `sdfGrid`：当前状态下的 $D_v$ 级宏观 narrow-band 浮点 SDF 网格（累积了所有历史切削的结果）。
+   * `sdfGrid`：当前状态下的 $D_v$ 级宏观 narrow-band 浮点 SDF 网格（累积了所有历史切削的结果，但只是宏观索引，没有切削界面的细节）。
    * `microGrid`：当前状态下的高精度面元网格（`PointDataGrid`，初始可为 `nullptr`）。面元来源无需追踪——任何 active 面元都是当前工件表面的一部分。
 
 ### 2.2 算法输出 (Outputs)
@@ -80,10 +85,19 @@
      * 落入刀具内的旧面元被干净剪裁（`active = 0`），无论这些面元来自第几刀。
      * 同一平滑面上的多余高密采样点被"法向敏感滤波器"自动去密，而锐边及薄壁面元被完美保留。
      * 完成了 `topologyIntersection` 拓扑同步，彻底物理回收了完全切除的叶子节点内存。
-3. **精度保证**：
+3. **精度保证与验证策略**：
    * 每个新注入面元的位置精度 ≤ $\tau$（来自刀具解析几何的精确投影）。
    * 交线对齐精度 ≤ $\tau$（来自牛顿迭代收敛）。
-   * 精度输出查询：在需要微米级验证时，直接用当前刀具解析 SDF 评估面元偏差，不需要回溯历史刀具。
+   * **累积正确性定理**：若每步满足（a）clip 完备、（b）注入精度 ≤ τ、（c）crease 对齐 ≤ τ、（d）面元 pos 不可变，则归纳法保证 K 步后面元集合与理论 CSG 表面的 Hausdorff 距离 ≤ τ。
+   * **分级验证策略**：
+
+     | 级别 | 时机 | 方法 | 开销 |
+     |------|------|------|------|
+     | L0 注入精度 | 每步（Debug） | 新面元 `|toolSDF.eval(pos)| < τ` | O(M_new) |
+     | L1 Clip 完备 | 每步（Debug） | bbox 内存活面元 `toolSDF.eval(pos) > -τ` | O(M_bbox) |
+     | L2 拓扑一致 | 每 N 步 | macro/micro leaf 拓扑同步检查 | O(leaves) |
+     | L3 Hausdorff | 离线回归 | 全面元 × 全历史刀具最近距离 | O(M×K) |
+     | L4 Ground truth | CI | 小件单轨高精度 vs 双轨对比 | 分钟级 |
 
 ---
 
@@ -276,6 +290,78 @@ $$ds \leq \sqrt{8 \cdot r_{curv} \cdot \tau}$$
    - **优先**：从 macrogrid SDF 梯度插值获取。macrogrid 已累积所有历史切削，其梯度就是当前工件外法向的粗近似。
    - **备选**：从 microGrid 中最近的存活旧面元的 normal 获取。该面元的 normal 在其注入时就已经被精确设定，无需追溯来源。
    - **两种方式都不需要知道旧表面"是哪把刀切出来的"。**
+
+6. **精度问题与迭代投影方案**：
+
+   **问题分析**：单步投影的精度瓶颈来自 $\Phi_{\text{work}}$ 和 $\mathbf{n}_w$ 的不精确：
+
+   | 量 | 来源 | 精度 |
+   |----|------|------|
+   | $\Phi_{\text{tool}}(P)$, $\mathbf{n}_t$ | 刀具解析方程 | 机器精度（精确） |
+   | $\Phi_{\text{work}}(P)$ | macrogrid 三线性插值 | $O(D_v^2)$ 截断误差 |
+   | $\mathbf{n}_w$（macrogrid 梯度） | macrogrid 中心差分 | $O(D_v)$ 方向误差 |
+   | $\mathbf{n}_w$（旧面元 normal） | 面元注入时保证 | ≤ τ |
+
+   单步投影后残余偏差：若用 macrogrid 梯度，$\epsilon \approx O(D_v)$；若用旧面元 normal，$\epsilon \approx O(\tau)$。
+
+   **解决方案：分场景的迭代/非迭代策略**
+
+   | 场景 | $\mathbf{n}_w$ 来源 | 迭代需求 | 最终精度 |
+   |------|---------------------|---------|---------|
+   | case1_2（有旧面元） | 邻近旧面元 normal | 1~2 步 | ≤ τ |
+   | case1_1（首次暴露） | macrogrid 梯度 | 2~3 步迭代 | ~$D_v^2$（已是插值极限） |
+   | 法向退化（$\mathbf{n}_w \parallel \mathbf{n}_t$） | 单表面投影 | 1 步 | ≤ τ |
+
+   **迭代收敛性**：
+
+   $$\text{iter 0: } |\epsilon| \sim D_v \quad \xrightarrow{\text{step 1}} \quad O(D_v^2) \quad \xrightarrow{\text{step 2}} \quad O(D_v^3) \quad \xrightarrow{\text{step 3}} \quad O(D_v^2) \text{ floor}$$
+
+   收敛到 macrogrid 插值精度极限后不再改善。对于 $D_v = 0.5\text{mm}$，$D_v^2 = 0.25\text{mm}^2$，弦高 $\approx D_v^2 / (8R) = 0.006\text{mm}$（R=5mm），通常满足 τ。
+
+   **核心设计决策**：优先使用旧面元 normal（精度高，无需迭代），仅在无旧面元时回退到 macrogrid 梯度 + 迭代。
+
+   **迭代投影伪代码**：
+   ```cpp
+   bool projectToCreaseIterative(
+       Vec3d& p, const ToolSweepSDF& tool,
+       const FloatGrid& sdfGrid, const PointDataGrid* microGrid,
+       int maxIter = 3, double tol = tau)
+   {
+       for (int i = 0; i < maxIter; ++i) {
+           double phi_tool = tool.eval(p);
+           Vec3d  n_t = normalize(tool.gradient(p));  // 精确
+           
+           // 优先：从 microGrid 找邻近旧面元 normal
+           Vec3d n_w;
+           double phi_work;
+           Surfel* nearest = findNearestActive(microGrid, p, D_v);
+           if (nearest) {
+               n_w = nearest->norm;                    // 精度 ≤ τ
+               phi_work = dot(p - nearest->pos, n_w);  // 平面距离估算
+           } else {
+               phi_work = trilinearSample(sdfGrid, p); // 精度 ~D_v²
+               n_w = normalize(centralDiff(sdfGrid, p)); // 精度 ~D_v
+           }
+           
+           // 收敛检查
+           if (abs(phi_tool) < tol && abs(phi_work) < tol) return true;
+           
+           // 一步投影
+           double d = dot(n_w, n_t);
+           double det = 1.0 - d*d;
+           if (abs(det) < 1e-5) { p -= phi_tool * n_t; continue; }
+           double c_w = (-phi_work + d * phi_tool) / det;
+           double c_t = (-phi_tool + d * phi_work) / det;
+           p += c_w * n_w + c_t * n_t;
+       }
+       return abs(tool.eval(p)) < tol;  // 至少保证工具侧精确
+   }
+   ```
+
+   **设计要点**：
+   - 刀具侧始终精确——即使 macrogrid 侧有残余误差，面元最终位置至少精确落在刀具零等值面上。
+   - 3 次迭代上限足够（超过后被 macrogrid 插值精度限制，继续迭代无意义）。
+   - 若邻近旧面元存在，一步即可达到 τ 精度，无需迭代。
 
 ---
 
