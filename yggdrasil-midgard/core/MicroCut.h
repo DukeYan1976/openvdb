@@ -25,7 +25,8 @@ public:
         const std::vector<VoxelTask>& tasks,
         const ToolSweepSurface& surface,
         const ToolSweepSDF& sdf,
-        const ToleranceConfig& config);
+        const ToleranceConfig& config,
+        const openvdb::FloatGrid::Ptr& billetGrid = nullptr);  // 毛坯SDF用于过滤空气中的点
 
     /// Phase 3+4: 旧点剔除 + per-leaf 重建 MicroGrid
     /// deleted voxels: 全部点删除
@@ -46,7 +47,9 @@ private:
         const ToolSweepSurface& surface,
         double chordalLimit,
         int depth,
-        PointBuffer& output);
+        PointBuffer& output,
+        const openvdb::FloatGrid::ConstAccessor* billetAcc = nullptr,
+        const openvdb::math::Transform* billetXform = nullptr);
 
     static constexpr int MAX_DEPTH = 12;
 };

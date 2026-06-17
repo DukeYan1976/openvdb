@@ -10,6 +10,7 @@
 #include <openvdb/points/PointCount.h>
 #include <filesystem>
 #include <iostream>
+#include <fstream>
 #include <thread>
 #include <chrono>
 #include <cmath>
@@ -48,7 +49,7 @@ int main(int argc, char* argv[]) {
     pageBreak("Phase -1: 参数配置");
 
     double t = 0.05;  // 用户容差 mm
-    ToleranceConfig config(t);
+    ToleranceConfig config(t, ToleranceConfig::INTERACTIVE, 10.0);
     std::cout << "  user_t      = " << config.user_t << " mm\n"
               << "  V_macro     = " << config.voxelMacro << " mm\n"
               << "  K factor    = " << config.K << "\n"
@@ -102,6 +103,9 @@ int main(int argc, char* argv[]) {
     int activeBefore = ipw.macroGrid->activeVoxelCount();
 
     auto tCut0 = std::chrono::high_resolution_clock::now();
+    // 保存原始毛坯grid用于Phase 2的空气过滤
+    auto billetOriginal = ipw.macroGrid->deepCopy();
+
     MacroCut macrocut;
     auto cls = macrocut.classifyVoxels(ipw, sdf);
     auto tCut1 = std::chrono::high_resolution_clock::now();
@@ -163,6 +167,13 @@ int main(int argc, char* argv[]) {
               << "  vSplit: " << surface.vSplit() << "\n"
               << "  hasMidPatch: " << (surface.hasMidPatch() ? "yes" : "no") << "\n";
 
+    // 打印前3个task的参数域用于调试
+    for (size_t i = 0; i < std::min((size_t)3, tasks.size()); ++i) {
+        std::cout << "  task[" << i << "] origin=" << tasks[i].origin
+                  << " u=[" << tasks[i].u_min << "," << tasks[i].u_max
+                  << "] v=[" << tasks[i].t_min << "," << tasks[i].t_max << "]\n";
+    }
+
     // 统计参数域范围
     double avgURange = 0, avgVRange = 0;
     for (const auto& t : tasks) {
@@ -179,7 +190,8 @@ int main(int argc, char* argv[]) {
 
     // Phase 2: 四叉树采样
     MicroCut microcut;
-    auto buffers = microcut.sampleNewSurface(tasks, surface, sdf, config);
+    auto buffers = microcut.sampleNewSurface(tasks, surface, sdf, config,
+        openvdb::gridPtrCast<openvdb::FloatGrid>(billetOriginal));
 
     int totalNewPoints = 0;
     for (const auto& [coord, buf] : buffers) totalNewPoints += buf.positions.size();
@@ -273,6 +285,24 @@ int main(int argc, char* argv[]) {
 
     std::cout << "\n  Output: " << objDir.string() << "\n";
 
+    // 导出ToolSweepSurface参数面为OBJ
+    {
+        std::ofstream sout((objDir / "sweep_surface_param.obj").string());
+        int N = 50;
+        for (int i = 0; i <= N; ++i)
+            for (int j = 0; j <= N; ++j) {
+                double u = (double)i/N, v = (double)j/N;
+                Vec3d p = surface.eval(u,v);
+                sout << "v " << p.x() << " " << p.y() << " " << p.z() << "\n";
+            }
+        for (int i = 0; i < N; ++i)
+            for (int j = 0; j < N; ++j) {
+                int a=i*(N+1)+j+1, b=a+1, c=a+(N+1), d=c+1;
+                sout << "f " << a << " " << b << " " << d << " " << c << "\n";
+            }
+        std::cout << "  [4] sweep_surface_param.obj\n";
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     return (deletedOK && boundaryOK) ? 0 : 1;
 }
+

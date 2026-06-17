@@ -52,25 +52,22 @@ Vec3d ToolSweepSurface::evalCap(double u, double w) const {
         return center + Vec3d(r * std::cos(theta), r * std::sin(theta), z);
     } else {
         // 线性: 前向半球 (以dir为极轴)
-        // u ∈ [0,1] → 半球纬度 α ∈ [0, π/2] (赤道到极点)
-        // w ∈ [0,1] → 经度 β ∈ [0, 2π] (绕dir轴全圆)
-        double alpha = (M_PI / 2.0) * u;  // 0=赤道, π/2=极点(最前方)
+        // u ∈ [0,1] → 极角 alpha ∈ [0, π/2] (0=正前, π/2=赤道)
+        // w ∈ [0,1] → 绕轴经度 beta ∈ [0, 2π]
+        double alpha = (M_PI / 2.0) * (1.0 - u);  // u=1时在最前面
         double beta = 2.0 * M_PI * w;
 
-        // 构建局部坐标系: dir为极轴, 需要两个正交轴
-        // dir在XY平面 → 用Z作为一个正交轴
         Vec3d axisZ(0, 0, 1);
-        Vec3d axisPerp = axisZ.cross(mDir);  // 垂直于dir且在XY平面
+        Vec3d axisPerp = axisZ.cross(mDir);
         if (axisPerp.length() < 1e-10) axisPerp = Vec3d(0, 1, 0);
         else axisPerp.normalize();
-        // 第三轴
         Vec3d axisUp = mDir.cross(axisPerp);
-        axisUp.normalize();
 
-        // 半球面上的点 (以dir为极轴)
         double cosA = std::cos(alpha), sinA = std::sin(alpha);
         double cosB = std::cos(beta), sinB = std::sin(beta);
-        Vec3d offset = mTool.R * (cosA * (cosB * axisPerp + sinB * axisUp) + sinA * mDir);
+        
+        // 极轴是 mDir
+        Vec3d offset = mTool.R * (sinA * mDir + cosA * (cosB * axisPerp + sinB * axisUp));
         return center + offset;
     }
 }
@@ -82,7 +79,7 @@ Vec3d ToolSweepSurface::normalCap(double u, double w) const {
         double sp = std::sin(phi), cp = std::cos(phi);
         return Vec3d(sp * std::cos(theta), sp * std::sin(theta), -cp);
     } else {
-        double alpha = (M_PI / 2.0) * u;
+        double alpha = (M_PI / 2.0) * (1.0 - u);
         double beta = 2.0 * M_PI * w;
 
         Vec3d axisZ(0, 0, 1);
@@ -90,56 +87,103 @@ Vec3d ToolSweepSurface::normalCap(double u, double w) const {
         if (axisPerp.length() < 1e-10) axisPerp = Vec3d(0, 1, 0);
         else axisPerp.normalize();
         Vec3d axisUp = mDir.cross(axisPerp);
-        axisUp.normalize();
 
         double cosA = std::cos(alpha), sinA = std::sin(alpha);
         double cosB = std::cos(beta), sinB = std::sin(beta);
-        // 法线 = 从球心到表面点的方向
-        return (cosA * (cosB * axisPerp + sinB * axisUp) + sinA * mDir);
+        
+        return (sinA * mDir + cosA * (cosB * axisPerp + sinB * axisUp));
     }
 }
 
 // ─── Mid 补丁: 包络面 (线性刀路) ──────────────────────────────
-// u ∈ [0,1]: 沿轮廓
-// t ∈ [0,1]: 沿路径
+// u ∈ [0,1]: 绕轴角度 [0, 2π]
+// t ∈ [0,1]: 沿路径 [0, L]
 
 Vec3d ToolSweepSurface::evalMid(double u, double t) const {
-    if (mLength < 1e-15) return mSeg.start; // 不应被调用
+    if (mLength < 1e-15) return mSeg.start;
 
-    double r = rProfile(u);
-    double z = zProfile(u);
-
-    // 擦掠线方向 = φ_grazing（面向进给的那侧）
-    Vec3d local(r * std::cos(mPhiGrazing), r * std::sin(mPhiGrazing), z);
+    double theta = 2.0 * M_PI * u;
+    
+    // 构建垂直于 mDir 的基向量
+    Vec3d axisZ(0, 0, 1);
+    Vec3d axis1 = axisZ.cross(mDir);
+    if (axis1.length() < 1e-10) axis1 = Vec3d(0, 1, 0);
+    else axis1.normalize();
+    Vec3d axis2 = mDir.cross(axis1);
+    
+    // 侧面包络是一个圆柱（对球头刀而言）
+    // 注意：如果是平底刀，这里逻辑不同，但目前主要针对球头刀优化
+    Vec3d local = mTool.R * (std::cos(theta) * axis1 + std::sin(theta) * axis2);
     Vec3d center = mSeg.start + t * mLength * mDir;
+    
     return center + local;
 }
 
 Vec3d ToolSweepSurface::normalMid(double u, double t) const {
-    double phi = M_PI * u;
-    double sp = std::sin(phi), cp = std::cos(phi);
-    // 法线沿径向外
-    return Vec3d(sp * std::cos(mPhiGrazing), sp * std::sin(mPhiGrazing), -cp);
+    double theta = 2.0 * M_PI * u;
+    Vec3d axisZ(0, 0, 1);
+    Vec3d axis1 = axisZ.cross(mDir);
+    if (axis1.length() < 1e-10) axis1 = Vec3d(0, 1, 0);
+    else axis1.normalize();
+    Vec3d axis2 = mDir.cross(axis1);
+    
+    return (std::cos(theta) * axis1 + std::sin(theta) * axis2);
 }
 
 // ─── 统一接口 ──────────────────────────────────────────────────
 
 Vec3d ToolSweepSurface::eval(double u, double v) const {
-    if (v <= mVSplit && mVSplit > 0.0) {
-        double t = v / mVSplit;
+    if (mLength < 1e-15) {
+        // 静态情况：全由 evalCap 处理 (w=v)
+        return evalCap(u, v);
+    }
+
+    // 线性刀路：划分 StartCap, Mid, EndCap
+    // 比例: 1:3:1
+    if (v < 0.2) {
+        // Start Cap (后向半球)
+        double w = v / 0.2;
+        Vec3d center = mSeg.start;
+        double alpha = (M_PI / 2.0) * (1.0 - w);
+        double beta = 2.0 * M_PI * u;
+        Vec3d axisZ(0, 0, 1);
+        Vec3d axis1 = axisZ.cross(mDir);
+        if (axis1.length() < 1e-10) axis1 = Vec3d(0, 1, 0); else axis1.normalize();
+        Vec3d axis2 = mDir.cross(axis1);
+        double cosA = std::cos(alpha), sinA = std::sin(alpha);
+        double cosB = std::cos(beta), sinB = std::sin(beta);
+        // 极轴是 -mDir
+        return center + mTool.R * (sinA * (-mDir) + cosA * (cosB * axis1 + sinB * axis2));
+    } else if (v < 0.8) {
+        // Mid (圆柱侧面)
+        double t = (v - 0.2) / 0.6;
         return evalMid(u, t);
     } else {
-        double w = (mVSplit >= 1.0) ? v : (v - mVSplit) / (1.0 - mVSplit);
+        // End Cap (前向半球)
+        double w = (v - 0.8) / 0.2;
         return evalCap(u, w);
     }
 }
 
 Vec3d ToolSweepSurface::normal(double u, double v) const {
-    if (v <= mVSplit && mVSplit > 0.0) {
-        double t = v / mVSplit;
+    if (mLength < 1e-15) return normalCap(u, v);
+
+    if (v < 0.2) {
+        double w = v / 0.2;
+        double alpha = (M_PI / 2.0) * (1.0 - w);
+        double beta = 2.0 * M_PI * u;
+        Vec3d axisZ(0, 0, 1);
+        Vec3d axis1 = axisZ.cross(mDir);
+        if (axis1.length() < 1e-10) axis1 = Vec3d(0, 1, 0); else axis1.normalize();
+        Vec3d axis2 = mDir.cross(axis1);
+        double cosA = std::cos(alpha), sinA = std::sin(alpha);
+        double cosB = std::cos(beta), sinB = std::sin(beta);
+        return (sinA * (-mDir) + cosA * (cosB * axis1 + sinB * axis2));
+    } else if (v < 0.8) {
+        double t = (v - 0.2) / 0.6;
         return normalMid(u, t);
     } else {
-        double w = (mVSplit >= 1.0) ? v : (v - mVSplit) / (1.0 - mVSplit);
+        double w = (v - 0.8) / 0.2;
         return normalCap(u, w);
     }
 }

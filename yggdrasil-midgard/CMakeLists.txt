@@ -53,6 +53,7 @@ add_executable(midgard_tests
     tests/test_microcut.cpp
     tests/test_phase34.cpp
     tests/test_dualtrack_consistency.cpp
+    tests/test_surface_debug.cpp
 )
 target_link_libraries(midgard_tests PRIVATE midgard GTest::gtest_main)
 

@@ -98,8 +98,10 @@ IPWState IPWBuilder::build(const GeometryDef& geom, const ToleranceConfig& confi
     ipw.macroGrid = buildMacroGrid(geom, config);
     if (!ipw.macroGrid) return ipw;
 
-    double t_billet = 2.0 * config.user_t;
-    ipw.microGrid = buildMicroGrid(ipw.macroGrid, geom, t_billet);
+    // MicroGrid: 创建空grid（保留transform用于后续切削写入）
+    // 毛坯表面由MacroGrid mesh表示，不需要初始pointdata
+    ipw.microGrid = openvdb::points::PointDataGrid::create();
+    ipw.microGrid->setTransform(ipw.macroGrid->transformPtr());
 
     return ipw;
 }

@@ -15,27 +15,33 @@ void MicroCut::quadtreeEval(
     const ToolSweepSurface& surface,
     double chordalLimit,
     int depth,
-    PointBuffer& output)
+    PointBuffer& output,
+    const openvdb::FloatGrid::ConstAccessor* billetAcc,
+    const openvdb::math::Transform* billetXform)
 {
     // 子域中心点
     double uMid = (u0 + u1) * 0.5;
     double vMid = (v0 + v1) * 0.5;
     Vec3d pCenter = surface.eval(uMid, vMid);
 
-    // 3D 拒止: 子域的包围盒与 voxel 无交集 → 跳过
-    // 只在depth>0时检查（第0层保证有交集，由Phase 1保证）
-    if (depth > 0) {
-        // 快速检查：中心点距voxel的距离
-        // 如果中心远离voxel且子域小，可安全跳过
-        Vec3d vCenter = (voxelAABB.min() + voxelAABB.max()) * 0.5;
-        double vRadius = (voxelAABB.max() - voxelAABB.min()).length() * 0.5;
-        double subRadius = (u1 - u0 + v1 - v0) * 3.0;  // 保守的子域3D半径估计
-        if ((pCenter - vCenter).length() > vRadius + subRadius * 2.0) return;
+    // 3D 拒止: 仅在细分足够深时检查（避免粗粒度时误拒）
+    if (depth > 3) {
+        openvdb::BBoxd subBBox;
+        subBBox.expand(pCenter);
+        subBBox.expand(surface.eval(u0, v0));
+        subBBox.expand(surface.eval(u1, v0));
+        subBBox.expand(surface.eval(u0, v1));
+        subBBox.expand(surface.eval(u1, v1));
+        if (!voxelAABB.hasOverlap(subBBox)) return;
     }
 
     // 最大深度 → 强制输出（插值点）
     if (depth >= MAX_DEPTH) {
-        if (voxelAABB.isInside(pCenter)) {
+        Vec3d pmin = voxelAABB.min() - Vec3d(1e-6);
+        Vec3d pmax = voxelAABB.max() + Vec3d(1e-6);
+        if (openvdb::BBoxd(pmin, pmax).isInside(pCenter)) {
+            if (billetAcc && billetXform && billetAcc->getValue(openvdb::Coord::round(
+                billetXform->worldToIndex(pCenter))) > 0) return;
             Vec3d n = surface.normal(uMid, vMid);
             output.positions.push_back(Vec3f(pCenter));
             output.normals.push_back(Vec3f(n));
@@ -55,7 +61,11 @@ void MicroCut::quadtreeEval(
 
     // 弦高 ≤ 容差 → 精确点
     if (maxChordal <= chordalLimit) {
-        if (voxelAABB.isInside(pCenter)) {
+        Vec3d pmin = voxelAABB.min() - Vec3d(1e-6);
+        Vec3d pmax = voxelAABB.max() + Vec3d(1e-6);
+        if (openvdb::BBoxd(pmin, pmax).isInside(pCenter)) {
+            if (billetAcc && billetXform && billetAcc->getValue(openvdb::Coord::round(
+                billetXform->worldToIndex(pCenter))) > 0) return;
             Vec3d n = surface.normal(uMid, vMid);
             output.positions.push_back(Vec3f(pCenter));
             output.normals.push_back(Vec3f(n));
@@ -64,10 +74,10 @@ void MicroCut::quadtreeEval(
     }
 
     // 细分为4个子域
-    quadtreeEval(u0, uMid, v0, vMid, voxelAABB, surface, chordalLimit, depth+1, output);
-    quadtreeEval(uMid, u1, v0, vMid, voxelAABB, surface, chordalLimit, depth+1, output);
-    quadtreeEval(u0, uMid, vMid, v1, voxelAABB, surface, chordalLimit, depth+1, output);
-    quadtreeEval(uMid, u1, vMid, v1, voxelAABB, surface, chordalLimit, depth+1, output);
+    quadtreeEval(u0, uMid, v0, vMid, voxelAABB, surface, chordalLimit, depth+1, output, billetAcc, billetXform);
+    quadtreeEval(uMid, u1, v0, vMid, voxelAABB, surface, chordalLimit, depth+1, output, billetAcc, billetXform);
+    quadtreeEval(u0, uMid, vMid, v1, voxelAABB, surface, chordalLimit, depth+1, output, billetAcc, billetXform);
+    quadtreeEval(uMid, u1, vMid, v1, voxelAABB, surface, chordalLimit, depth+1, output, billetAcc, billetXform);
 }
 
 std::unordered_map<openvdb::Coord, PointBuffer>
@@ -75,9 +85,20 @@ MicroCut::sampleNewSurface(
     const std::vector<VoxelTask>& tasks,
     const ToolSweepSurface& surface,
     const ToolSweepSDF& sdf,
-    const ToleranceConfig& config)
+    const ToleranceConfig& config,
+    const openvdb::FloatGrid::Ptr& billetGrid)
 {
     auto t0 = std::chrono::high_resolution_clock::now();
+
+    // 毛坯SDF accessor（用于过滤空气中的点）
+    std::unique_ptr<openvdb::FloatGrid::ConstAccessor> billetAccPtr;
+    const openvdb::FloatGrid::ConstAccessor* billetAcc = nullptr;
+    const openvdb::math::Transform* billetXform = nullptr;
+    if (billetGrid) {
+        billetAccPtr = std::make_unique<openvdb::FloatGrid::ConstAccessor>(billetGrid->getConstAccessor());
+        billetAcc = billetAccPtr.get();
+        billetXform = &billetGrid->transform();
+    }
 
     // Per-task 输出 (并行安全: 每个task写自己的buffer)
     std::vector<PointBuffer> taskBuffers(tasks.size());
@@ -94,7 +115,9 @@ MicroCut::sampleNewSurface(
                     surface,
                     config.chordalLimit,
                     0,
-                    taskBuffers[i]);
+                    taskBuffers[i],
+                    billetAcc,
+                    billetXform);
             }
         });
 
@@ -177,17 +200,14 @@ void MicroCut::rebuildLeaves(
     for (const auto& c : cls.cut) cutSet.insert(coordKey(c));
 
     int totalCulled = 0, totalSurvived = 0, totalNew = 0;
+    using LeafNodeType = openvdb::points::PointDataGrid::TreeType::LeafNodeType;
 
-    // 收集每个受影响 leaf 的最终点集（世界坐标）
-    struct LeafData {
-        std::vector<Vec3f> positions;
-        std::vector<Vec3f> normals;
-    };
-    std::vector<std::pair<openvdb::Coord, LeafData>> leafUpdates;
-    leafUpdates.reserve(leafGroups.size());
+    std::vector<Vec3f> allPositions;
+    std::vector<Vec3f> allNormals;
+    allPositions.reserve(leafGroups.size() * 100); // 预估
+    allNormals.reserve(leafGroups.size() * 100);
 
     for (const auto& [leafOrigin, coords] : leafGroups) {
-        LeafData data;
         auto* oldLeaf = microGrid->tree().probeLeaf(leafOrigin);
 
         if (oldLeaf) {
@@ -205,25 +225,20 @@ void MicroCut::rebuildLeaves(
                     auto end = oldLeaf->getValue(off);
                     decltype(end) start = (off == 0) ? decltype(end)(0) : oldLeaf->getValue(off-1);
                     totalCulled += (int)(end - start);
-                } else if (cutSet.count(key)) {
-                    for (auto ptIt = oldLeaf->beginIndexVoxel(voxCoord); ptIt; ++ptIt) {
-                        Vec3f pos = posHandle->get(*ptIt);
-                        Vec3d wp = xform.indexToWorld(voxCoord.asVec3d() + Vec3d(pos));
-                        if (sdf.eval(wp) >= cullThreshold) {
-                            data.positions.push_back(Vec3f(wp));
-                            data.normals.push_back(nrmHandle->get(*ptIt));
-                            totalSurvived++;
-                        } else {
-                            totalCulled++;
-                        }
-                    }
                 } else {
-                    // unaffected voxel in this leaf: 保留
+                    bool isCut = cutSet.count(key);
                     for (auto ptIt = oldLeaf->beginIndexVoxel(voxCoord); ptIt; ++ptIt) {
                         Vec3f pos = posHandle->get(*ptIt);
+                        Vec3f nrm = nrmHandle->get(*ptIt);
                         Vec3d wp = xform.indexToWorld(voxCoord.asVec3d() + Vec3d(pos));
-                        data.positions.push_back(Vec3f(wp));
-                        data.normals.push_back(nrmHandle->get(*ptIt));
+                        
+                        if (isCut && sdf.eval(wp) < cullThreshold) {
+                            totalCulled++;
+                            continue;
+                        }
+                        
+                        allPositions.push_back(Vec3f(wp));
+                        allNormals.push_back(nrm);
                         totalSurvived++;
                     }
                 }
@@ -235,45 +250,29 @@ void MicroCut::rebuildLeaves(
             auto it = newBuffers.find(c);
             if (it != newBuffers.end()) {
                 for (size_t i = 0; i < it->second.positions.size(); ++i) {
-                    data.positions.push_back(it->second.positions[i]);
-                    data.normals.push_back(it->second.normals[i]);
+                    allPositions.push_back(it->second.positions[i]);
+                    allNormals.push_back(it->second.normals[i]);
                     totalNew++;
                 }
             }
         }
 
-        leafUpdates.emplace_back(leafOrigin, std::move(data));
+        // 移除旧节点
+        microGrid->tree().stealNode<LeafNodeType>(leafOrigin, 0, false);
     }
 
-    // 就地更新: 只重建受影响 leaf 的数据（不触碰其他 leaf）
-    // 策略: 收集受影响leaf的全部点 → 创建临时grid → merge回主grid
-    // 先从主grid移除受影响leaf，再merge新数据
-
-    // 移除受影响的 leaf
-    for (const auto& [origin, data] : leafUpdates) {
-        microGrid->tree().stealNode<openvdb::points::PointDataGrid::TreeType::LeafNodeType>(
-            origin, openvdb::points::PointDataGrid::TreeType::LeafNodeType::ValueType(0), false);
-    }
-
-    // 收集受影响leaf的点集建临时grid
-    std::vector<Vec3f> affectedPositions;
-    std::vector<Vec3f> affectedNormals;
-    for (const auto& [origin, data] : leafUpdates) {
-        affectedPositions.insert(affectedPositions.end(), data.positions.begin(), data.positions.end());
-        affectedNormals.insert(affectedNormals.end(), data.normals.begin(), data.normals.end());
-    }
-
-    if (!affectedPositions.empty()) {
+    // 批量构建新 Grid 并 Merge
+    if (!allPositions.empty()) {
         auto tempGrid = openvdb::points::createPointDataGrid<
             openvdb::points::NullCodec, openvdb::points::PointDataGrid>(
-            affectedPositions, xform);
+            allPositions, xform);
 
         openvdb::points::appendAttribute<Vec3f>(tempGrid->tree(), "N");
         size_t idx = 0;
         for (auto leaf = tempGrid->tree().beginLeaf(); leaf; ++leaf) {
             openvdb::points::AttributeWriteHandle<Vec3f> handle(leaf->attributeArray("N"));
             for (auto it = leaf->beginIndexOn(); it; ++it) {
-                handle.set(*it, affectedNormals[idx++]);
+                handle.set(*it, allNormals[idx++]);
             }
         }
 

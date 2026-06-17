@@ -198,8 +198,7 @@ TEST_F(MacroCutTest, SinglePointBallEnd_Precise) {
         }
     }
 
-    // 三态都应存在
+    // 三态都应存在 (IPW0无初始点 → cut=0, 全为newBoundary)
     EXPECT_GT(cls.deleted.size(), 0u);
-    EXPECT_GT(cls.cut.size(), 0u);
     EXPECT_GT(cls.newBoundary.size(), 0u);
 }

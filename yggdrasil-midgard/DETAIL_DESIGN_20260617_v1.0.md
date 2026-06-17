@@ -102,12 +102,15 @@ MacroGrid 必须执行 CSG 才能正确激活新边界。分类条件增加 `|ma
 
 ### 4.4 Phase 3+4: Per-leaf 就地重建
 
-不整体重建 MicroGrid。只操作受影响的 leaf：
-1. 移除旧 leaf（stealNode）
-2. 收集存活旧点 + 新点
-3. 创建临时 grid → merge 回主 grid
+不整体重建 MicroGrid。采用 **“按 Leaf 流式更新”** 策略：
+1. 收集受影响的 coords，按 leaf origin 分组。
+2. 对每个受影响 Leaf 进行局部重建：
+   - 提取存活旧点（SDF ≥ t）+ 收集新采样点。
+   - 为该 Leaf 创建极小的临时 Grid（避免全局 Binning 开销）。
+   - 使用 `stealNode` 从临时 Grid 获取新 Leaf，并用 `addLeaf` 手动替换主 Grid 节点。
+3. 不受影响的 leaf 零开销。复杂度 O(N_affected_leaves * N_pts_per_leaf)。
 
-不受影响的 leaf 零开销。复杂度 O(N_affected)。
+这种方案实现了最优内存占用（峰值从全局点数降低到单 Leaf 点数）和缓存友好的属性注入。
 
 ### 4.5 DualTrack 一致性原则
 
@@ -164,6 +167,5 @@ MacroGrid 必须执行 CSG 才能正确激活新边界。分类条件增加 `|ma
 | 1 | Phase 2 覆盖率 ~20% | 部分边界voxel无新点 | 正常行为（保守分类过宽） |
 | 2 | 只实现球头刀+平底刀 | 牛鼻刀未实现 | M2 迭代 |
 | 3 | 重投影未启用 | Phase 3 仅硬删除 | 如需再启用 |
-| 4 | rebuildLeaves 用临时grid merge | 非最优内存模式 | 后续per-leaf直接写入 |
-| 5 | 无渲染管线 | 无法可视化 | 下一步实现 |
-| 6 | 单段刀路 | 未实现多段连续切削循环 | M8+ |
+| 4 | 无渲染管线 | 无法可视化 | 下一步实现 |
+| 5 | 单段刀路 | 未实现多段连续切削循环 | M8+ |
