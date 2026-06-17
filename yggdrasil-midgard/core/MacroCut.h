@@ -2,6 +2,7 @@
 
 #include "core/Types.h"
 #include "core/ToolSweepSDF.h"
+#include "core/ToolSweepSurface.h"
 #include "debug/RtDebugSys.h"
 #include <openvdb/Grid.h>
 #include <vector>
@@ -18,6 +19,14 @@ class MacroCut {
 public:
     /// Phase 0: CSG差集 + 三态分类
     CutClassification classifyVoxels(IPWState& ipw, const ToolSweepSDF& tool);
+
+    /// Phase 1: 生成VoxelTask列表
+    /// 使用ToolSweepSurface的参数面进行反向查询
+    std::vector<VoxelTask> buildTaskList(
+        const CutClassification& cls,
+        const ToolSweepSurface& surface,
+        const ToleranceConfig& config,
+        const openvdb::math::Transform& xform);
 };
 
 } // namespace midgard

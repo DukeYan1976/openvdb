@@ -1,8 +1,11 @@
 #include "debug/RtDebugSys.h"
 #include "core/Types.h"
 #include "core/ToolSweepSDF.h"
+#include "core/ToolSweepSurface.h"
 #include "core/MacroCut.h"
+#include "core/MicroCut.h"
 #include "core/IPWBuilder.h"
+#include "core/MeshExport.h"
 #include <openvdb/openvdb.h>
 #include <openvdb/points/PointCount.h>
 #include <filesystem>
@@ -10,6 +13,7 @@
 #include <thread>
 #include <chrono>
 #include <cmath>
+#include <unordered_set>
 
 using namespace midgard;
 
@@ -150,15 +154,92 @@ int main(int argc, char* argv[]) {
               << "  threshold:         " << threshold << "\n";
 
     // ─── Phase 2/3/4 占位 ───────────────────────────────────────────
+    pageBreak("Phase 1: 任务列表生成");
+
+    ToolSweepSurface surface(tool, seg);
+    auto tasks = macrocut.buildTaskList(cls, surface, config, ipw.macroGrid->transform());
+
+    std::cout << "  Tasks generated: " << tasks.size() << "\n"
+              << "  vSplit: " << surface.vSplit() << "\n"
+              << "  hasMidPatch: " << (surface.hasMidPatch() ? "yes" : "no") << "\n";
+
+    // 统计参数域范围
+    double avgURange = 0, avgVRange = 0;
+    for (const auto& t : tasks) {
+        avgURange += (t.u_max - t.u_min);
+        avgVRange += (t.t_max - t.t_min);
+    }
+    if (!tasks.empty()) {
+        avgURange /= tasks.size();
+        avgVRange /= tasks.size();
+    }
+    std::cout << "  Avg param range: u=" << avgURange << " v=" << avgVRange << "\n";
+
     pageBreak("Phase 2-4: 待实现 (MicroCut + Compaction)");
 
-    std::cout << "  [TODO] Phase 2: 四叉树采样生成新切削面点\n"
-              << "         - 需处理 " << cls.newBoundary.size() << " 个 voxel_n (从零生成)\n"
-              << "         - 需处理 " << cls.cut.size() << " 个 voxel_c (补新点)\n"
-              << "  [TODO] Phase 3: 旧点剔除 (SDF < t)\n"
-              << "         - 需处理 " << cls.cut.size() << " 个 voxel_c 中的旧点\n"
-              << "         - 需删除 " << cls.deleted.size() << " 个 voxel_d 的全部点\n"
-              << "  [TODO] Phase 4: per-leaf 重建 MicroGrid\n";
+    // Phase 2: 四叉树采样
+    MicroCut microcut;
+    auto buffers = microcut.sampleNewSurface(tasks, surface, sdf, config);
+
+    int totalNewPoints = 0;
+    for (const auto& [coord, buf] : buffers) totalNewPoints += buf.positions.size();
+
+    std::cout << "  Phase 2 results:\n"
+              << "    Voxels with new points: " << buffers.size() << "\n"
+              << "    Total new points: " << totalNewPoints << "\n";
+
+    // ─── Phase 3+4: 旧点剔除 + 重建 ────────────────────────────────
+    pageBreak("Phase 3+4: 重建 MicroGrid");
+
+    openvdb::Index64 ptsBefore = openvdb::points::pointCount(ipw.microGrid->tree());
+
+    auto tR0 = std::chrono::high_resolution_clock::now();
+    microcut.rebuildLeaves(ipw, cls, buffers, sdf, config);
+    auto tR1 = std::chrono::high_resolution_clock::now();
+
+    openvdb::Index64 ptsAfter = openvdb::points::pointCount(ipw.microGrid->tree());
+    double msRebuild = std::chrono::duration<double, std::milli>(tR1 - tR0).count();
+
+    std::cout << "  MicroGrid points: " << ptsBefore << " -> " << ptsAfter << "\n"
+              << "  Rebuild time: " << msRebuild << " ms\n";
+
+    // ─── 端到端精度验证 ─────────────────────────────────────────────
+    pageBreak("M8: 切削面精度验证");
+
+    // 只验证切削区域（cut + newBoundary voxels）内的点
+    // 这些点应该在扫掠面上（新生成的）或在刀具外部（存活旧点）
+    double maxSdfInCutZone = 0;
+    int cutZonePoints = 0;
+    std::unordered_set<int64_t> cutZoneSet;
+    auto ck = [](const openvdb::Coord& c) -> int64_t {
+        return (int64_t(c.x()) << 40) | (int64_t(c.y() & 0xFFFFF) << 20) | int64_t(c.z() & 0xFFFFF);
+    };
+    for (const auto& c : cls.cut) cutZoneSet.insert(ck(c));
+    for (const auto& c : cls.newBoundary) cutZoneSet.insert(ck(c));
+
+    for (auto leaf = ipw.microGrid->tree().cbeginLeaf(); leaf; ++leaf) {
+        auto posHandle = openvdb::points::AttributeHandle<Vec3f>::create(
+            leaf->constAttributeArray("P"));
+        for (auto it = leaf->beginIndexOn(); it; ++it) {
+            openvdb::Coord voxCoord = it.getCoord();
+            if (!cutZoneSet.count(ck(voxCoord))) continue;  // 非切削区跳过
+
+            Vec3f pos = posHandle->get(*it);
+            Vec3d wp = ipw.microGrid->transform().indexToWorld(
+                voxCoord.asVec3d() + Vec3d(pos));
+            double s = sdf.eval(wp);
+            // 新点应SDF≈0, 存活旧点应SDF≥t
+            // 最小SDF代表最深入刀具的点（不应有SDF<0）
+            if (s < 0) maxSdfInCutZone = std::max(maxSdfInCutZone, -s);
+            cutZonePoints++;
+        }
+    }
+
+    std::cout << "  Cut zone points checked: " << cutZonePoints << "\n"
+              << "  Max penetration (SDF<0): " << maxSdfInCutZone << " mm\n"
+              << "  Tolerance t: " << config.user_t << " mm\n"
+              << "  " << (maxSdfInCutZone <= config.user_t ? "[PASS]" : "[WARN]")
+              << " All cut-zone points within tolerance\n";
 
     // ─── 总结 ────────────────────────────────────────────────────────
     pageBreak("Summary");
@@ -168,6 +249,29 @@ int main(int argc, char* argv[]) {
               << "  Total:        " << (msBuild + msCut) << " ms\n"
               << "  Status:       Phase 0 " << (deletedOK && boundaryOK ? "PASS" : "FAIL") << "\n"
               << "\n  Debug log: " << (debugDir / "DebugInfo.txt").string() << "\n";
+
+    // ─── OBJ 导出 ───────────────────────────────────────────────────
+    pageBreak("OBJ Export");
+
+    std::filesystem::path objDir = exePath / "obj_output";
+    std::filesystem::create_directories(objDir);
+
+    // 1. 原始毛坯 mesh
+    {
+        auto pristine = IPWBuilder().build(geom, config);
+        exportMacroMesh(pristine.macroGrid, (objDir / "billet_original.obj").string());
+        std::cout << "  [1] billet_original.obj\n";
+    }
+
+    // 2. 切削后工件 mesh
+    exportMacroMesh(ipw.macroGrid, (objDir / "billet_after_cut.obj").string());
+    std::cout << "  [2] billet_after_cut.obj\n";
+
+    // 3. 切削区点云
+    exportMicroPoints(ipw.microGrid, (objDir / "cut_surface_points.obj").string());
+    std::cout << "  [3] cut_surface_points.obj\n";
+
+    std::cout << "\n  Output: " << objDir.string() << "\n";
 
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     return (deletedOK && boundaryOK) ? 0 : 1;

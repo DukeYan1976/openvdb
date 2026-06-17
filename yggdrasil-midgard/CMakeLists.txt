@@ -18,8 +18,11 @@ find_package(OpenVDB REQUIRED)
 add_library(midgard
     debug/RtDebugSys.cpp
     core/ToolSweepSDF.cpp
+    core/ToolSweepSurface.cpp
     core/MacroCut.cpp
     core/IPWBuilder.cpp
+    core/MicroCut.cpp
+    core/MeshExport.cpp
 )
 target_include_directories(midgard PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(midgard PUBLIC OpenVDB::openvdb)
@@ -43,8 +46,13 @@ enable_testing()
 add_executable(midgard_tests
     tests/test_placeholder.cpp
     tests/test_toolsweep_sdf.cpp
+    tests/test_toolsweep_surface.cpp
     tests/test_macrocut.cpp
+    tests/test_macrocut_phase1.cpp
     tests/test_ipwbuilder.cpp
+    tests/test_microcut.cpp
+    tests/test_phase34.cpp
+    tests/test_dualtrack_consistency.cpp
 )
 target_link_libraries(midgard_tests PRIVATE midgard GTest::gtest_main)
 

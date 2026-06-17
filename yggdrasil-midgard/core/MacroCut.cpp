@@ -1,8 +1,10 @@
 #include "core/MacroCut.h"
 #include <openvdb/tools/Composite.h>
+#include <openvdb/tools/LevelSetRebuild.h>
 #include <openvdb/points/PointDataGrid.h>
 #include <cmath>
 #include <chrono>
+#include <unordered_map>
 
 namespace midgard {
 
@@ -99,6 +101,10 @@ CutClassification MacroCut::classifyVoxels(IPWState& ipw, const ToolSweepSDF& to
     // MicroGrid 的更新由后续 Phase 3/4 完成（per-leaf 重建）
     openvdb::tools::csgDifference(*macroGrid, *toolGrid);
 
+    // 修复CSG后的SDF场质量（renormalize distance field）
+    macroGrid = openvdb::tools::levelSetRebuild(*macroGrid, 0.0f,
+        halfwidth * macroGrid->voxelSize()[0]);
+
     auto t2 = std::chrono::high_resolution_clock::now();
 
     // ─── Step 4: 三态分类 ───────────────────────────────────────────────
@@ -128,13 +134,16 @@ CutClassification MacroCut::classifyVoxels(IPWState& ipw, const ToolSweepSDF& to
             const openvdb::Coord coord = iter.getCoord();
             const openvdb::Vec3d worldPos = macroGrid->indexToWorld(coord);
             // 用解析SDF判断该voxel相对刀具的位置
-            const double sdf = tool.eval(worldPos);
+            const double toolSdf = tool.eval(worldPos);
+            // CSG后的MacroGrid SDF值（判断是否在工件零等值面附近）
+            const float macroSdf = iter.getValue();
 
-            if (sdf < -threshold) {
+            if (toolSdf < -threshold) {
                 // voxel_d: 完全在刀具内部，后续从MicroGrid删除对应点
                 result.deleted.push_back(coord);
-            } else if (sdf <= threshold) {
-                // 边界voxel: 查MicroGrid该voxel是否有点（非leaf级别）
+            } else if (toolSdf <= threshold && std::abs(macroSdf) < V) {
+                // 边界voxel: 靠近扫掠面 AND 在工件零等值面附近
+                // 只有同时满足两个条件的才是真正的切削界面voxel
                 bool hasExistingData = false;
                 if (microAcc) {
                     auto* mleaf = microAcc->probeConstLeaf(coord);
@@ -187,6 +196,131 @@ CutClassification MacroCut::classifyVoxels(IPWState& ipw, const ToolSweepSDF& to
     }
 
     return result;
+}
+
+/// Phase 1: 为每个边界 voxel 生成 VoxelTask（含参数域范围）
+/// 使用 ToolSweepSurface 的统一参数面进行反向查询
+std::vector<VoxelTask> MacroCut::buildTaskList(
+    const CutClassification& cls,
+    const ToolSweepSurface& surface,
+    const ToleranceConfig& config,
+    const openvdb::math::Transform& xform)
+{
+    const double V = config.voxelMacro;
+
+    // ─── 构建 task 列表 ─────────────────────────────────────────────
+    std::vector<VoxelTask> tasks;
+    tasks.reserve(cls.cut.size() + cls.newBoundary.size());
+
+    auto addCoords = [&](const std::vector<openvdb::Coord>& coords, VoxelClass vc) {
+        for (const auto& coord : coords) {
+
+            VoxelTask task;
+            task.origin = coord;
+            task.classification = vc;
+            // voxel 物理 AABB (使用grid的transform正确转换)
+            openvdb::Vec3d wmin = xform.indexToWorld(coord);
+            openvdb::Vec3d wmax = xform.indexToWorld(coord.offsetBy(1, 1, 1));
+            task.aabb = openvdb::BBoxd(wmin, wmax);
+            // 参数域初始化为空（后续expand）
+            task.u_min = 1.0; task.u_max = 0.0;
+            task.t_min = 1.0; task.t_max = 0.0;
+            tasks.push_back(task);
+        }
+    };
+    addCoords(cls.cut, VoxelClass::CUT);
+    addCoords(cls.newBoundary, VoxelClass::NEW_BOUNDARY);
+
+    if (tasks.empty()) return tasks;
+
+    auto t0 = std::chrono::high_resolution_clock::now();
+
+    // ─── 参数面统一分块 → 反向查询匹配 voxel ─────────────────────
+    // 分块数动态计算: 使每个参数块映射的3D范围≈1-2个voxel大小
+    openvdb::BBoxd fullBBox = surface.bbox(0, 1, 0, 1);
+    openvdb::Vec3d fullExtent = fullBBox.max() - fullBBox.min();
+    // u方向≈周长(取XY平面最大跨度*π), v方向≈轴向展开长
+    double diameter = std::max(fullExtent.x(), fullExtent.y());
+    double circumference = M_PI * diameter;
+    double axialLength = fullExtent.length();
+
+    int N_U = std::clamp((int)std::ceil(circumference / V), 4, 16);
+    int N_V = std::clamp((int)std::ceil(axialLength / V), 4, 16);
+
+    const double margin = V * 0.9;  // 裕量外扩（覆盖bbox采样误差）
+    const double du = 1.0 / N_U;
+    const double dv = 1.0 / N_V;
+
+    for (int iu = 0; iu < N_U; ++iu) {
+        for (int iv = 0; iv < N_V; ++iv) {
+            double u0 = iu * du, u1 = (iu + 1) * du;
+            double v0 = iv * dv, v1 = (iv + 1) * dv;
+
+            openvdb::BBoxd blockBBox = surface.bbox(u0, u1, v0, v1);
+            blockBBox.expand(margin);
+
+            for (size_t i = 0; i < tasks.size(); ++i) {
+                if (tasks[i].aabb.hasOverlap(blockBBox)) {
+                    tasks[i].u_min = std::min(tasks[i].u_min, u0);
+                    tasks[i].u_max = std::max(tasks[i].u_max, u1);
+                    tasks[i].t_min = std::min(tasks[i].t_min, v0);
+                    tasks[i].t_max = std::max(tasks[i].t_max, v1);
+                }
+            }
+        }
+    }
+
+    // 统计匹配成功的task数
+    int matched = 0;
+    for (const auto& task : tasks) {
+        if (task.u_min <= task.u_max) matched++;
+    }
+
+    // 对未匹配的task: 暴力搜索找到最近参数位置，设局部邻域
+    const double searchDu = 1.0 / 20.0;
+    const double searchDv = 1.0 / 20.0;
+    const double localRadius = 2.0 * std::max(du, dv); // 邻域半径
+
+    for (auto& task : tasks) {
+        if (task.u_min <= task.u_max) continue;  // 已匹配，跳过
+
+        // 找voxel中心最近的参数面点
+        Vec3d center = (task.aabb.min() + task.aabb.max()) * 0.5;
+        double bestDist = 1e9;
+        double bestU = 0.5, bestV = 0.5;
+
+        for (double u = 0; u <= 1.0; u += searchDu) {
+            for (double v = 0; v <= 1.0; v += searchDv) {
+                Vec3d p = surface.eval(u, v);
+                double d = (p - center).lengthSqr();
+                if (d < bestDist) {
+                    bestDist = d;
+                    bestU = u;
+                    bestV = v;
+                }
+            }
+        }
+
+        task.u_min = std::max(0.0, bestU - localRadius);
+        task.u_max = std::min(1.0, bestU + localRadius);
+        task.t_min = std::max(0.0, bestV - localRadius);
+        task.t_max = std::min(1.0, bestV + localRadius);
+    }
+
+    auto t1 = std::chrono::high_resolution_clock::now();
+
+    DEBUG_SECTION(Phase1_TaskList) {
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        DEBUG_INFO_OUT("Phase1: tasks=" + std::to_string(tasks.size())
+                     + " block_matched=" + std::to_string(matched)
+                     + " nearest_search=" + std::to_string((int)tasks.size() - matched)
+                     + " blocks=" + std::to_string(N_U * N_V)
+                     + " N_U=" + std::to_string(N_U)
+                     + " N_V=" + std::to_string(N_V)
+                     + " time=" + std::to_string(ms) + "ms");
+    }
+
+    return tasks;
 }
 
 } // namespace midgard
