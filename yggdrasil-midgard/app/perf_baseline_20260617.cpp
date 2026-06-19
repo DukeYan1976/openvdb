@@ -1,6 +1,6 @@
 #include "debug/RtDebugSys.h"
 #include "core/Types.h"
-#include "core/ToolSweepSDF.h"
+#include "core/ToolSweptSDF.h"
 #include "core/MacroCut.h"
 #include "core/IPWBuilder.h"
 #include <openvdb/openvdb.h>
@@ -80,7 +80,7 @@ int main(int argc, char* argv[]) {
 
     ToolDef tool{ToolType::BALL_END, 5.0, 0.0, 30.0};
     MoveSegment seg{Vec3d(0, 10, 18), Vec3d(20, 10, 18)};
-    ToolSweepSDF sdf(tool, seg);
+    ToolSweptSDF sdf(tool, seg);
 
     double pathLen = (seg.end - seg.start).length();
     auto bbox = sdf.boundingBox();

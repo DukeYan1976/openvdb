@@ -20,7 +20,7 @@
 |------|------|------|
 | Types | `core/Types.h` | 公共类型、ToleranceConfig |
 | IPWBuilder | `core/IPWBuilder.h/.cpp` | 毛坯初始化（MacroGrid + MicroGrid） |
-| ToolSweepSDF | `core/ToolSweepSDF.h/.cpp` | 刀具扫掠体解析SDF + 梯度 |
+| ToolSweptSDF | `core/ToolSweptSDF.h/.cpp` | 刀具扫掠体解析SDF + 梯度 |
 | ToolSweepSurface | `core/ToolSweepSurface.h/.cpp` | 刀具扫掠体参数面（双补丁模型） |
 | MacroCut | `core/MacroCut.h/.cpp` | Phase 0（CSG+分类）+ Phase 1（任务生成） |
 | MicroCut | `core/MicroCut.h/.cpp` | Phase 2（采样）+ Phase 3+4（剔除+重建） |
@@ -148,7 +148,7 @@ MacroGrid 必须执行 CSG 才能正确激活新边界。分类条件增加 `|ma
 | 类别 | 测试数 | 关键验证 |
 |------|--------|----------|
 | Types | 2 | ToleranceConfig 派生 + clamp |
-| ToolSweepSDF | 20 | 球头/平底 SDF + 梯度(有限差分<1e-6) |
+| ToolSweptSDF | 20 | 球头/平底 SDF + 梯度(有限差分<1e-6) |
 | ToolSweepSurface | 13 | 静态/线性 SDF交叉验证 + bbox保守 |
 | MacroCut Phase 0 | 6 | CSG + 三态分类 + 精确验证 |
 | MacroCut Phase 1 | 4 | 任务生成 + 参数域保守性(0 violations) |

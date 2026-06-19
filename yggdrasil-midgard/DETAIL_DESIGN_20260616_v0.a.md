@@ -239,14 +239,14 @@ struct IPWState {
 } // namespace midgard
 ```
 
-### 3.2 ToolSweepSDF — 刀具扫掠体解析 SDF
+### 3.2 ToolSweptSDF — 刀具扫掠体解析 SDF
 
 ```cpp
 namespace midgard {
 
-class ToolSweepSDF {
+class ToolSweptSDF {
 public:
-    ToolSweepSDF(const ToolDef& tool, const MoveSegment& seg);
+    ToolSweptSDF(const ToolDef& tool, const MoveSegment& seg);
 
     /// 有符号距离 (< 0 = 内部)
     double eval(const Vec3d& p) const;
@@ -325,18 +325,18 @@ public:
     /// 3. 对CSG后的active voxels做SDF阈值分类
     CutClassification classifyVoxels(
         IPWState& ipw,
-        const ToolSweepSDF& tool);
+        const ToolSweptSDF& tool);
 
     /// Phase 1: 生成任务列表
     /// 反向查询: per-param_block → 匹配 voxels
     std::vector<VoxelTask> buildTaskList(
         const CutClassification& classification,
-        const ToolSweepSDF& tool,
+        const ToolSweptSDF& tool,
         const ToleranceConfig& config);
 
 private:
     // 参数面均匀分块数 (自适应)
-    int computeBlockCount(const ToolSweepSDF& tool,
+    int computeBlockCount(const ToolSweptSDF& tool,
                           double voxelSize) const;
 };
 
@@ -361,7 +361,7 @@ public:
     std::unordered_map<openvdb::Coord, PointBuffer>
     sampleNewSurface(
         const std::vector<VoxelTask>& tasks,
-        const ToolSweepSDF& tool,
+        const ToolSweptSDF& tool,
         const ToleranceConfig& config);
 
     /// Phase 3: 旧点剔除 (SDF < t → 删除)
@@ -369,7 +369,7 @@ public:
     void cullOldPoints(
         IPWState& ipw,
         const CutClassification& classification,
-        const ToolSweepSDF& tool,
+        const ToolSweptSDF& tool,
         const ToleranceConfig& config);
 
 private:
@@ -377,14 +377,14 @@ private:
     void quadtreeEval(
         double u0, double u1, double t0, double t1,
         const openvdb::BBoxd& voxelAABB,
-        const ToolSweepSDF& tool,
+        const ToolSweptSDF& tool,
         double epsilon,
         int depth,
         PointBuffer& output);
 
     /// 阻尼Newton重投影 (2-3步)
     Vec3d reproject(const Vec3d& p,
-                    const ToolSweepSDF& tool,
+                    const ToolSweptSDF& tool,
                     double epsilon) const;
 
     static constexpr int MAX_QUADTREE_DEPTH = 12;
@@ -494,7 +494,7 @@ voxelSize = `config.voxelMacro`, halfwidth = 3。
 
 **算法**（四步）：
 ```
-Input: IPWState (macroGrid + microGrid), ToolSweepSDF
+Input: IPWState (macroGrid + microGrid), ToolSweptSDF
 Output: CutClassification { deleted, cut, newBoundary }
 
 Step 1 - 光栅化范围裁剪:
@@ -704,7 +704,7 @@ for each affected_leaf (按 leaf origin 分组 CutClassification 的 coords):
 ### 5.1 Phase 依赖图
 
 ```
-ToolSweepSDF ──┬──→ MacroCut (Phase 0-1) ──→ MicroCut (Phase 2-3) ──→ Compaction (Phase 4)
+ToolSweptSDF ──┬──→ MacroCut (Phase 0-1) ──→ MicroCut (Phase 2-3) ──→ Compaction (Phase 4)
                │
 Types.h ───────┘
 ```
@@ -714,8 +714,8 @@ Types.h ───────┘
 | 里程碑 | 内容 | 验收标准 |
 |--------|------|----------|
 | M0 | 工程骨架 + Types + 编译通过 | CMake build 成功，空 test 运行 |
-| M1 | ToolSweepSDF (球头+平底) | TDD 通过，解析梯度误差 < 1e-10 |
-| M2 | ToolSweepSDF (牛鼻刀) | 环面段 Newton 收敛，脊线处 smooth |
+| M1 | ToolSweptSDF (球头+平底) | TDD 通过，解析梯度误差 < 1e-10 |
+| M2 | ToolSweptSDF (牛鼻刀) | 环面段 Newton 收敛，脊线处 smooth |
 | M3 | MacroCut Phase 0 | SDF 点查询分类正确，voxel 三态标记准确 |
 | M4 | MacroCut Phase 1 | 反向查询正确，任务覆盖保守完备 |
 | M5 | MicroCut Phase 2 | 四叉树采样精度 ≤ ε/2 |
@@ -760,7 +760,7 @@ Types.h ───────┘
 
 | 模块 | 必须通过的 TDD 测试 |
 |------|---------------------|
-| ToolSweepSDF | 球体/平面/环面已知解析解对比，梯度有限差分验证（误差<1e-6） |
+| ToolSweptSDF | 球体/平面/环面已知解析解对比，梯度有限差分验证（误差<1e-6） |
 | MacroCut | SDF分类正确（球切方块→DELETED/CUT/UNCHANGED分布符合几何预期） |
 | MicroCut.quadtreeEval | 平面→单次终止，球面→多层细分，采样密度与ε关系 |
 | MicroCut.reproject | 收敛步数统计，发散检测，边界case |
