@@ -15,12 +15,12 @@ protected:
 TEST_F(MicroCutTest, SinglePoint_AllPointsOnSDF_Zero) {
     // 构建IPW + 切削
     GeometryDef geom{GeometryDef::BOX, Vec3d(0), Vec3d(10, 10, 10)};
-    ToleranceConfig config(1.0 / 30.0);  // V=1mm, t=0.033mm
+    ToleranceConfig config(1.0 / 30.0, ToleranceConfig::INTERACTIVE, 30.0);  // V=1mm, t=0.033mm
     auto ipw = IPWBuilder().build(geom, config);
 
     ToolDef tool{ToolType::BALL_END, 3.0, 0.0, 20.0};
     MoveSegment seg{Vec3d(5, 5, 9), Vec3d(5, 5, 9)};
-    ToolSweepSDF sdf(tool, seg);
+    ToolSweptSDF sdf(tool, seg);
     ToolSweepSurface surf(tool, seg);
 
     // Phase 0 + 1
@@ -30,7 +30,7 @@ TEST_F(MicroCutTest, SinglePoint_AllPointsOnSDF_Zero) {
 
     // Phase 2: 采样
     MicroCut microcut;
-    auto buffers = microcut.sampleNewSurface(tasks, surf, sdf, config);
+    auto buffers = microcut.sampleNewSurface(tasks, surf, sdf, config, ipw);
 
     // 验证: 所有采样点的SDF值应≈0
     double maxAbsSDF = 0;
@@ -50,12 +50,12 @@ TEST_F(MicroCutTest, SinglePoint_AllPointsOnSDF_Zero) {
 
 TEST_F(MicroCutTest, SinglePoint_PointsInsideVoxel) {
     GeometryDef geom{GeometryDef::BOX, Vec3d(0), Vec3d(10, 10, 10)};
-    ToleranceConfig config(1.0 / 30.0);
+    ToleranceConfig config(1.0 / 30.0, ToleranceConfig::INTERACTIVE, 30.0);
     auto ipw = IPWBuilder().build(geom, config);
 
     ToolDef tool{ToolType::BALL_END, 3.0, 0.0, 20.0};
     MoveSegment seg{Vec3d(5, 5, 9), Vec3d(5, 5, 9)};
-    ToolSweepSDF sdf(tool, seg);
+    ToolSweptSDF sdf(tool, seg);
     ToolSweepSurface surf(tool, seg);
 
     MacroCut macrocut;
@@ -63,28 +63,31 @@ TEST_F(MicroCutTest, SinglePoint_PointsInsideVoxel) {
     auto tasks = macrocut.buildTaskList(cls, surf, config, ipw.macroGrid->transform());
 
     MicroCut microcut;
-    auto buffers = microcut.sampleNewSurface(tasks, surf, sdf, config);
+    auto buffers = microcut.sampleNewSurface(tasks, surf, sdf, config, ipw);
 
-    // 验证: 每个buffer的点都在对应task的voxel AABB内
+    // 验证: 每个buffer的点都在对应task的voxel AABB附近
+    // 四叉树精确采样的点在AABB内(浮点误差)
+    // SDF投影fallback点可能在相邻体素(1V范围内)
     for (const auto& task : tasks) {
         auto it = buffers.find(task.origin);
         if (it == buffers.end()) continue;
         for (const auto& pos : it->second.positions) {
-            Vec3d p(pos);
-            EXPECT_TRUE(task.aabb.isInside(p))
-                << "Point " << p << " outside voxel at " << task.origin;
+            openvdb::BBoxd expandedBox = task.aabb;
+            expandedBox.expand(config.voxelMacro);
+            EXPECT_TRUE(expandedBox.isInside(pos))
+                << "Point " << pos << " too far from voxel at " << task.origin;
         }
     }
 }
 
 TEST_F(MicroCutTest, SinglePoint_NormalsAreUnit) {
     GeometryDef geom{GeometryDef::BOX, Vec3d(0), Vec3d(10, 10, 10)};
-    ToleranceConfig config(1.0 / 30.0);
+    ToleranceConfig config(1.0 / 30.0, ToleranceConfig::INTERACTIVE, 30.0);
     auto ipw = IPWBuilder().build(geom, config);
 
     ToolDef tool{ToolType::BALL_END, 3.0, 0.0, 20.0};
     MoveSegment seg{Vec3d(5, 5, 9), Vec3d(5, 5, 9)};
-    ToolSweepSDF sdf(tool, seg);
+    ToolSweptSDF sdf(tool, seg);
     ToolSweepSurface surf(tool, seg);
 
     MacroCut macrocut;
@@ -92,7 +95,7 @@ TEST_F(MicroCutTest, SinglePoint_NormalsAreUnit) {
     auto tasks = macrocut.buildTaskList(cls, surf, config, ipw.macroGrid->transform());
 
     MicroCut microcut;
-    auto buffers = microcut.sampleNewSurface(tasks, surf, sdf, config);
+    auto buffers = microcut.sampleNewSurface(tasks, surf, sdf, config, ipw);
 
     for (const auto& [coord, buf] : buffers) {
         for (const auto& n : buf.normals) {

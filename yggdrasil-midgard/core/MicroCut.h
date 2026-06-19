@@ -1,7 +1,7 @@
 #pragma once
 
 #include "core/Types.h"
-#include "core/ToolSweepSDF.h"
+#include "core/ToolSweptSDF.h"
 #include "core/ToolSweepSurface.h"
 #include "core/MacroCut.h"
 #include "debug/RtDebugSys.h"
@@ -11,12 +11,6 @@
 
 namespace midgard {
 
-/// Phase 2 输出: 每个voxel的新采样点
-struct PointBuffer {
-    std::vector<Vec3f> positions;  // 世界坐标 (Phase 4转相对坐标)
-    std::vector<Vec3f> normals;    // 单位法线
-};
-
 class MicroCut {
 public:
     /// Phase 2: TBB并行四叉树自适应采样
@@ -24,9 +18,16 @@ public:
     sampleNewSurface(
         const std::vector<VoxelTask>& tasks,
         const ToolSweepSurface& surface,
-        const ToolSweepSDF& sdf,
+        const ToolSweptSDF& sdf,
         const ToleranceConfig& config,
-        const openvdb::FloatGrid::Ptr& billetGrid = nullptr);  // 毛坯SDF用于过滤空气中的点
+        const IPWState& ipw);
+
+    /// Phase 1.5: 对缺失点云的 NEW_BOUNDARY 体素，动态进行毛坯表面采样（冷启动）
+    std::unordered_map<openvdb::Coord, PointBuffer>
+    primeBilletBoundaries(
+        const std::vector<VoxelTask>& tasks,
+        const GeometryDef& billetDef,
+        const ToleranceConfig& config);
 
     /// Phase 3+4: 旧点剔除 + per-leaf 重建 MicroGrid
     /// deleted voxels: 全部点删除
@@ -36,10 +37,9 @@ public:
         IPWState& ipw,
         const CutClassification& cls,
         const std::unordered_map<openvdb::Coord, PointBuffer>& newBuffers,
-        const ToolSweepSDF& sdf,
+        const ToolSweptSDF& sdf,
         const ToleranceConfig& config);
 
-private:
     /// 四叉树递归核心
     void quadtreeEval(
         double u0, double u1, double v0, double v1,
@@ -49,8 +49,11 @@ private:
         int depth,
         PointBuffer& output,
         const openvdb::FloatGrid::ConstAccessor* billetAcc = nullptr,
-        const openvdb::math::Transform* billetXform = nullptr);
+        const openvdb::math::Transform* billetXform = nullptr,
+        const PointBuffer* existingData = nullptr,
+        double cullThreshold = 0.01);
 
+private:
     static constexpr int MAX_DEPTH = 12;
 };
 

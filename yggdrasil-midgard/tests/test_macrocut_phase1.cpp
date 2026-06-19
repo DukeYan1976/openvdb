@@ -13,12 +13,12 @@ protected:
 
 TEST_F(MacroCutPhase1Test, SinglePoint_GeneratesTasks) {
     GeometryDef geom{GeometryDef::BOX, Vec3d(0), Vec3d(10,10,10)};
-    ToleranceConfig config(1.0 / 30.0);
+    ToleranceConfig config(1.0 / 30.0, ToleranceConfig::INTERACTIVE, 30.0);
     auto ipw = IPWBuilder().build(geom, config);
 
     ToolDef tool{ToolType::BALL_END, 3.0, 0.0, 20.0};
     MoveSegment seg{Vec3d(5,5,9), Vec3d(5,5,9)};
-    ToolSweepSDF sdf(tool, seg);
+    ToolSweptSDF sdf(tool, seg);
     ToolSweepSurface surf(tool, seg);
 
     MacroCut macrocut;
@@ -41,12 +41,12 @@ TEST_F(MacroCutPhase1Test, SinglePoint_GeneratesTasks) {
 
 TEST_F(MacroCutPhase1Test, SinglePoint_TaskAABBCoversVoxel) {
     GeometryDef geom{GeometryDef::BOX, Vec3d(0), Vec3d(10,10,10)};
-    ToleranceConfig config(1.0 / 30.0);
+    ToleranceConfig config(1.0 / 30.0, ToleranceConfig::INTERACTIVE, 30.0);
     auto ipw = IPWBuilder().build(geom, config);
 
     ToolDef tool{ToolType::BALL_END, 3.0, 0.0, 20.0};
     MoveSegment seg{Vec3d(5,5,9), Vec3d(5,5,9)};
-    ToolSweepSDF sdf(tool, seg);
+    ToolSweptSDF sdf(tool, seg);
     ToolSweepSurface surf(tool, seg);
 
     MacroCut macrocut;
@@ -64,12 +64,12 @@ TEST_F(MacroCutPhase1Test, SinglePoint_TaskAABBCoversVoxel) {
 
 TEST_F(MacroCutPhase1Test, SinglePoint_ParamDomainCoversVoxel) {
     GeometryDef geom{GeometryDef::BOX, Vec3d(0), Vec3d(10,10,10)};
-    ToleranceConfig config(1.0 / 30.0);
+    ToleranceConfig config(1.0 / 30.0, ToleranceConfig::INTERACTIVE, 30.0);
     auto ipw = IPWBuilder().build(geom, config);
 
     ToolDef tool{ToolType::BALL_END, 3.0, 0.0, 20.0};
     MoveSegment seg{Vec3d(5,5,9), Vec3d(5,5,9)};
-    ToolSweepSDF sdf(tool, seg);
+    ToolSweptSDF sdf(tool, seg);
     ToolSweepSurface surf(tool, seg);
 
     MacroCut macrocut;
@@ -92,12 +92,12 @@ TEST_F(MacroCutPhase1Test, SinglePoint_ParamDomainCoversVoxel) {
 
 TEST_F(MacroCutPhase1Test, SinglePoint_ParamDomainIsConservative) {
     GeometryDef geom{GeometryDef::BOX, Vec3d(0), Vec3d(10,10,10)};
-    ToleranceConfig config(1.0 / 30.0);
+    ToleranceConfig config(1.0 / 30.0, ToleranceConfig::INTERACTIVE, 30.0);
     auto ipw = IPWBuilder().build(geom, config);
 
     ToolDef tool{ToolType::BALL_END, 3.0, 0.0, 20.0};
     MoveSegment seg{Vec3d(5,5,9), Vec3d(5,5,9)};
-    ToolSweepSDF sdf(tool, seg);
+    ToolSweptSDF sdf(tool, seg);
     ToolSweepSurface surf(tool, seg);
 
     MacroCut macrocut;

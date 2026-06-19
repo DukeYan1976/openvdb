@@ -15,13 +15,13 @@ protected:
 TEST_F(Phase34Test, RebuildLeaves_PointCountChanges) {
     // IPW0 + 切削
     GeometryDef geom{GeometryDef::BOX, Vec3d(0), Vec3d(10, 10, 10)};
-    ToleranceConfig config(1.0 / 30.0);
+    ToleranceConfig config(1.0 / 30.0, ToleranceConfig::INTERACTIVE, 30.0);
     auto ipw = IPWBuilder().build(geom, config);
     auto pointsBefore = openvdb::points::pointCount(ipw.microGrid->tree());
 
     ToolDef tool{ToolType::BALL_END, 3.0, 0.0, 20.0};
     MoveSegment seg{Vec3d(5, 5, 9), Vec3d(5, 5, 9)};
-    ToolSweepSDF sdf(tool, seg);
+    ToolSweptSDF sdf(tool, seg);
     ToolSweepSurface surf(tool, seg);
 
     MacroCut macrocut;
@@ -29,7 +29,7 @@ TEST_F(Phase34Test, RebuildLeaves_PointCountChanges) {
     auto tasks = macrocut.buildTaskList(cls, surf, config, ipw.macroGrid->transform());
 
     MicroCut microcut;
-    auto newBuffers = microcut.sampleNewSurface(tasks, surf, sdf, config);
+    auto newBuffers = microcut.sampleNewSurface(tasks, surf, sdf, config, ipw);
 
     // Phase 3+4: 重建
     microcut.rebuildLeaves(ipw, cls, newBuffers, sdf, config);
@@ -43,12 +43,12 @@ TEST_F(Phase34Test, RebuildLeaves_PointCountChanges) {
 
 TEST_F(Phase34Test, DeletedVoxels_NoPoints) {
     GeometryDef geom{GeometryDef::BOX, Vec3d(0), Vec3d(10, 10, 10)};
-    ToleranceConfig config(1.0 / 30.0);
+    ToleranceConfig config(1.0 / 30.0, ToleranceConfig::INTERACTIVE, 30.0);
     auto ipw = IPWBuilder().build(geom, config);
 
     ToolDef tool{ToolType::BALL_END, 3.0, 0.0, 20.0};
     MoveSegment seg{Vec3d(5, 5, 9), Vec3d(5, 5, 9)};
-    ToolSweepSDF sdf(tool, seg);
+    ToolSweptSDF sdf(tool, seg);
     ToolSweepSurface surf(tool, seg);
 
     MacroCut macrocut;
@@ -56,7 +56,7 @@ TEST_F(Phase34Test, DeletedVoxels_NoPoints) {
     auto tasks = macrocut.buildTaskList(cls, surf, config, ipw.macroGrid->transform());
 
     MicroCut microcut;
-    auto newBuffers = microcut.sampleNewSurface(tasks, surf, sdf, config);
+    auto newBuffers = microcut.sampleNewSurface(tasks, surf, sdf, config, ipw);
     microcut.rebuildLeaves(ipw, cls, newBuffers, sdf, config);
 
     // deleted voxels 不应有点
@@ -74,12 +74,12 @@ TEST_F(Phase34Test, DeletedVoxels_NoPoints) {
 
 TEST_F(Phase34Test, CutVoxels_OldPointsCulled) {
     GeometryDef geom{GeometryDef::BOX, Vec3d(0), Vec3d(10, 10, 10)};
-    ToleranceConfig config(1.0 / 30.0);
+    ToleranceConfig config(1.0 / 30.0, ToleranceConfig::INTERACTIVE, 30.0);
     auto ipw = IPWBuilder().build(geom, config);
 
     ToolDef tool{ToolType::BALL_END, 3.0, 0.0, 20.0};
     MoveSegment seg{Vec3d(5, 5, 9), Vec3d(5, 5, 9)};
-    ToolSweepSDF sdf(tool, seg);
+    ToolSweptSDF sdf(tool, seg);
     ToolSweepSurface surf(tool, seg);
 
     MacroCut macrocut;
@@ -87,7 +87,7 @@ TEST_F(Phase34Test, CutVoxels_OldPointsCulled) {
     auto tasks = macrocut.buildTaskList(cls, surf, config, ipw.macroGrid->transform());
 
     MicroCut microcut;
-    auto newBuffers = microcut.sampleNewSurface(tasks, surf, sdf, config);
+    auto newBuffers = microcut.sampleNewSurface(tasks, surf, sdf, config, ipw);
     microcut.rebuildLeaves(ipw, cls, newBuffers, sdf, config);
 
     // cut voxels中剩余的点：旧点SDF≥t应保留，SDF<t应被删

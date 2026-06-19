@@ -10,6 +10,22 @@ namespace midgard {
 using Vec3d = openvdb::Vec3d;
 using Vec3f = openvdb::Vec3f;
 
+// === 几何体定义 (毛坯) ===
+struct GeometryDef {
+    enum Type { BOX, CYLINDER, SPHERE, MESH };
+    Type type = BOX;
+    Vec3d origin{0, 0, 0};
+    Vec3d dims{0, 0, 0};       // BOX: length/width/height
+    double radius = 0;          // CYLINDER/SPHERE
+    double height = 0;          // CYLINDER
+};
+
+// === 采样点缓存 ===
+struct PointBuffer {
+    std::vector<Vec3f> positions;  // 世界坐标
+    std::vector<Vec3f> normals;    // 单位法线
+};
+
 // === 刀具定义 ===
 enum class ToolType : uint8_t { BALL_END, FLAT_END, BULL_NOSE };
 
@@ -38,7 +54,7 @@ struct ToleranceConfig {
     double chordalLimit;    // 弦高细分阈值
 
     int    halfwidth = 3;
-    double K = 30.0;        // V_macro / t 比例因子 (20~50)
+    double K = 10.0;        // V_macro / t 比例因子 (10~20 for smaller scales)
 
     enum Mode { INTERACTIVE, FINAL };
     Mode mode = INTERACTIVE;
@@ -46,7 +62,7 @@ struct ToleranceConfig {
     static constexpr double MIN_VOXEL_SIZE = 0.02;
     static constexpr double MAX_VOXEL_SIZE = 5.0;
 
-    explicit ToleranceConfig(double t, Mode m = INTERACTIVE, double k = 30.0)
+    explicit ToleranceConfig(double t, Mode m = INTERACTIVE, double k = 10.0)
         : user_t(t), K(k), mode(m)
     {
         voxelMacro   = std::clamp(K * t, MIN_VOXEL_SIZE, MAX_VOXEL_SIZE);
@@ -78,8 +94,10 @@ struct IPWState {
     openvdb::FloatGrid::Ptr macroGrid;
     openvdb::points::PointDataGrid::Ptr microGrid;
     ToleranceConfig config;
+    GeometryDef billetDef; // 原始毛坯解析定义
 
     IPWState(double tolerance) : config(tolerance) {}
+    IPWState(const ToleranceConfig& cfg) : config(cfg) {}
 };
 
 } // namespace midgard

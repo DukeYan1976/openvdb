@@ -4,7 +4,7 @@
 TEST(TypesTest, ToleranceConfigDerivation) {
     midgard::ToleranceConfig cfg(0.01);
     EXPECT_DOUBLE_EQ(cfg.user_t, 0.01);
-    EXPECT_DOUBLE_EQ(cfg.voxelMacro, 0.3);  // K=30, 30*0.01=0.3
+    EXPECT_DOUBLE_EQ(cfg.voxelMacro, 0.1);  // K=10, 10*0.01=0.1
     EXPECT_DOUBLE_EQ(cfg.baseStep, 0.1);     // 10*0.01
     EXPECT_DOUBLE_EQ(cfg.chordalLimit, 0.01);
 }

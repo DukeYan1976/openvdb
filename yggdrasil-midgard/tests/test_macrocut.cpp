@@ -27,7 +27,7 @@ TEST_F(MacroCutTest, NoMicroGrid_AllBoundaryIsNew) {
 
     ToolDef tool{ToolType::BALL_END, 5.0, 0.0, 30.0};
     MoveSegment seg{Vec3d(10, 10, 15), Vec3d(10, 10, 15)};
-    ToolSweepSDF sdf(tool, seg);
+    ToolSweptSDF sdf(tool, seg);
 
     MacroCut macrocut;
     auto cls = macrocut.classifyVoxels(ipw, sdf);
@@ -45,7 +45,7 @@ TEST_F(MacroCutTest, NoContact_AllEmpty) {
 
     ToolDef tool{ToolType::BALL_END, 5.0, 0.0, 30.0};
     MoveSegment seg{Vec3d(10, 10, 30), Vec3d(10, 10, 30)};
-    ToolSweepSDF sdf(tool, seg);
+    ToolSweptSDF sdf(tool, seg);
 
     MacroCut macrocut;
     auto cls = macrocut.classifyVoxels(ipw, sdf);
@@ -63,7 +63,7 @@ TEST_F(MacroCutTest, FullPenetration_MostlyDeleted) {
 
     ToolDef tool{ToolType::BALL_END, 10.0, 0.0, 30.0};
     MoveSegment seg{Vec3d(2, 2, 2), Vec3d(2, 2, 2)};
-    ToolSweepSDF sdf(tool, seg);
+    ToolSweptSDF sdf(tool, seg);
 
     MacroCut macrocut;
     auto cls = macrocut.classifyVoxels(ipw, sdf);
@@ -79,7 +79,7 @@ TEST_F(MacroCutTest, LinearPath_BoundaryOnThreshold) {
 
     ToolDef tool{ToolType::BALL_END, 3.0, 0.0, 20.0};
     MoveSegment seg{Vec3d(0, 10, 18), Vec3d(20, 10, 18)};
-    ToolSweepSDF sdf(tool, seg);
+    ToolSweptSDF sdf(tool, seg);
 
     MacroCut macrocut;
     auto cls = macrocut.classifyVoxels(ipw, sdf);
@@ -106,7 +106,7 @@ TEST_F(MacroCutTest, CSG_ActivatesNewVoxels) {
 
     ToolDef tool{ToolType::BALL_END, 5.0, 0.0, 30.0};
     MoveSegment seg{Vec3d(10, 10, 15), Vec3d(10, 10, 15)};
-    ToolSweepSDF sdf(tool, seg);
+    ToolSweptSDF sdf(tool, seg);
 
     MacroCut macrocut;
     auto cls = macrocut.classifyVoxels(ipw, sdf);
@@ -132,19 +132,18 @@ TEST_F(MacroCutTest, SinglePointBallEnd_Precise) {
     geom.dims = Vec3d(10, 10, 10);
 
     // t=0.033 → V=max(30*0.033, 0.02)=0.99→clamp=0.99, 太小
-    // 直接用K使得V=1: t=1/30=0.0333
-    ToleranceConfig config(1.0/30.0);  // V_macro = 1.0mm
+    // 直接用K使得V=1: t=1/30=0.0333, K=30
+    ToleranceConfig config(1.0/30.0, ToleranceConfig::INTERACTIVE, 30.0);  // V_macro = 1.0mm
     ASSERT_NEAR(config.voxelMacro, 1.0, 0.01);
 
     IPWBuilder builder;
     auto ipw = builder.build(geom, config);
     ASSERT_NE(ipw.microGrid, nullptr);
 
-    // 静态球头刀: 中心(5,5,9), R=3
-    // 球底Z=6, 与顶面(Z=10)相交处: Z=10, 相交圆半径=sqrt(9-1)=2.83mm
+    // 静态球头刀: 刀尖(5,5,6), R=3 => 球心(5,5,9)
     ToolDef tool{ToolType::BALL_END, 3.0, 0.0, 20.0};
-    MoveSegment seg{Vec3d(5, 5, 9), Vec3d(5, 5, 9)};  // 静态
-    ToolSweepSDF sdf(tool, seg);
+    MoveSegment seg{Vec3d(5, 5, 6), Vec3d(5, 5, 6)};  // 静态
+    ToolSweptSDF sdf(tool, seg);
 
     MacroCut macrocut;
     auto cls = macrocut.classifyVoxels(ipw, sdf);
@@ -152,28 +151,26 @@ TEST_F(MacroCutTest, SinglePointBallEnd_Precise) {
     double V = config.voxelMacro;
     double threshold = V * std::sqrt(3.0) / 2.0;  // ≈ 0.866mm
 
-    // --- 验证 deleted: 这些voxel中心距球心 < R - threshold ---
-    // 球心(5,5,9), 完全在球内的voxel中心: dist_to_center < 3 - 0.866 = 2.134mm
+    // --- 验证 deleted: 这些voxel中心 SDF < -threshold ---
     for (const auto& coord : cls.deleted) {
         Vec3d wp = ipw.macroGrid->indexToWorld(coord);
-        double dist = (wp - Vec3d(5,5,9)).length();
-        // SDF = dist - R, 要求 SDF < -threshold → dist < R - threshold = 2.134
-        EXPECT_LT(dist, 3.0 - threshold + 1e-6)
-            << "deleted voxel at " << coord << " dist=" << dist;
+        double s = sdf.eval(wp);
+        EXPECT_LT(s, -threshold + 1e-6)
+            << "deleted voxel at " << coord << " SDF=" << s;
     }
 
-    // --- 验证 cut+newBoundary: 这些voxel中心距球心在 [R-threshold, R+threshold] ---
+    // --- 验证 cut+newBoundary: 这些voxel中心 SDF 在 [-threshold, threshold] ---
     for (const auto& coord : cls.cut) {
         Vec3d wp = ipw.macroGrid->indexToWorld(coord);
-        double dist = (wp - Vec3d(5,5,9)).length();
-        EXPECT_GE(dist, 3.0 - threshold - 1e-6);
-        EXPECT_LE(dist, 3.0 + threshold + 1e-6);
+        double s = sdf.eval(wp);
+        EXPECT_GE(s, -threshold - 1e-6);
+        EXPECT_LE(s, threshold + 1e-6);
     }
     for (const auto& coord : cls.newBoundary) {
         Vec3d wp = ipw.macroGrid->indexToWorld(coord);
-        double dist = (wp - Vec3d(5,5,9)).length();
-        EXPECT_GE(dist, 3.0 - threshold - 1e-6);
-        EXPECT_LE(dist, 3.0 + threshold + 1e-6);
+        double s = sdf.eval(wp);
+        EXPECT_GE(s, -threshold - 1e-6);
+        EXPECT_LE(s, threshold + 1e-6);
     }
 
     // --- 验证 cut vs newBoundary 的区分 ---

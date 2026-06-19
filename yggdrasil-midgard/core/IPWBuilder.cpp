@@ -91,15 +91,54 @@ openvdb::points::PointDataGrid::Ptr IPWBuilder::buildMicroGrid(
     return pointGrid;
 }
 
+PointBuffer IPWBuilder::sampleBoundary(const GeometryDef& geom, const openvdb::BBoxd& region) {
+    PointBuffer buffer;
+    
+    if (geom.type == GeometryDef::BOX) {
+        Vec3d bmin = geom.origin;
+        Vec3d bmax = geom.origin + geom.dims;
+        
+        struct Face { Vec3d normal; double val; int axis; };
+        Face faces[6] = {
+            {{-1, 0, 0}, bmin.x(), 0}, {{1, 0, 0}, bmax.x(), 0},
+            {{0, -1, 0}, bmin.y(), 1}, {{0, 1, 0}, bmax.y(), 1},
+            {{0, 0, -1}, bmin.z(), 2}, {{0, 0, 1}, bmax.z(), 2}
+        };
+
+        for (const auto& f : faces) {
+            if (f.val >= region.min()[f.axis] && f.val <= region.max()[f.axis]) {
+                int a1 = (f.axis + 1) % 3;
+                int a2 = (f.axis + 2) % 3;
+                
+                double intersect_min1 = std::max(region.min()[a1], bmin[a1]);
+                double intersect_max1 = std::min(region.max()[a1], bmax[a1]);
+                double intersect_min2 = std::max(region.min()[a2], bmin[a2]);
+                double intersect_max2 = std::min(region.max()[a2], bmax[a2]);
+                
+                if (intersect_min1 <= intersect_max1 && intersect_min2 <= intersect_max2) {
+                    Vec3d p;
+                    p[f.axis] = f.val;
+                    p[a1] = (intersect_min1 + intersect_max1) * 0.5;
+                    p[a2] = (intersect_min2 + intersect_max2) * 0.5;
+                    
+                    buffer.positions.push_back(Vec3f(p));
+                    buffer.normals.push_back(Vec3f(f.normal));
+                }
+            }
+        }
+    }
+    
+    return buffer;
+}
+
 IPWState IPWBuilder::build(const GeometryDef& geom, const ToleranceConfig& config) {
-    IPWState ipw(config.user_t);
-    ipw.config = config;
+    IPWState ipw(config);
+    ipw.billetDef = geom; // 存储原始定义
 
     ipw.macroGrid = buildMacroGrid(geom, config);
     if (!ipw.macroGrid) return ipw;
 
     // MicroGrid: 创建空grid（保留transform用于后续切削写入）
-    // 毛坯表面由MacroGrid mesh表示，不需要初始pointdata
     ipw.microGrid = openvdb::points::PointDataGrid::create();
     ipw.microGrid->setTransform(ipw.macroGrid->transformPtr());
 

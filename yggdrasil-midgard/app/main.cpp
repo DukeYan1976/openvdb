@@ -1,6 +1,6 @@
 #include "debug/RtDebugSys.h"
 #include "core/Types.h"
-#include "core/ToolSweepSDF.h"
+#include "core/ToolSweptSDF.h"
 #include "core/ToolSweepSurface.h"
 #include "core/MacroCut.h"
 #include "core/MicroCut.h"
@@ -85,7 +85,7 @@ int main(int argc, char* argv[]) {
 
     ToolDef tool{ToolType::BALL_END, 5.0, 0.0, 30.0};
     MoveSegment seg{Vec3d(0, 10, 18), Vec3d(20, 10, 18)};
-    ToolSweepSDF sdf(tool, seg);
+    ToolSweptSDF sdf(tool, seg);
 
     double pathLen = (seg.end - seg.start).length();
     auto bbox = sdf.boundingBox();
@@ -164,8 +164,7 @@ int main(int argc, char* argv[]) {
     auto tasks = macrocut.buildTaskList(cls, surface, config, ipw.macroGrid->transform());
 
     std::cout << "  Tasks generated: " << tasks.size() << "\n"
-              << "  vSplit: " << surface.vSplit() << "\n"
-              << "  hasMidPatch: " << (surface.hasMidPatch() ? "yes" : "no") << "\n";
+              << "  v1: " << surface.v1() << ", v2: " << surface.v2() << "\n";
 
     // 打印前3个task的参数域用于调试
     for (size_t i = 0; i < std::min((size_t)3, tasks.size()); ++i) {
@@ -190,8 +189,7 @@ int main(int argc, char* argv[]) {
 
     // Phase 2: 四叉树采样
     MicroCut microcut;
-    auto buffers = microcut.sampleNewSurface(tasks, surface, sdf, config,
-        openvdb::gridPtrCast<openvdb::FloatGrid>(billetOriginal));
+    auto buffers = microcut.sampleNewSurface(tasks, surface, sdf, config, ipw);
 
     int totalNewPoints = 0;
     for (const auto& [coord, buf] : buffers) totalNewPoints += buf.positions.size();
@@ -283,16 +281,20 @@ int main(int argc, char* argv[]) {
     exportMicroPoints(ipw.microGrid, (objDir / "cut_surface_points.obj").string());
     std::cout << "  [3] cut_surface_points.obj\n";
 
+    // 4. PLY 点云 (位置+法向, 通用格式)
+    exportMicroPLY(ipw.microGrid, (objDir / "cut_surface_points.ply").string());
+    std::cout << "  [4] cut_surface_points.ply\n";
+
     std::cout << "\n  Output: " << objDir.string() << "\n";
 
-    // 导出ToolSweepSurface参数面为OBJ
-    {
-        std::ofstream sout((objDir / "sweep_surface_param.obj").string());
-        int N = 50;
+    // 导出多刀型高精度参数面
+    auto exportHighRes = [&](const ToolDef& t, const MoveSegment& s, const std::string& name) {
+        ToolSweepSurface surf(t, s);
+        const int N = 200;
+        std::ofstream sout((objDir / (name + ".obj")).string());
         for (int i = 0; i <= N; ++i)
             for (int j = 0; j <= N; ++j) {
-                double u = (double)i/N, v = (double)j/N;
-                Vec3d p = surface.eval(u,v);
+                Vec3d p = surf.eval((double)i/N, (double)j/N);
                 sout << "v " << p.x() << " " << p.y() << " " << p.z() << "\n";
             }
         for (int i = 0; i < N; ++i)
@@ -300,8 +302,13 @@ int main(int argc, char* argv[]) {
                 int a=i*(N+1)+j+1, b=a+1, c=a+(N+1), d=c+1;
                 sout << "f " << a << " " << b << " " << d << " " << c << "\n";
             }
-        std::cout << "  [4] sweep_surface_param.obj\n";
-    }
+        std::cout << "  [5] " << name << ".obj\n";
+    };
+
+    exportHighRes(tool, seg, "surface_ball_end");
+    exportHighRes({ToolType::BULL_NOSE, 5.0, 2.0, 20.0}, seg, "surface_bull_nose");
+    exportHighRes({ToolType::FLAT_END, 5.0, 0.0, 20.0}, seg, "surface_flat_end");
+
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     return (deletedOK && boundaryOK) ? 0 : 1;
 }

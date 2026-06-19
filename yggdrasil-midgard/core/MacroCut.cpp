@@ -11,7 +11,7 @@ namespace midgard {
 /// 在指定范围内光栅化刀具解析SDF为FloatGrid (与MacroGrid同分辨率)
 /// 只写入narrowband内的voxel (|sdf| < background)
 static openvdb::FloatGrid::Ptr rasterizeToolGrid(
-    const ToolSweepSDF& tool,
+    const ToolSweptSDF& tool,
     const openvdb::math::Transform::Ptr& xform,
     int halfwidth,
     const openvdb::BBoxd& cutBBox)
@@ -62,7 +62,7 @@ static openvdb::FloatGrid::Ptr rasterizeToolGrid(
 ///           - deleted: 完全在刀具内部 (SDF < -threshold)
 ///           - cut: 在切削边界且MicroGrid有既有点数据 (需剔除旧点+补新点)
 ///           - newBoundary: 在切削边界但MicroGrid无数据 (需从零生成点集)
-CutClassification MacroCut::classifyVoxels(IPWState& ipw, const ToolSweepSDF& tool) {
+CutClassification MacroCut::classifyVoxels(IPWState& ipw, const ToolSweptSDF& tool) {
     auto& macroGrid = ipw.macroGrid;
     const double V = macroGrid->voxelSize()[0];
     const double threshold = V * std::sqrt(3.0) / 2.0;
@@ -115,7 +115,13 @@ CutClassification MacroCut::classifyVoxels(IPWState& ipw, const ToolSweepSDF& to
             if (toolSdf < -threshold) {
                 result.deleted.push_back(coord);
             } else if (toolSdf <= threshold) {
-                // 边界voxel: 靠近扫掠面（不限制macroSdf，切削槽底部也要覆盖）
+                // 打印少量边界 Voxel 信息用于诊断
+                static int logCount = 0;
+                if (logCount < 5) {
+                    DEBUG_INFO_OUT("Boundary Voxel: coord=[" + std::to_string(coord.x()) + "," + std::to_string(coord.y()) + "," + std::to_string(coord.z()) + "] SDF=" + std::to_string(toolSdf));
+                    logCount++;
+                }
+
                 bool hasExistingData = false;
                 if (microAcc) {
                     auto* mleaf = microAcc->probeConstLeaf(coord);
@@ -146,10 +152,10 @@ CutClassification MacroCut::classifyVoxels(IPWState& ipw, const ToolSweepSDF& to
     // ─── Step 4: CSG 差集与拓扑更新 ──────────────────────────────────────
     openvdb::tools::csgDifference(*macroGrid, *toolGrid);
 
-    // levelSetRebuild 暂时禁用（引入空气侧额外 narrowband）
-    // macroGrid = openvdb::tools::levelSetRebuild(*macroGrid, 0.0f,
-    //     halfwidth * macroGrid->voxelSize()[0]);
-    // macroGrid->tree().prune();
+    // levelSetRebuild: 恢复窄带，确保拓扑一致性
+    ipw.macroGrid = openvdb::tools::levelSetRebuild(*macroGrid, 0.0f,
+        static_cast<float>(halfwidth * V));
+    ipw.macroGrid->tree().prune();
 
     auto t3 = std::chrono::high_resolution_clock::now();
 
@@ -219,18 +225,15 @@ std::vector<VoxelTask> MacroCut::buildTaskList(
     auto t0 = std::chrono::high_resolution_clock::now();
 
     // ─── 参数面统一分块 → 反向查询匹配 voxel ─────────────────────
-    // 分块数动态计算: 使每个参数块映射的3D范围≈1-2个voxel大小
-    openvdb::BBoxd fullBBox = surface.bbox(0, 1, 0, 1);
-    openvdb::Vec3d fullExtent = fullBBox.max() - fullBBox.min();
-    // u方向≈周长(取XY平面最大跨度*π), v方向≈轴向展开长
-    double diameter = std::max(fullExtent.x(), fullExtent.y());
-    double circumference = M_PI * diameter;
-    double axialLength = fullExtent.length();
+    // 基于物理弧长动态计算分块数: 使每个参数块映射的 3D 范围对应 1~1.5 个 Voxel
+    // N = TotalArc / (K * V), K 取 1.0~1.5
+    double arcU = surface.totalArcU();
+    double arcV = surface.totalArcV();
 
-    int N_U = std::clamp((int)std::ceil(circumference / V), 4, 16);
-    int N_V = std::clamp((int)std::ceil(axialLength / V), 4, 16);
+    int N_U = std::clamp((int)std::ceil(arcU / V), 8, 64);
+    int N_V = std::clamp((int)std::ceil(arcV / V), 8, 128);
 
-    const double margin = V * 0.9;  // 裕量外扩（覆盖bbox采样误差）
+    const double margin = V * std::sqrt(3.0);  // 体素对角线长度，确保覆盖边界体素
     const double du = 1.0 / N_U;
     const double dv = 1.0 / N_V;
 
