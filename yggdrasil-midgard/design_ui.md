@@ -1,711 +1,463 @@
-# Yggdrasil-Midgard 多轴刀路仿真 — 集成界面设计方案
+# Yggdrasil-Midgard 仿真界面设计
 
-> 版本：v1.0（Final） | 日期：2026-06-19
-> 状态：**已审查通过**
-> 原则：**简洁就是美**。
+> 版本：v2.0 | 日期：2026-06-19
+> 原则：**Simplicity is beautiful.**
 
 ---
 
 ## 修订记录
 
-| 版本 | 时间 | 修改内容 | 触发原因 |
-|------|------|----------|----------|
-| v0.1 | 11:00 | 初始设计：三窗口（Settings/SimulationControl/Output） | 用户初始需求 |
-| v0.2 | 11:26 | 增加单步模式、顶部居中布局、Path区块前置、Demo场景、Debug窗口 | 用户反馈：位置调整、单步执行、.cls格式、IT-1 Demo |
-| v0.3 | 11:34 | 调整布局：Settings+Debug左侧，SimControl顶部右侧，Output右侧；增加布局持久化 | 用户反馈：窗口停靠位置调整 |
-| v0.4 | 12:13 | 精简内容，增加字体DPI自适应，明确Speed与feedrate关系 | Loop Engineering 自检 |
-| v0.5 | 13:07 | 增加算法调试显示接口（IDebugDisplay） | 用户反馈：算法调试可视化需求 |
-| **v1.0 Final** | 13:47 | 审查通过，形成正式设计文档 1.0 | 用户确认 |
+| 版本 | 日期 | 修改内容 |
+|------|------|----------|
+| v1.0 | 06-19 | 初始设计（过度工程版） |
+| v2.0 | 06-19 | 精简重构：删除 IProgressReporter、精简 IDebugDisplay 至 3 方法、合并 interface 到 core、修复交互冲突 |
+| v2.1 | 06-19 | 增加 §10 异步计算-渲染架构（可选，后期实现） |
+| v2.2 | 06-19 | 修正刀具设计：分离刀具库与路径段，避免数据冗余 |
 
 ---
 
-## 审查意见与处理
+## 1. 技术栈
 
-| # | 审查意见 | 处理状态 | 修改位置 |
-|---|----------|----------|----------|
-| 1 | 精度 `t` 放在 Path 区块 | ✅ 已采纳 | 3.1 Path |
-| 2 | 需要单步执行，刀具路径一段一段执行 | ✅ 已采纳 | 4. Simulation Control - Step模式 |
-| 3 | UI字体根据屏幕分辨率自适应 | ✅ 已采纳 | 2.1 布局 - 字体说明 |
-| 4 | 支持 `*.cls` 格式 | ✅ 已采纳 | 3.1 Path - Load .cls |
-| 5 | 预设Demo场景，参考IT-1测试案例 | ✅ 已采纳 | 3.1 Path - Load Demo |
-| 6 | 增加专门Debug控制窗口，简化Voxel Inspector | ✅ 已采纳 | 6. Debug窗口 |
-| 7 | 仿真控制窗口默认在顶部右侧 | ✅ 已采纳 | 2.1 布局 |
-| 8 | Settings和Debug停靠左侧，Output右侧 | ✅ 已采纳 | 2.1 布局 |
-| 9 | 用户调整后布局下次启动保留 | ✅ 已采纳 | 2.1 布局 - imgui.ini |
-| 10 | Path区块放在Settings最前面 | ✅ 已采纳 | 3. Settings - Path默认展开 |
-| 11 | 设计抽象Display接口供算法调试 | ✅ 已采纳 | 7. 算法调试显示接口 |
-| 12 | Debug窗口缺少设计说明 | ✅ 已采纳 | 6. Debug窗口（本节补全） |
-| 13 | 增加 IProgressReporter 接口，支持算法进度显示 | ✅ 已采纳 | 8. 算法进度报告接口（新增） |
+OpenGL 3.3 + GLFW + GLAD + ImGui。借鉴 `yggdrasil/app/main.cpp` 渲染栈。
 
 ---
 
-## 1. 技术参考
-
-借鉴 `yggdrasil/app/main.cpp` 的渲染栈（OpenGL 3.3 + GLFW + GLAD + ImGui），不继承其 UI 功能。
-
----
-
-## 2. 布局（默认停靠，用户调整持久化）
+## 2. 布局
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│  3D Viewport                                                 │
+│                      3D Viewport                             │
 │                                                              │
-│  ┌─ Settings ────────┐  ┌─ Simulation Control ─────────────┐ │
-│  │ ▼ Path            │  │ ▶ ⏸ ⏹ ⏮ ⏭ [████░░] 60%        │ │
-│  │ ▶ Billet          │  │ Step[x] Speed[===]1x             │ │
-│  │ ▶ Tool            │  └──────────────────────────────────┘ │
-│  └────────────────────┘  ┌─ Output ─────────────────────────┐ │
-│  ┌─ Debug ────────────┐  │ [11:00:01] [Build]...            │ │
-│  │ [x] Inspector      │  │ [11:00:02] [Cut 744/1240]        │ │
-│  │ Depth: 0 [+][-]    │  │ ...                              │ │
-│  │ [x] RtDebug On     │  │ ───────────────────────────────  │ │
-│  │ Coord: (123,45,67) │  │ Voxels: 47,726  Mem: 128 MB      │ │
-│  └────────────────────┘  └──────────────────────────────────┘ │
+│  ┌─ Settings ─────┐     ┌─ Simulation Control ─────────────┐│
+│  │ ▼ Path         │     │ ▶ ⏸ ⏹ ⏮ ⏭ [████░░] 60% 744/1240││
+│  │ ▶ Billet       │     │ [x]Step   Speed[===]1x           ││
+│  │ ▶ Tool         │     └──────────────────────────────────┘│
+│  └─────────────────┘     ┌─ Output ────────────────────────┐│
+│  ┌─ Debug ─────────┐     │ [11:00:01] Cut 744/1240  28ms   ││
+│  │ [x] Inspector   │     │ Voxels:47726 Surfels:17688      ││
+│  │ [x] RtDebug On  │     └─────────────────────────────────┘│
+│  │ SDF: -0.023     │                                        │
+│  └─────────────────┘                                        │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-| 窗口 | 默认位置 | 持久化 |
-|------|----------|--------|
-| Settings | 左上 | imgui.ini |
-| Simulation Control | 顶部右侧（Settings 右侧） | imgui.ini |
-| Output | 右侧 | imgui.ini |
-| Debug | 左下（Settings 下方） | imgui.ini |
-
-**字体**：ImGui 默认字体根据 `io.FontGlobalScale` 自动适配屏幕 DPI（Retina 2x，普通 1x）。
+- 所有窗口可拖拽停靠，布局通过 `imgui.ini` 持久化
+- 字体：`io.FontGlobalScale` 按屏幕 DPI 自适应
 
 ---
 
-## 3. Settings 窗口
+## 3. Settings
 
-Path 区块默认展开，其余折叠。
+Path 默认展开，其余折叠。
 
 ### 3.1 Path
 
+| 控件 | 说明 |
+|------|------|
+| Load .cls | 加载刀路文件（含刀具表+路径段） |
+| Load Demo | IT-1 预设（50×50×20 Box, BallEnd R=5, 单段X向, t=0.01mm） |
+| Tolerance t | 用户容差，可修改后 Recalculate |
+| Show Path | 显示开关 |
+| Segments | 只读，总段数 |
+| Current Tool | 只读，当前段使用的刀具（从刀具库索引） |
+
+### 3.2 Tool Library（折叠）
+
+| 控件 | 说明 |
+|------|------|
+| Tool List | 刀具库列表，点击选中 |
+| Type[Ball/Flat/Bull] | 选中刀具的类型 |
+| R, r, H | 选中刀具的几何参数 |
+| Add / Remove | 增删刀具 |
+
+### 3.3 Billet（折叠）
+
+Type[Box/Cyl/Mesh], Size, Origin, Alpha, Show
+
+---
+
+## 4. Simulation Control
+
 ```
-┌─ Path ─────────────────────┐
-│ [x] Show Path [ ] Axis     │
-│ Col [■] [■]                │
-│ [Load .cls...]  test.cls   │
-│ Segments: 1,240            │
-│ ─────────────────          │
-│ Tolerance t: [0.05] mm     │
-│ d_v: 0.0500  D_v: 0.500    │
-│ N: 4  Mode: DUAL           │
-│ [Recalculate]              │
-│ [Load Demo]                │
-└───────────────────────────┘
+▶ ⏸ ⏹ ⏮ ⏭   [████████░░░░] 60%   744/1240   [x]Step   Speed[===]1x
 ```
 
 | 控件 | 说明 |
 |------|------|
-| Show Path / Axis | 显示开关 |
-| Load .cls... | 加载刀路 |
-| Tolerance t | 继承 CAM，可修改 |
-| Recalculate | 重算分辨率配置 |
-| **Load Demo** | 加载 IT-1 预设场景 |
+| ▶ ⏸ ⏹ | Play / Pause / Stop |
+| ⏮ ⏭ | 回退/前进一段 |
+| Step | ON时按▶执行1段后暂停 |
+| Speed | 段间延迟缩放：1x=按feedrate实时，10x=快进10倍 |
 
-**Demo 场景（IT-1 单切精度验证）**：
-- 毛坯：50×50×20 mm Box
-- 刀具：球头刀 R=5mm
-- 刀路：X 单段 (0,0,18)→(50,0,18)，切深 2mm
-- 容差：t=0.01mm
+**状态机**: IDLE → RUNNING → PAUSED → IDLE。RUNNING时Settings灰显。
 
-### 3.2 Billet（折叠）
-
-Show, Alpha, Color, Type[Box/Cylinder/Mesh], Size[3], Origin[3], [Apply]
-
-### 3.3 Tool（折叠）
-
-Show, Color, Type[Ball/Flat/Bull], R, r, H
+**取消**: Stop按钮设置 `cancelled=true`，主循环段间检查：
+```cpp
+for (auto& seg : segments) {
+    if (cancelled) break;
+    simulate(seg);
+    updateProgress(++current, total);
+}
+```
 
 ---
 
-## 4. Simulation Control 窗口
+## 5. Output
 
-```
-┌─ Simulation Control ───────────────────────────────────────┐
-│ ▶ ⏸ ⏹ ⏮ ⏭  [████████░░░░] 60%  744/1240  [x]Step  Speed[===]1x │
-└────────────────────────────────────────────────────────────┘
-```
+- 日志：自动滚动，500行上限，颜色分级（Build蓝 / Cut绿 / Error红）
+- 统计：Voxels / Surfels / Mem / Volume / Last(ms) / Avg(ms)
+- 每段切削后更新
 
-| 控件 | 说明 |
+---
+
+## 6. Debug
+
+### 6.1 Voxel Inspector
+
+- **交互**：Shift+左键点击拾取（避免与3D导航冲突）
+- 显示：Coord / SDF / Surfels 数量
+- 3D视口中高亮选中voxel黄色线框
+
+### 6.2 RtDebug
+
+| 控件 | 映射 |
 |------|------|
-| ▶ ⏸ ⏹ ⏮ ⏭ | 播放/暂停/停止/进退 |
-| Progress | 进度条 + 百分比 |
-| Segment | 当前/总段 |
-| Step | 单步开关。ON：按 ▶ 执行 1 个 move 段后暂停 |
-| Speed | 0.25x ~ 10x，连续模式下 feedrate × speedMultiplier |
-
-**状态机**：
-- IDLE → Play → RUNNING → Pause → PAUSED → Stop → IDLE
-- RUNNING 时 Settings 灰显
+| ON/OFF | `Debugger::Activate / Deactivate` |
+| Level [On/Verbose] | `_debugLevel` |
 
 ---
 
-## 5. Output 窗口
+## 7. 调试显示接口
 
-```
-┌─ Output ──────────────────┐
-│ [11:00:01] [Build] Billet │
-│ [11:00:02] [Cut 744/1240] │
-│ ...                       │
-│ [Clear] [Save]            │
-│ ───────────────────────── │
-│ Voxels: 47,726            │
-│ Surfels: 12,340           │
-│ Mem: 128 MB               │
-│ Volume: 12,450 mm³        │
-│ Last: 28 ms  Avg: 25 ms   │
-└───────────────────────────┘
-```
+### 7.1 设计
 
-- 日志：自动滚动，500 行上限，颜色分级（Build蓝/Cut绿/Error红）
-- 统计：每段切削后更新
+- 定义在 `core/IDebugDisplay.h`，算法代码可选调用
+- `g_debugDisplay == nullptr` 时零开销
+- UI 环境注入实现；无 UI 时不链接
 
----
-
-## 6. Debug 窗口
-
-> 左侧 Settings 下方，简化 Inspector + RtDebug 控制。
-> 与 `RtDebugSys` 联动：Inspector 显示 3D 拾取信息，RtDebug 控制算法日志级别。
-
-```
-┌─ Debug ────────────────────┐
-│ [x] Voxel Inspector        │
-│   Depth: 0  [+][-]         │
-│ ─────────────────          │
-│ [x] RtDebug                │
-│ Level: [On ▼]              │
-│ ─────────────────          │
-│ Coord: (123, 45, 67)       │
-│ SDF: -0.0234               │
-│ Surfels: 4                 │
-└───────────────────────────┘
-```
-
-### 6.1 Voxel Inspector（简化）
-
-| 控件 | 说明 |
-|------|------|
-| Voxel Inspector | 总开关。关闭时 3D 视图不拾取 voxel |
-| Depth +/- | 循环深度。鼠标悬停 voxel 时，用 +/- 切换拾取深度 |
-| Coord | 当前 voxel 的网格坐标（只读） |
-| SDF | 有符号距离值（只读） |
-| Surfels | 该 voxel 内 surfel 数量（只读） |
-
-**交互**：鼠标悬停 3D 视图 → 自动 ray pick → 显示 voxel 信息。无需左键点击，用 +/- 按钮循环深度。
-
-### 6.2 RtDebug 控制
-
-| 控件 | 说明 |
-|------|------|
-| RtDebug | 总开关。映射 `Debugger::Activate/Deactivate` |
-| Level | Off / On / Verbose。映射 `_debugLevel` |
-
-**联动逻辑**：
-- RtDebug OFF → `DEBUG_SECTION` 宏不执行，算法不输出调试信息
-- RtDebug ON → `DEBUG_SECTION` 执行，算法输出到 `DebugInfo.txt`
-- Verbose → 额外输出 `DEBUG_SECTION_VERBOSE` 内容
-
-### 6.3 与算法调试显示接口的协作
-
-Debug 窗口是**控制面板**，算法调试显示接口（`IDebugDisplay`）是**数据通道**：
-- Debug 窗口的 Inspector 开关，控制是否拾取 voxel 并显示
-- RtDebug 的 tag 系统，控制算法中哪些中间数据通过 `g_debugDisplay` 绘制到 3D 视图
-- 两者独立：可以只开 Inspector 看 SDF，或只开 RtDebug 看算法输出，或同时开启
-
----
-
-## 7. 算法调试显示接口（核心设计）
-
-### 7.1 设计目标
-
-- 在 `core` 中定义抽象接口，算法代码全局可用
-- 集成 UI 环境下，实现该接口并注入引擎
-- 无 UI 时指针为 `nullptr`，显示代码零开销
-- 与 `RtDebugSys` 配合，按 tag 条件显示中间数据
-
-### 7.2 接口定义（`interface/DebugDisplay.h`）
+### 7.2 接口（3个方法，够用）
 
 ```cpp
+// core/IDebugDisplay.h
 #pragma once
-#include "Types.h"
-#include <vector>
-#include <memory>
+#include <cstddef>
+#include <cstdint>
 
 namespace midgard {
 
-/// 调试显示抽象接口
-/// 由 UI 层实现，通过指针注入引擎。nullptr = 无显示
+struct Vec3f { float x, y, z; };
+
 class IDebugDisplay {
 public:
     virtual ~IDebugDisplay() = default;
 
-    /// 批量 BBox（如 LeafNode 集合、任务分块）
-    virtual void drawBBoxes(const std::vector<openvdb::BBoxd>& boxes,
-                            uint32_t color = 0xFF00FFFF,  // 默认黄色
-                            float lineWidth = 1.0f) = 0;
-
-    /// 单个 BBox（如当前聚焦 voxel、刀具包围盒）
-    virtual void drawBBox(const openvdb::BBoxd& box,
-                          uint32_t color = 0xFF00FFFF,
-                          float lineWidth = 1.5f) = 0;
-
-    /// 点+法向集（如 surfel 点云、采样点）
-    virtual void drawPoints(const std::vector<Vec3d>& points,
-                            const std::vector<Vec3d>& normals,
-                            uint32_t color = 0xFF3366FF,   // 默认蓝色
-                            float pointSize = 3.0f) = 0;
-
-    /// 无 normals 的点云
-    virtual void drawPoints(const std::vector<Vec3d>& points,
-                            uint32_t color = 0xFF3366FF,
-                            float pointSize = 3.0f) = 0;
-
-    /// 三角片数据（如局部重建 mesh、刀具 mesh）
-    virtual void drawTriangles(const std::vector<Vec3d>& vertices,
-                               const std::vector<uint32_t>& indices,
-                               uint32_t color = 0xFF66CC33,  // 默认绿色
-                               float alpha = 0.8f) = 0;
-
-    /// 线段（如刀轴方向、法线指示）
-    virtual void drawLines(const std::vector<Vec3d>& points,  // 每 2 个点一条线段
-                           uint32_t color = 0xFFFFFFFF,
-                           float lineWidth = 1.0f) = 0;
-
-    /// 箭头（如刀轴方向、梯度方向）
-    virtual void drawArrow(const Vec3d& from, const Vec3d& to,
-                           uint32_t color = 0xFFFFFFFF,
-                           float lineWidth = 1.5f,
-                           float headSize = 2.0f) = 0;
-
-    /// 清除该 tag 的所有显示数据（按帧或按调用清理）
-    virtual void clear(const std::string& tag = "") = 0;
+    virtual void drawLines(const Vec3f* data, size_t count, uint32_t color) = 0;
+    virtual void drawPoints(const Vec3f* data, size_t count, uint32_t color) = 0;
+    virtual void drawTriangles(const Vec3f* verts, const uint32_t* indices, size_t triCount, uint32_t color) = 0;
+    virtual void clear() = 0;
 };
 
-/// 全局显示指针。UI 初始化时注入，无 UI 时为 nullptr
-extern std::shared_ptr<IDebugDisplay> g_debugDisplay;
+extern IDebugDisplay* g_debugDisplay;
 
 } // namespace midgard
+
+// 编译隔离宏
+#ifdef MIDGARD_DEV
+  #define DEBUG_DRAW(code) do { if (midgard::g_debugDisplay) { code; } } while(0)
+#else
+  #define DEBUG_DRAW(code) ((void)0)
+#endif
 ```
 
-### 7.3 引擎中的使用模式
+### 7.3 使用模式
 
 ```cpp
-// core/MacroCut.cpp 示例
-void MacroCut::classifyVoxels(IPWState& ipw, const ToolSweptSDF& tool) {
-    // ... 正常计算 ...
-
-    DEBUG_SECTION(MACRO_CUT) {
-        // 仅当 RtDebug tag 激活且显示接口存在时显示
-        if (g_debugDisplay) {
-            std::vector<openvdb::BBoxd> taskBoxes;
-            for (const auto& task : tasks) {
-                taskBoxes.push_back(task.aabb);
-            }
-            g_debugDisplay->clear("macro_tasks");
-            g_debugDisplay->drawBBoxes(taskBoxes, 0xFF00FFFF, 1.0f);
-        }
+// core/MacroCut.cpp
+DEBUG_SECTION(MACRO_CUT) {
+    if (g_debugDisplay) {
+        // 画所有task的voxel bbox (12条线段/box)
+        std::vector<Vec3f> lines;
+        for (auto& t : tasks) appendBBoxLines(lines, t.aabb);
+        g_debugDisplay->drawLines(lines.data(), lines.size(), 0xFF00FFFF);
     }
 }
 ```
 
-### 7.4 UI 层实现（`app/renderers/DebugDisplayImpl.h`）
+### 7.4 约束
 
-```cpp
-#pragma once
-#include "core/DebugDisplay.h"
-#include <map>
-#include <string>
-
-namespace midgard {
-
-/// OpenGL 实现：将调试数据缓存为 GPU buffer，每帧渲染
-class DebugDisplayImpl : public IDebugDisplay {
-public:
-    void drawBBoxes(const std::vector<openvdb::BBoxd>& boxes,
-                    uint32_t color, float lineWidth) override;
-    void drawBBox(const openvdb::BBoxd& box,
-                  uint32_t color, float lineWidth) override;
-    void drawPoints(const std::vector<Vec3d>& points,
-                    const std::vector<Vec3d>& normals,
-                    uint32_t color, float pointSize) override;
-    void drawPoints(const std::vector<Vec3d>& points,
-                    uint32_t color, float pointSize) override;
-    void drawLines(const std::vector<Vec3d>& points,
-                   uint32_t color, float lineWidth) override;
-    void drawArrow(const Vec3d& from, const Vec3d& to,
-                   uint32_t color, float lineWidth, float headSize) override;
-    void drawTriangles(const std::vector<Vec3d>& vertices,
-                       const std::vector<uint32_t>& indices,
-                       uint32_t color, float alpha) override;
-    void clear(const std::string& tag) override;
-
-    /// 由 SceneRenderer 每帧调用
-    void render(const float mvp[16]);
-
-private:
-    struct Batch {
-        GLuint vao = 0, vbo = 0, ebo = 0;
-        int count = 0;
-        uint32_t color = 0xFFFFFFFF;
-        float lineWidth = 1.0f;
-        float pointSize = 3.0f;
-        float alpha = 1.0f;
-        GLenum primitive = GL_LINES;
-    };
-    std::map<std::string, std::vector<Batch>> m_taggedBatches;
-};
-
-} // namespace midgard
-```
-
-### 7.5 初始化与注入（`app/main.cpp`）
-
-```cpp
-#include "core/DebugDisplay.h"
-#include "renderers/DebugDisplayImpl.h"
-
-int main() {
-    // ... GLFW/ImGui 初始化 ...
-
-    // 创建显示实现并注入引擎
-    auto display = std::make_shared<midgard::DebugDisplayImpl>();
-    midgard::g_debugDisplay = display;
-
-    // ... 主循环 ...
-    while (!glfwWindowShouldClose(win)) {
-        // ... 仿真计算 ...
-
-        // 渲染场景（含调试层）
-        sceneRenderer.render(cam);
-        display->render(mvp);  // 在场景之后渲染调试数据
-
-        // ... ImGui ...
-    }
-
-    midgard::g_debugDisplay = nullptr;
-    return 0;
-}
-```
-
-### 7.6 零开销保证
-
-- `g_debugDisplay` 为 `nullptr` 时，`DEBUG_SECTION` 内代码不执行
-- 无 UI 环境下，不链接 `DebugDisplayImpl`，不创建 OpenGL 资源
-- 发布模式可定义 `NDEBUG` 完全移除 `DEBUG_SECTION` 宏
+- **只在主线程调用**（TBB worker 不直接调用，计算完成后在主线程汇总绘制）
+- 发布版 `#ifdef MIDGARD_DEV` 编译开关移除所有调试UI
 
 ---
 
-## 8. 算法进度报告接口（新增）
+## 8. 3D 渲染层
 
-### 8.1 设计目标
+| 层 | 条件 |
+|----|------|
+| SDF Mesh | always |
+| Billet (透明) | showBillet |
+| Tool Path | showPath |
+| Current Tool | showTool |
+| Voxel Highlight | inspector active |
+| Debug Lines/Points | g_debugDisplay |
 
-- 算法执行过程中向 UI 报告进度，与 Simulation Control 窗口的进度条联动
-- 支持任务初始化（总工作量统计）、过程中推进、完成报告
-- 无 UI 时接口为 `nullptr`，进度代码零开销
-- 典型场景：Phase 0 体素分类、Phase 1 任务生成、Phase 2 四叉树采样等长耗时操作
-
-### 8.2 接口定义（`interface/ProgressReporter.h`）
-
-```cpp
-#pragma once
-#include <string>
-#include <memory>
-
-namespace midgard {
-
-/// 进度报告抽象接口
-/// 由 UI 层实现，通过指针注入引擎。nullptr = 不报告
-class IProgressReporter {
-public:
-    virtual ~IProgressReporter() = default;
-
-    /// 开始一个任务，报告总工作量
-    /// @param taskName  任务名称（如 "Phase 0: MacroCut"）
-    /// @param totalWork 总工作量（如 voxel 数、任务数、采样点数）
-    /// @param unit      单位描述（如 "voxels", "tasks", "samples"）
-    virtual void beginTask(const std::string& taskName,
-                           int64_t totalWork,
-                           const std::string& unit = "") = 0;
-
-    /// 推进进度
-    /// @param completed 已完成工作量
-    /// @param message   当前状态信息（可选，如 "processing leaf 45/128"）
-    virtual void update(int64_t completed,
-                        const std::string& message = "") = 0;
-
-    /// 增加已完成量（增量更新）
-    /// @param delta   本次完成量
-    /// @param message 当前状态信息（可选）
-    virtual void advance(int64_t delta = 1,
-                         const std::string& message = "") = 0;
-
-    /// 任务完成
-    /// @param message 完成信息（如 "classified 2911 voxels in 18ms"）
-    virtual void endTask(const std::string& message = "") = 0;
-
-    /// 取消当前任务（用户点击 Stop 时调用）
-    virtual void cancel() = 0;
-
-    /// 是否已请求取消（算法应定期检查并提前退出）
-    virtual bool isCancelled() const = 0;
-};
-
-/// 全局进度报告指针。UI 初始化时注入，无 UI 时为 nullptr
-extern std::shared_ptr<IProgressReporter> g_progressReporter;
-
-} // namespace midgard
-```
-
-### 8.3 引擎中的使用模式
-
-```cpp
-// core/MacroCut.cpp 示例
-void MacroCut::classifyVoxels(IPWState& ipw, const ToolSweptSDF& tool) {
-    auto* reporter = g_progressReporter.get();
-    
-    // 1. 统计总工作量
-    int64_t totalVoxels = ipw.macroGrid->activeVoxelCount();
-    if (reporter) {
-        reporter->beginTask("Phase 0: MacroCut", totalVoxels, "voxels");
-    }
-    
-    // 2. 遍历处理
-    int64_t processed = 0;
-    for (auto iter = ipw.macroGrid->cbeginValueOn(); iter; ++iter) {
-        // ... 分类逻辑 ...
-        
-        // 每 64 个 voxel 报告一次进度（避免频繁调用）
-        if (++processed % 64 == 0 && reporter) {
-            reporter->advance(64, "classifying voxels...");
-            
-            // 检查用户是否点击了取消
-            if (reporter->isCancelled()) {
-                // 清理并退出
-                if (reporter) reporter->cancel();
-                return;
-            }
-        }
-    }
-    
-    // 3. 完成报告
-    if (reporter) {
-        reporter->endTask("classified " + std::to_string(processed) + " voxels");
-    }
-}
-```
-
-### 8.4 UI 层实现（`app/windows/SimControlWindow.h`）
-
-```cpp
-#pragma once
-#include "core/ProgressReporter.h"
-#include <atomic>
-
-namespace midgard {
-
-/// Simulation Control 窗口实现 IProgressReporter
-/// 进度更新直接反映在 ImGui 进度条上
-class SimControlWindow : public IProgressReporter {
-public:
-    void beginTask(const std::string& taskName, int64_t totalWork,
-                   const std::string& unit) override;
-    void update(int64_t completed, const std::string& message) override;
-    void advance(int64_t delta, const std::string& message) override;
-    void endTask(const std::string& message) override;
-    void cancel() override;
-    bool isCancelled() const override;
-
-    // ImGui 渲染时调用，显示当前进度
-    void drawProgressBar();
-
-private:
-    struct TaskState {
-        std::string name;
-        std::string unit;
-        int64_t total = 0;
-        int64_t completed = 0;
-        std::string currentMessage;
-        double startTime = 0.0;
-    };
-    
-    std::atomic<bool> m_cancelled{false};
-    TaskState m_currentTask;
-    bool m_hasActiveTask = false;
-};
-
-} // namespace midgard
-```
-
-### 8.5 与 Simulation Control 窗口的联动
-
-```
-┌─ Simulation Control ───────────────────────────────────────┐
-│ ▶ ⏸ ⏹ ⏮ ⏭  [████████░░░░] 60%  744/1240  [x]Step  Speed[===]1x │
-│                                                            │
-│ Phase 0: MacroCut  [████████████░░░░] 80%  2329/2911       │
-│ > classifying voxels...                                    │
-└────────────────────────────────────────────────────────────┘
-```
-
-**显示规则**：
-- 有活跃任务时，在控制按钮下方显示子进度条
-- 子进度条显示：任务名 + 进度条 + 百分比 + 已完成/总数 + 当前消息
-- 多阶段任务（Phase 0→1→2）依次显示，前一阶段完成后显示下一阶段
-- `endTask()` 后子进度条淡出或显示完成信息 2 秒
-
-### 8.6 初始化与注入（`app/main.cpp`）
-
-```cpp
-#include "core/ProgressReporter.h"
-#include "windows/SimControlWindow.h"
-
-int main() {
-    // ... GLFW/ImGui 初始化 ...
-    
-    SimControlWindow simControl;
-    
-    // 注入进度报告接口
-    midgard::g_progressReporter = std::shared_ptr<IProgressReporter>(
-        &simControl, [](IProgressReporter*){}  // 不拥有所有权，避免 double-free
-    );
-    
-    // ... 主循环 ...
-    while (!glfwWindowShouldClose(win)) {
-        // ... 仿真计算（内部使用 g_progressReporter）...
-        
-        // ImGui 渲染
-        simControl.draw();  // 内部调用 drawProgressBar()
-    }
-    
-    midgard::g_progressReporter = nullptr;
-    return 0;
-}
-```
-
-### 8.7 零开销保证
-
-- `g_progressReporter` 为 `nullptr` 时，所有进度代码不执行
-- 批量推进（`advance(64)`）减少调用频率，避免每 voxel/每点都调用
-- `isCancelled()` 检查与进度更新合并，不增加额外原子操作
-- 无 UI 环境下不创建 `SimControlWindow`，不占用内存
+刀路分色：已执行 灰α0.4 / 当前 橙α1.0 / 未执行 暗灰α0.2
 
 ---
 
-## 9. 3D 视口渲染层
+## 9. 数据模型（修正）
 
-| 层 | 条件 | 方式 |
-|----|------|------|
-| SDF Mesh | always | 三角面片 |
-| Billet (orig) | `showBillet` | 透明 Box |
-| Tool Path | `showToolPath` | GL_LINES，分色 |
-| Tool Axis | `showToolAxis` | GL_LINES 箭头 |
-| Current Tool | `showTool` | 球/圆柱 mesh |
-| Voxel Wire | `inspectorActive` | 黄色线框 |
-| **Debug Display** | `g_debugDisplay != nullptr` | 按 tag 渲染 BBox/点/三角片 |
+### 9.1 刀具与路径分离
 
-**刀路轨迹分色**：已执行 #888888α0.4 / 当前 #FFAA00α1.0 / 未执行 #444444α0.2
+```cpp
+// 刀具定义（独立库）
+struct ToolDef {
+    int id = 0;
+    ToolType type = ToolType::BALL_END;
+    double R = 5.0, r = 0.0, H = 20.0;
+};
 
----
+// 刀路段（引用刀具，不内嵌参数）
+struct ToolPathSegment {
+    Vec3d start = {0, 0, 0};
+    Vec3d end = {0, 0, 0};
+    Vec3d axis = {0, 0, 1};
+    int toolId = 0;  // 引用 ToolDef
+};
+```
 
-## 10. 实现文件结构
+**优势**：
+- 一把刀对应多段路径，符合 CAM 实际
+- 换刀时只需改 `toolId`
+- 刀具参数集中管理，避免冗余
+
+### 9.2 文件结构
 
 ```
 app/
 ├── main.cpp
-├── AppState.h/.cpp
+├── AppState.h
 ├── windows/
-│   ├── SettingsWindow.h/.cpp
-│   ├── SimControlWindow.h/.cpp    # 新增：实现 IProgressReporter
-│   ├── OutputWindow.h/.cpp
-│   └── DebugWindow.h/.cpp
+│   ├── SettingsWindow.cpp    # Path / Tool Library / Billet
+│   ├── SimControlWindow.cpp
+│   ├── OutputWindow.cpp
+│   └── DebugWindow.cpp
 ├── renderers/
-│   ├── SceneRenderer.h/.cpp
-│   ├── PathRenderer.h/.cpp
-│   ├── ToolRenderer.h/.cpp
-│   └── DebugDisplayImpl.h/.cpp    # 新增：调试显示实现
+│   ├── SceneRenderer.cpp
+│   ├── DebugDisplayImpl.cpp
+│   └── PathRenderer.cpp
 └── utils/
-    └── LogBuffer.h/.cpp
-interface/                          # 新增：抽象接口层
-├── DebugDisplay.h                  # IDebugDisplay 接口
-├── ProgressReporter.h              # IProgressReporter 接口
-└── Globals.cpp                     # 全局指针定义
+    └── LogBuffer.h
 core/
-├── CMakeLists.txt                  # 链接 interface
+├── IDebugDisplay.h
 ├── Types.h
-├── ToolSweptSDF.h/.cpp
+├── ToolDef.h              # 刀具定义（新增）
+├── MicroCut.cpp
 └── ...
 ```
 
 ---
 
-## 11. 待审查事项
+## 10. 异步计算-渲染架构（可选，后期实现）
 
-本次审查意见：
+> 注：此架构用于解决计算与渲染争用，提升高倍速仿真时的流畅度。算法稳定后可实现。
 
-| # | 审查意见 | 处理方案 |
-|---|----------|----------|
-| 14 | Voxel Inspector 简化程度足够 | 无需修改 |
-| 15 | IDebugDisplay 增加 `drawLine()` / `drawArrow()` | 已更新接口 |
-| 16 | Demo 场景 IT-1 足够 | 无需修改 |
-| 17 | DebugDisplay.h / ProgressReporter.h 作为独立项目 | 已更新为 `interface/` 方案，见 11.1 节 |
-| 18 | GPU 扩展兼容性 | ✅ 已分析 | 11.2 节 |
-
-### 11.1 抽象接口的部署方式讨论
-
-**当前方案**：接口定义在 `core/` 目录，与算法核心同仓库。
-
-**用户建议**：作为独立 DLL 项目，core 引用抽象接口，宿主程序实现并通过指针传递。
-
-**分析对比**：
-
-| 方案 | 优点 | 缺点 |
-|------|------|------|
-| **A. 当前（同仓库）** | 简单，无额外依赖，头文件直接包含 | core 与 UI 耦合在代码层面（虽然运行时不耦合） |
-| **B. 独立 DLL** | 物理隔离，core 完全不感知 UI；多宿主共享 | 增加构建复杂度；C++ ABI 兼容性问题；需要显式加载/链接 |
-| **C. 独立头文件库（推荐）** | 仅头文件，无 ABI 问题；物理隔离但构建简单；多宿主共享 | 仍需管理头文件路径 |
-
-**推荐方案 D（同仓库 interface/ 目录）**：
+### 10.1 核心设计
 
 ```
-yggdrasil-midgard/
-├── interface/              # 抽象接口，不依赖任何实现
-│   ├── DebugDisplay.h
-│   ├── ProgressReporter.h
-│   └── Globals.cpp         # g_debugDisplay, g_progressReporter 定义
-├── core/                   # 算法引擎
-│   ├── CMakeLists.txt      # 链接 interface
-│   └── ...
-├── app/                    # UI 集成环境
-│   ├── CMakeLists.txt      # 链接 interface
-│   └── ...
-└── CMakeLists.txt          # 总控，add_subdirectory(interface)
+┌──────────────┐         ┌──────────────┐
+│  Compute     │  epoch  │   Render     │
+│  Thread      │ ──────→ │   Thread     │
+│  (TBB+CPU)   │  atomic │   (OpenGL)   │
+└──────────────┘         └──────────────┘
 ```
 
-**关键**：`interface/` 是独立目录，但同仓库管理。`core` 和 `app` 都链接 `interface` 静态库，共享同一个全局指针定义。
+| 设计点 | 说明 |
+|--------|------|
+| **双线程不互等** | 计算全速跑，渲染按帧读取最新完成状态 |
+| **epoch 原子计数** | 一段完整 Phase 0→4 后才 +1，渲染不读到半写状态 |
+| **OpenVDB ConstAccessor** | 读写天然无竞争（tree 的 leaf 替换是原子的） |
+| **视锥裁剪** | 只 mesh 化可见 leaf，epoch 不变时零开销复用上帧 |
 
-### 11.2 GPU 扩展兼容性说明
+### 10.2 数据流
 
-当前 midgard 采用 **TBB 并行（CPU）**，未来规划 **GPU 加速四叉树细分**。
+```cpp
+// Compute Thread
+while (running) {
+    // 1. 执行完整切削段（Phase 0→4）
+    engine.cut(billet, tool);
+    
+    // 2. 原子递增 epoch，标记新数据可用
+    ++epoch;
+    
+    // 3. 非阻塞，立即进入下一段
+}
 
-`interface/` 方案对 GPU 扩展的影响分析：
+// Render Thread (每帧)
+void renderFrame() {
+    // 1. 读取当前 epoch（原子读）
+    uint64_t currentEpoch = epoch.load(std::memory_order_acquire);
+    
+    // 2. epoch 未变？复用上帧 mesh
+    if (currentEpoch == lastRenderedEpoch) {
+        drawLastFrame();  // 零开销
+        return;
+    }
+    
+    // 3. epoch 变了？用 ConstAccessor 读取新 grid
+    auto acc = grid.getConstAccessor();
+    
+    // 4. 视锥裁剪：只 mesh 化可见 leaf
+    for (visible leaf in frustum) {
+        meshify(leaf, acc);
+    }
+    
+    // 5. 更新缓存
+    lastRenderedEpoch = currentEpoch;
+    draw();
+}
+```
 
-| 场景 | 影响 | 处理方式 |
-|------|------|----------|
-| **GPU 计算 + CPU 调试显示（过渡期）** | 无影响 | GPU kernel 完成后，CPU 侧读取结果再调用 `IDebugDisplay` |
-| **纯 GPU 管线（未来）** | 需 GPU-aware 实现 | 实现类使用 CUDA-OpenGL interop 直接渲染，或 device→host 回传后调用 |
+### 10.3 关键保证
 
-**设计保证**：
-- `IDebugDisplay` 是纯虚接口，不绑定 OpenGL
-- 未来可提供 `CudaDebugDisplay` 或 `MetalDebugDisplay` 实现
-- 高频调用已优化：批量推进（`advance(64)`），避免每 voxel 调用
+- **无锁读**：OpenVDB `ConstAccessor` 不阻塞 `stealNode` 写入
+- **不读半写**：epoch 在 Phase 4 完成后才递增，渲染永远读到完整状态
+- **零拷贝**：mesh 化时直接读取 voxel 数据，不复制 grid
+- **帧率稳定**：计算再快，渲染按 60fps 固定节奏，不卡顿
 
-**注意事项**：
-- GPU 异步执行时，CPU 侧 `g_debugDisplay` 可能销毁，需 `std::atomic` 或显式同步
-- GPU 产生的 device vector 需拷贝到 host 再传给 `IDebugDisplay`（除非实现类直接处理 GPU 内存）
+### 10.4 实现时机
+
+- **Phase 1（当前）**：单线程，计算与渲染串行，简单可靠
+- **Phase 2（后期）**：引入双线程，当算法稳定且需要高倍速仿真时实现
 
 ---
 
-*设计文档 v1.0（Final）已审查通过，可进入实现阶段。*
+## 11. 编译隔离
+
+```cpp
+// core/IDebugDisplay.h 末尾
+#ifdef MIDGARD_DEV
+  #define DEBUG_DRAW(code) do { if (g_debugDisplay) { code; } } while(0)
+#else
+  #define DEBUG_DRAW(code) ((void)0)
+#endif
+```
+
+发布版本：调试UI代码、`DebugWindow`、`DebugDisplayImpl` 全部不编译。
+
+---
+
+---
+
+## 12. 三态分类判据
+
+> 原则：**可以漏判（false negative），不能错判（zero false positive）。**
+>
+> 两类位置需要分类：
+> 1. **MacroCut::classifyVoxels** — 将 active voxel 分三态（deleted / boundary / keep）用于 Phase 0 加工模拟
+> 2. **IPWBuilder::build() debug** — 仅显示 boundary voxel，用于可视化验证
+>
+> 两者共用同一判据，保证一致性。
+
+### 12.1 外接球判据
+
+体素中心到最远角点的距感为外接球半径 $R_{\text{circ}} = V \cdot \sqrt{3} / 2$。
+
+利用 SDF 的 **1-Lipschitz 性质**（体素内任意两点的 SDF 差不超过它们的欧氏距感）：
+
+- 若体素中心 SDF $D > R_{\text{circ}} + \varepsilon$：
+  即使最靠近实体的角点（沿梯度反方向 $R_{\text{circ}}$），其 SDF $\geq D - R_{\text{circ}} > \varepsilon > 0$。
+  → **整个体素在实体外** → 确定 **Air**。
+
+- 若体素中心 SDF $D < -(R_{\text{circ}} + \varepsilon)$：
+  即使最远离实体的角点，其 SDF $\leq D + R_{\text{circ}} < -\varepsilon < 0$。
+  → **整个体素在实体内** → 确定 **Interior**。
+
+- 否则 $|D| \leq R_{\text{circ}} + \varepsilon$：
+  存在角点 SDF 符号相反的可能性 → 曲面**可能**穿过此体素 → **Boundary**。
+
+**零误判保证**：任何被判定为 boundary 的体素，其外接球确实触碰到曲面。
+**漏判允许**：体素某角落被曲面划过但中心 SDF 恰好 $> R_{\text{circ}}$（极其罕见），判为 Air/Interior 也不产生错误微表面（切削时由相邻 voxel 覆盖）。
+
+### 12.2 公式
+
+```cpp
+static constexpr double kMechEpsilon = 1e-4;  // 0.1μm 固定机械分辨率，仅防浮点抖动
+const double threshold = V * std::sqrt(3.0) / 2.0 + kMechEpsilon;
+
+// ─── 三态分类 ───
+if      (sdf < -threshold)  →  Interior / Deleted     (全在实体内)
+else if (sdf >  threshold)  →  Air / Keep              (全在实体外)
+else                         →  Boundary / Cut+Boundary (可能被穿过)
+```
+
+### 12.3 生效位置
+
+| 文件 | 函数 | 用途 | 判据 |
+|------|------|------|------|
+| `core/MacroCut.cpp` | `classifyVoxels()` | Phase 0 三态分类 | `V·√3/2 + 1e-4` |
+| `core/IPWBuilder.cpp` | `build()` debug | 可视化 boundary | `V·√3/2 + 1e-4` |
+
+> 两者共用同一 `threshold`。MacroCut 的三态中 `deleted` 映射到 Interior、`keep` 映射到 Air、其余为 Boundary（再细分为 cut/newBoundary）。
+
+### 12.4 端面双层 boundary 显示
+
+圆柱端面 disc 内部 voxel 的 SDF 恒为 0（端面=边界面），通过 threshold 检查。
+不做额外过滤，SDF 判据自行产生双层效果：
+
+- **第 1 层**（iz=0/izTop）：完整端面 disc，SDF=0 → `|SDF| ≤ threshold` → 显示
+- **第 2 层**（iz=1/izTop-1）：侧壁边界环。内部 voxel 因 `|SDF|=V > threshold` 自筛掉
+
+---
+
+## 修订记录
+
+| 版本 | 日期 | 修改内容 |
+|------|------|----------|
+| v2.5 | 06-20 | SimEngine 单段切削管线封装 + GTest |
+| v2.4 | 06-20 | §12 重写为三态分类判据，外接球保证零误判 |
+| v2.3 | 06-20 | 增加 §12 边界 Voxel 宽容判据，`threshold` 叠加 `user_t` |
+
+---
+
+## 13. SimEngine 单段切削管线
+
+将 MacroCut + MicroCut 五阶段管线封装为 `SimEngine::cutSegment()`。
+
+### 13.1 接口
+
+```cpp
+struct CutResult {
+    bool success = false;
+    int  deletedVoxels = 0;
+    int  newSurfacePoints = 0;
+    double elapsedMs = 0.0;
+};
+
+class SimEngine {
+public:
+    CutResult cutSegment(IPWState& ipw, const MoveSegment& seg,
+                         const ToolDef& tool, const GeometryDef& billet,
+                         const ToleranceConfig& config);
+};
+```
+
+### 13.2 管线流程
+
+1. `ToolSweptSDF(tool, seg)` — 刀具扫掠 SDF
+2. `ToolSweepSurface(tool, seg)` — 参数面
+3. `MacroCut::classifyVoxels()` — 三态分类
+4. `MacroCut::buildTaskList()` — 生成 VoxelTask
+5. `MicroCut::primeBilletBoundaries()` — 冷启动毛坯边界
+6. `MicroCut::sampleNewSurface()` — 刀具表面采样
+7. 合并 billetBuf → newBuf（仅补充缺失 key）
+8. `MicroCut::rebuildLeaves()` — 重建 leaf
+9. 返回 `CutResult`
+
+### 13.3 设计约束
+
+- 无状态：不缓存任何 grid，可复用
+- 不引入新依赖
+- 不修改已稳定的 core 算法文件
+
+*设计文档 v2.5 — 已更新，可进入实现阶段。*

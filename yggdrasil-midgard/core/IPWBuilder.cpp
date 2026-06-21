@@ -1,8 +1,13 @@
 #include "core/IPWBuilder.h"
+#include "core/IDebugDisplay.h"
+#include "debug/RtDebugSys.h"
 #include <openvdb/tools/MeshToVolume.h>
+#include <openvdb/tree/LeafManager.h>
 #include <openvdb/points/PointConversion.h>
 #include <openvdb/points/PointAttribute.h>
 #include <cmath>
+#include <sstream>
+#include <cstdio>
 
 namespace midgard {
 
@@ -12,17 +17,69 @@ openvdb::FloatGrid::Ptr IPWBuilder::buildMacroGrid(
     openvdb::math::Transform::Ptr xform =
         openvdb::math::Transform::createLinearTransform(config.voxelMacro);
 
+    openvdb::FloatGrid::Ptr grid;
+
     switch (geom.type) {
         case GeometryDef::BOX: {
             openvdb::math::BBox<openvdb::Vec3d> bbox(
                 geom.origin, geom.origin + geom.dims);
-            return openvdb::tools::createLevelSetBox<openvdb::FloatGrid>(
+            grid = openvdb::tools::createLevelSetBox<openvdb::FloatGrid>(
                 bbox, *xform, config.halfwidth);
+            break;
+        }
+        case GeometryDef::CYLINDER: {
+            // 解析法构造圆柱 SDF，避免 meshToVolume 的三角面逼近误差
+            // (chordal error + 端面接缝处 SDF 不准 → 不同视角对齐偏差)
+            double cx = geom.origin[0], cy = geom.origin[1];
+            double cz0 = geom.origin[2], cz1 = geom.origin[2] + geom.height;
+            double r  = geom.radius;
+            double czMid = (cz0 + cz1) * 0.5;
+            double halfH = geom.height * 0.5;
+            double voxel = config.voxelMacro;
+            double halfWidth = config.halfwidth * voxel; // narrow band (world units)
+
+            // 世界空间包围盒（含 narrow band）
+            openvdb::Vec3d wMin(cx - r - halfWidth, cy - r - halfWidth, cz0 - halfWidth);
+            openvdb::Vec3d wMax(cx + r + halfWidth, cy + r + halfWidth, cz1 + halfWidth);
+            openvdb::Vec3d iMin = xform->worldToIndex(wMin);
+            openvdb::Vec3d iMax = xform->worldToIndex(wMax);
+
+            grid = openvdb::FloatGrid::create((float)config.halfwidth);
+            grid->setTransform(xform);
+            auto acc = grid->getAccessor();
+
+            openvdb::Coord i0((int)std::floor(iMin.x()), (int)std::floor(iMin.y()), (int)std::floor(iMin.z()));
+            openvdb::Coord i1((int)std::ceil(iMax.x()),   (int)std::ceil(iMax.y()),   (int)std::ceil(iMax.z()));
+
+            // Inigo Quilez capped cylinder SDF:
+            //   min(max(d_xy,d_z),0) + length(max(vec2(d_xy,d_z),0))
+            for (int ix = i0.x(); ix <= i1.x(); ++ix) {
+            for (int iy = i0.y(); iy <= i1.y(); ++iy) {
+            for (int iz = i0.z(); iz <= i1.z(); ++iz) {
+                openvdb::Vec3d w = xform->indexToWorld(openvdb::Coord(ix, iy, iz));
+                double dx = w.x() - cx, dy = w.y() - cy;
+                double dz = w.z() - czMid;
+
+                double d_xy = std::sqrt(dx*dx + dy*dy) - r;
+                double d_z  = std::fabs(dz) - halfH;
+                double d_ext = std::sqrt(std::max(d_xy, 0.0) * std::max(d_xy, 0.0) +
+                                         std::max(d_z,  0.0) * std::max(d_z,  0.0));
+                double d_int = std::min(std::max(d_xy, d_z), 0.0);
+                double sdf = d_ext + d_int;
+
+                if (std::fabs(sdf) < halfWidth) {
+                    acc.setValue(openvdb::Coord(ix, iy, iz), (float)sdf);
+                }
+            }
+            }
+            }
+            break;
         }
         default:
-            // TODO: CYLINDER, SPHERE, MESH
             return nullptr;
     }
+
+    return grid;
 }
 
 openvdb::points::PointDataGrid::Ptr IPWBuilder::buildMicroGrid(
@@ -131,16 +188,115 @@ PointBuffer IPWBuilder::sampleBoundary(const GeometryDef& geom, const openvdb::B
     return buffer;
 }
 
-IPWState IPWBuilder::build(const GeometryDef& geom, const ToleranceConfig& config) {
+IPWState IPWBuilder::build(const GeometryDef& geom, const ToleranceConfig& config,
+                             DebugLogFn logFn, bool showBoundary) {
     IPWState ipw(config);
-    ipw.billetDef = geom; // 存储原始定义
 
     ipw.macroGrid = buildMacroGrid(geom, config);
     if (!ipw.macroGrid) return ipw;
 
+    // prune: 清除全正/全负冗余 leaf → 余下全为 boundary leaf
+    ipw.macroGrid->tree().prune();
+
     // MicroGrid: 创建空grid（保留transform用于后续切削写入）
     ipw.microGrid = openvdb::points::PointDataGrid::create();
     ipw.microGrid->setTransform(ipw.macroGrid->transformPtr());
+
+    // ── Debug Section: 显示所有 zero-cross voxel 的 bbox ──
+    DEBUG_SECTION(IPW_BUILD) {
+    if (!g_debugDisplay) return ipw;
+
+    if (showBoundary)
+        g_debugDisplay->clear();
+
+    openvdb::tree::LeafManager<openvdb::FloatGrid::TreeType> leafMgr(ipw.macroGrid->tree());
+    size_t boundaryCnt = leafMgr.leafCount();
+    size_t totalActive = ipw.macroGrid->activeVoxelCount();
+
+    const auto& xform = ipw.macroGrid->transform();
+    // 三态分类判据 (和 MacroCut::classifyVoxels 一致):
+    // threshold = V·√3/2 + 1e-4 (体素外接球半径)
+    // - |SDF| > threshold → 外接球完全在某侧 → 确定为 Air 或 Interior (跳过)
+    // - |SDF| ≤ threshold → 曲面可能穿过 → Boundary (显示)
+    // 保证: 零误判 (no false positive), 可漏判 (false negative 允许)
+    static constexpr double kMechEpsilon = 1e-4;  // 机械加工最小分辨率 (0.1μm)
+    const double threshold = config.voxelMacro * std::sqrt(3.0) / 2.0 + kMechEpsilon;
+    const double halfVoxel = config.voxelMacro * 0.5;
+    const bool useBbox = (config.voxelMacro >= 0.15);
+    int zeroVoxels = 0;
+
+    std::vector<float> centers;
+    std::vector<float> lines;
+    centers.reserve(4096 * 3);
+    lines.reserve(4096 * 72);
+
+    for (size_t n = 0; n < boundaryCnt; ++n) {
+        const auto& leaf = leafMgr.leaf(n);
+        for (auto v = leaf.cbeginValueOn(); v; ++v) {
+            if (std::fabs(*v) > threshold) continue;  // Air/Interior: 外接球不触曲面
+            ++zeroVoxels;
+
+            openvdb::Vec3d w = xform.indexToWorld(v.getCoord());
+
+            // 圆柱端面 boundary 显示：端面上 SDF=0 的 voxel 构成第 1 层 disc，
+            // 相邻 voxel 层（z0±V）中贴近侧壁的 voxel 构成第 2 层环。
+            // SDF eps 检查自然区分了边界/内部体素，无需额外过滤。
+
+            if (useBbox) {
+                double x0 = w.x() - halfVoxel, x1 = w.x() + halfVoxel;
+                double y0 = w.y() - halfVoxel, y1 = w.y() + halfVoxel;
+                double z0 = w.z() - halfVoxel, z1 = w.z() + halfVoxel;
+                float e[72] = {
+                    (float)x0,(float)y0,(float)z0, (float)x1,(float)y0,(float)z0,
+                    (float)x0,(float)y1,(float)z0, (float)x1,(float)y1,(float)z0,
+                    (float)x0,(float)y0,(float)z1, (float)x1,(float)y0,(float)z1,
+                    (float)x0,(float)y1,(float)z1, (float)x1,(float)y1,(float)z1,
+                    (float)x0,(float)y0,(float)z0, (float)x0,(float)y1,(float)z0,
+                    (float)x1,(float)y0,(float)z0, (float)x1,(float)y1,(float)z0,
+                    (float)x0,(float)y0,(float)z1, (float)x0,(float)y1,(float)z1,
+                    (float)x1,(float)y0,(float)z1, (float)x1,(float)y1,(float)z1,
+                    (float)x0,(float)y0,(float)z0, (float)x0,(float)y0,(float)z1,
+                    (float)x1,(float)y0,(float)z0, (float)x1,(float)y0,(float)z1,
+                    (float)x0,(float)y1,(float)z0, (float)x0,(float)y1,(float)z1,
+                    (float)x1,(float)y1,(float)z0, (float)x1,(float)y1,(float)z1,
+                };
+                lines.insert(lines.end(), e, e + 72);
+            } else {
+                centers.insert(centers.end(), {(float)w.x(), (float)w.y(), (float)w.z()});
+            }
+        }
+    }
+
+    if (showBoundary) {
+        if (useBbox && !lines.empty())
+            g_debugDisplay->drawLines(lines.data(), lines.size()/3, 0xCC00FF00);
+        else if (!centers.empty())
+            g_debugDisplay->drawPoints(centers.data(), centers.size()/3, 0xFF4488FF);
+    }
+
+    if (logFn) {
+        const char* typeName = (geom.type == GeometryDef::BOX) ? "Box" : "Cylinder";
+        char buf[256];
+        if (geom.type == GeometryDef::BOX) {
+            std::snprintf(buf, sizeof(buf),
+                "IPW0 rebuilt [%s]: %.0fx%.0fx%.0f @ (%.1f,%.1f,%.1f) bbox=(%.1f-%.1f) — %zu leaves, %zu boundary voxels, %zu total voxels",
+                typeName,
+                geom.dims[0], geom.dims[1], geom.dims[2],
+                geom.origin[0], geom.origin[1], geom.origin[2],
+                geom.origin[0], geom.origin[0]+geom.dims[0],
+                boundaryCnt, (size_t)zeroVoxels, totalActive);
+        } else {
+            std::snprintf(buf, sizeof(buf),
+                "IPW0 rebuilt [%s]: r=%.1f h=%.1f @ (%.1f,%.1f,%.1f) bbox=(%.1f-%.1f) — %zu leaves, %zu boundary voxels, %zu total voxels",
+                typeName,
+                geom.radius, geom.height,
+                geom.origin[0], geom.origin[1], geom.origin[2],
+                geom.origin[0] - geom.radius, geom.origin[0] + geom.radius,
+                boundaryCnt, (size_t)zeroVoxels, totalActive);
+        }
+        logFn("Build", buf);
+    }
+    }
 
     return ipw;
 }

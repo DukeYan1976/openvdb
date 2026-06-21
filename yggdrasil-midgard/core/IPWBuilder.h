@@ -3,12 +3,20 @@
 #include "core/Types.h"
 #include <openvdb/points/PointDataGrid.h>
 
+#include <functional>
+
 namespace midgard {
+
+/// 调试日志回调 (core 层不持有输出端，通过回调解耦)
+using DebugLogFn = std::function<void(const char* level, const char* message)>;
 
 class IPWBuilder {
 public:
-    /// 构建完整 IPW0
-    IPWState build(const GeometryDef& geom, const ToleranceConfig& config);
+    /// 构建完整 IPW0（含 Debug Section）
+    /// @param showBoundary 是否绘制 boundary leaf bbox（受 ipwShowMacroGrid 控制）
+    IPWState build(const GeometryDef& geom, const ToleranceConfig& config,
+                   DebugLogFn logFn = nullptr,
+                   bool showBoundary = false);
 
     /**
      * @brief [标准功能] 对给定物理区域采样毛坯边界特征。

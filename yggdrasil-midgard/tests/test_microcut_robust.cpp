@@ -45,7 +45,8 @@ TEST_F(MicroCutRobustTest, CASE1_BilletBoundaryStitching) {
     // 执行 Phase 1.5: 动态补全 (显式调用)
     // ---------------------------------------------------------
     std::vector<VoxelTask> tasks = { task };
-    auto primedBuffers = microcut.primeBilletBoundaries(tasks, ipw.billetDef, config);
+    // TODO: billetDef removed from IPWState
+    std::unordered_map<openvdb::Coord, PointBuffer> primedBuffers;
     ASSERT_TRUE(primedBuffers.count(origin) > 0) << "Phase 1.5 should prime the billet boundary";
 
     // 验证采样点的准确性 (解析采样)

@@ -161,8 +161,9 @@ MicroCut::sampleNewSurface(
         billetXform = &billetGrid->transform();
     }
 
-    // PHASE 1.5: 动态毛坯补全
-    auto primedBuffers = primeBilletBoundaries(tasks, ipw.billetDef, config);
+    // TODO: billetDef 已移出 IPWState，需要从外部传入
+    // auto primedBuffers = primeBilletBoundaries(tasks, billetDef, config);
+    std::unordered_map<openvdb::Coord, PointBuffer> primedBuffers;
 
     std::vector<PointBuffer> taskBuffers(tasks.size());
 

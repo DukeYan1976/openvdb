@@ -1,70 +1,170 @@
-cmake_minimum_required(VERSION 3.20)
-project(YggdrasilMidgard LANGUAGES CXX)
+cmake_minimum_required(VERSION 3.16)
+project(yggdrasil-midgard LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-if(MSVC)
-    add_compile_options(/bigobj)
+# ═══════════════════════════════════════════════════════════════
+# 选项
+# ═══════════════════════════════════════════════════════════════
+option(MIDGARD_DEV   "Enable debug UI"          ON)
+option(MIDGARD_APP   "Build IMGUI application"   ON)
+option(MIDGARD_TESTS "Build GTest-based tests"   ON)
+
+# ═══════════════════════════════════════════════════════════════
+# 依赖查找 (跨平台: CMake targets → 手动路径 fallback)
+# ═══════════════════════════════════════════════════════════════
+
+# -- OpenVDB --
+find_package(OpenVDB QUIET CONFIG)
+if(OpenVDB_FOUND AND TARGET OpenVDB::openvdb)
+    set(OVDB_LIBS OpenVDB::openvdb)
+    get_target_property(OVDB_INC OpenVDB::openvdb INTERFACE_INCLUDE_DIRECTORIES)
+else()
+    find_path(OVDB_INC openvdb/openvdb.h
+        PATHS /opt/homebrew/opt/openvdb/include /usr/local/include /usr/include)
+    find_library(OVDB_LIB openvdb
+        PATHS /opt/homebrew/opt/openvdb/lib /usr/local/lib /usr/lib)
+    if(NOT OVDB_INC OR NOT OVDB_LIB)
+        message(FATAL_ERROR "OpenVDB not found")
+    endif()
+    set(OVDB_LIBS ${OVDB_LIB})
 endif()
 
-# OpenVDB (project-local install)
-set(OPENVDB_INSTALL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../install")
-set(CMAKE_MODULE_PATH "${OPENVDB_INSTALL_DIR}/lib/cmake/OpenVDB" ${CMAKE_MODULE_PATH})
-set(CMAKE_PREFIX_PATH "${OPENVDB_INSTALL_DIR}" ${CMAKE_PREFIX_PATH})
-find_package(OpenVDB REQUIRED)
+# -- TBB --
+find_package(TBB QUIET CONFIG)
+if(TBB_FOUND AND TARGET TBB::tbb)
+    set(TBB_LIBS TBB::tbb)
+    get_target_property(TBB_INC TBB::tbb INTERFACE_INCLUDE_DIRECTORIES)
+else()
+    find_path(TBB_INC tbb/tbb.h
+        PATHS /opt/homebrew/opt/tbb/include /usr/local/include /usr/include)
+    find_library(TBB_LIB tbb
+        PATHS /opt/homebrew/opt/tbb/lib /usr/local/lib /usr/lib)
+    if(NOT TBB_INC OR NOT TBB_LIB)
+        message(FATAL_ERROR "TBB not found")
+    endif()
+    set(TBB_LIBS ${TBB_LIB})
+endif()
 
-# Library
-add_library(midgard
-    debug/RtDebugSys.cpp
+# -- GTest --
+if(MIDGARD_TESTS)
+    find_package(GTest QUIET)
+    if(NOT GTest_FOUND)
+        message(WARNING "GTest not found — tests disabled")
+        set(MIDGARD_TESTS OFF)
+    endif()
+endif()
+
+# ═══════════════════════════════════════════════════════════════
+# midgard-core (静态库)
+# ═══════════════════════════════════════════════════════════════
+add_library(midgard-core STATIC
+    core/IPWBuilder.cpp
+    core/IDebugDisplay.cpp
+    core/MacroCut.cpp
+    core/MicroCut.cpp
+    core/MicroGridLab.cpp
+    core/OctreeRefiner.cpp
     core/ToolSweptSDF.cpp
     core/ToolSweepSurface.cpp
-    core/MacroCut.cpp
-    core/IPWBuilder.cpp
-    core/MicroCut.cpp
-    core/MeshExport.cpp
     core/LocalSurfaceEngine.cpp
+    core/SimEngine.cpp
+    debug/RtDebugSys.cpp
 )
-target_include_directories(midgard PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(midgard PUBLIC OpenVDB::openvdb)
+target_compile_definitions(midgard-core PRIVATE MIDGARD_DEV)
+target_include_directories(midgard-core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(midgard-core PUBLIC ${OVDB_INC} ${TBB_INC})
+# (link dirs handled by targets/find_library; empty on config)
+target_link_libraries(midgard-core PUBLIC ${OVDB_LIBS} ${TBB_LIBS})
 
-# App
-add_executable(midgard_app app/main.cpp)
-target_link_libraries(midgard_app PRIVATE midgard)
+# ═══════════════════════════════════════════════════════════════
+# midgard-app (IMGUI + GLFW + OpenGL)
+# ═══════════════════════════════════════════════════════════════
+if(MIDGARD_APP)
+    # GLFW — system or yggdrasil-local
+    find_package(glfw3 QUIET)
+    if(glfw3_FOUND AND TARGET glfw)
+        set(GLFW_LIBS glfw)
+    else()
+        find_library(GLFW_LIB glfw3 glfw
+            PATHS /opt/homebrew/opt/glfw/lib
+                  /Users/y/openclaw/workspace/myGHDevelop/openvdb/yggdrasil/app/build/_deps/glfw-build/src
+                  /usr/local/lib /usr/lib)
+        if(GLFW_LIB)
+            set(GLFW_LIBS ${GLFW_LIB})
+        endif()
+    endif()
 
-add_executable(perf_stress_test app/perf_stress_test.cpp)
-target_link_libraries(perf_stress_test PRIVATE midgard)
+    # IMGUI — 可配置路径，默认 yggdrasil 本地构建
+    set(IMGUI_INC "${CMAKE_CURRENT_SOURCE_DIR}/../yggdrasil/app/build/_deps/imgui-src"
+        CACHE PATH "IMGUI include directory")
+    set(IMGUI_BE  "${CMAKE_CURRENT_SOURCE_DIR}/../yggdrasil/app/build/_deps/imgui-src/backends"
+        CACHE PATH "IMGUI backends directory")
+    set(IMGUI_LIB "${CMAKE_CURRENT_SOURCE_DIR}/../yggdrasil/app/build/libimgui_impl.a"
+        CACHE FILEPATH "IMGUI impl library")
 
-add_executable(export_surface app/export_surface.cpp)
-target_link_libraries(export_surface PRIVATE midgard)
+    # glad — project-local
+    set(GLAD_INC "${CMAKE_CURRENT_SOURCE_DIR}/third_party/glad/include")
+    set(GLAD_SRC "${CMAKE_CURRENT_SOURCE_DIR}/third_party/glad/src/glad.c")
 
-# Tests
-include(FetchContent)
-FetchContent_Declare(googletest
-    GIT_REPOSITORY https://github.com/google/googletest.git
-    GIT_TAG v1.15.2
-)
-set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
-set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(googletest)
+    if(GLFW_LIBS AND EXISTS ${IMGUI_INC}/imgui.h AND EXISTS ${GLAD_SRC})
+        add_executable(midgard-app
+            app/main.cpp
+            app/AppState.cpp
+            app/windows/SettingsWindow.cpp
+            app/windows/SimControlWindow.cpp
+            app/windows/OutputWindow.cpp
+            app/windows/DebugWindow.cpp
+            app/windows/MicroGridLabWindow.cpp
+            app/renderers/GPURenderers.cpp
+            app/renderers/Camera.cpp
+            app/renderers/ShaderProgram.cpp
+            app/renderers/BilletMeshGenerator.cpp
+            app/renderers/ToolMeshGenerator.cpp
+            app/renderers/SceneRenderer.cpp
+            ${GLAD_SRC}
+        )
+        target_compile_definitions(midgard-app PRIVATE MIDGARD_DEV)
+        target_include_directories(midgard-app PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/app
+            ${CMAKE_CURRENT_SOURCE_DIR}/app/windows
+            ${CMAKE_CURRENT_SOURCE_DIR}/app/renderers
+            ${GLAD_INC} ${IMGUI_INC} ${IMGUI_BE}
+        )
+        target_link_libraries(midgard-app PRIVATE
+            midgard-core ${GLFW_LIBS} ${IMGUI_LIB}
+        )
+        if(APPLE)
+            target_link_libraries(midgard-app PRIVATE
+                "-framework OpenGL" "-framework Cocoa"
+                "-framework IOKit" "-framework CoreFoundation")
+        elseif(UNIX)
+            target_link_libraries(midgard-app PRIVATE ${CMAKE_DL_LIBS} pthread)
+        elseif(WIN32)
+            target_link_libraries(midgard-app PRIVATE opengl32)
+        endif()
+    else()
+        message(WARNING "midgard-app disabled: GLFW/IMGUI/glad not found")
+    endif()
+endif()
 
-enable_testing()
+# ═══════════════════════════════════════════════════════════════
+# 测试
+# ═══════════════════════════════════════════════════════════════
+if(MIDGARD_TESTS)
+    enable_testing()
+    add_executable(midgard_tests
+        tests/test_sim_engine.cpp
+        tests/test_microgrid_lab.cpp
+    )
+    target_link_libraries(midgard_tests PRIVATE
+        midgard-core GTest::gtest GTest::gtest_main
+    )
+    add_test(NAME midgard_tests_run COMMAND midgard_tests)
+endif()
 
-add_executable(midgard_tests
-    tests/test_placeholder.cpp
-    tests/test_toolsweep_sdf.cpp
-    tests/test_toolsweep_surface.cpp
-    tests/test_macrocut.cpp
-    tests/test_macrocut_phase1.cpp
-    tests/test_ipwbuilder.cpp
-    tests/test_microcut.cpp
-    tests/test_microcut_robust.cpp
-    tests/test_localsurface.cpp
-    tests/test_phase34.cpp
-    tests/test_dualtrack_consistency.cpp
-    tests/test_surface_debug.cpp
-)
-target_link_libraries(midgard_tests PRIVATE midgard GTest::gtest_main)
-
-include(GoogleTest)
-gtest_discover_tests(midgard_tests)
+# ═══════════════════════════════════════════════════════════════
+# 摘要
+# ═══════════════════════════════════════════════════════════════
+message(STATUS "yggdrasil-midgard: App=${MIDGARD_APP} Tests=${MIDGARD_TESTS}")

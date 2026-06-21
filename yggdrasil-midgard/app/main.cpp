@@ -1,315 +1,309 @@
-#include "debug/RtDebugSys.h"
-#include "core/Types.h"
-#include "core/ToolSweptSDF.h"
-#include "core/ToolSweepSurface.h"
-#include "core/MacroCut.h"
-#include "core/MicroCut.h"
+#include "AppState.h"
+#include "windows/SettingsWindow.h"
+#include "windows/SimControlWindow.h"
+#include "windows/OutputWindow.h"
+#include "windows/DebugWindow.h"
+#include "windows/MicroGridLabWindow.h"
+#include "renderers/SceneRenderer.h"
+#include "renderers/Camera.h"
+#include "renderers/GPURenderers.h"
+#include "renderers/ShaderProgram.h"
+#include "core/IDebugDisplay.h"
 #include "core/IPWBuilder.h"
-#include "core/MeshExport.h"
-#include <openvdb/openvdb.h>
-#include <openvdb/points/PointCount.h>
-#include <filesystem>
-#include <iostream>
-#include <fstream>
-#include <thread>
-#include <chrono>
 #include <cmath>
-#include <unordered_set>
 
-using namespace midgard;
-
-// ═══════════════════════════════════════════════════════════════════════
-// 分页输出辅助
-// ═══════════════════════════════════════════════════════════════════════
-static void pageBreak(const std::string& title) {
-    std::cout << "\n════════════════════════════════════════════════════════════\n"
-              << "  " << title << "\n"
-              << "════════════════════════════════════════════════════════════\n\n";
+namespace {
+// 从 GeometryDef 计算 world-space 包围盒 (origin, extent)
+std::pair<midgard::Vec3d, midgard::Vec3d> billetBBox(const midgard::GeometryDef& gd) {
+    if (gd.type == midgard::GeometryDef::CYLINDER) {
+        return {
+            midgard::Vec3d(gd.origin[0] - gd.radius, gd.origin[1] - gd.radius, gd.origin[2]),
+            midgard::Vec3d(gd.radius * 2.0, gd.radius * 2.0, gd.height)
+        };
+    }
+    return { gd.origin, gd.dims };
 }
+} // namespace
+#include <imgui.h>
+#include <imgui_impl_glfw.h>
+#include <imgui_impl_opengl3.h>
+#include <glad/glad.h>
+#include <GLFW/glfw3.h>
+#include <cstdio>
 
-// ═══════════════════════════════════════════════════════════════════════
-// 集成测试: 球头刀沿X方向切削方块毛坯
-//
-// 配置:
-//   毛坯: 20×20×20mm Box
-//   刀具: 球头刀 R=5mm
-//   刀路: 单段线性 (0,10,18)->(20,10,18), 切深2mm
-//   容差: t=0.05mm → V_macro=1.5mm
-// ═══════════════════════════════════════════════════════════════════════
-int main(int argc, char* argv[]) {
-    openvdb::initialize();
+// g_debugDisplay defined in core/IDebugDisplay.cpp
 
-    // ─── Debug系统初始化 ─────────────────────────────────────────────
-    std::filesystem::path exePath = std::filesystem::canonical(argv[0]).parent_path();
-    std::filesystem::path debugDir = exePath / "debug_output";
-    std::filesystem::create_directories(debugDir);
-    RtDebugSys::Debugger::GetInstance().SetWorkspace(debugDir.string());
-    RtDebugSys::Debugger::GetInstance().Activate(1);
+// ═══════════════════════════════════════════════════════════════
+class DebugDisplayImpl : public midgard::IDebugDisplay {
+public:
+    midgard::GPULines lines;
+    midgard::GPUPoints points;
+    midgard::GPUMesh triangles;
+    midgard::ShaderProgram lineShader, pointShader, triShader;
 
-    pageBreak("Phase -1: 参数配置");
+    uint32_t lineColor_ = 0xFFFFFF00;
+    uint32_t pointColor_ = 0xFF4488FF;
+    uint32_t triColor_ = 0x33CC33CC;
 
-    double t = 0.05;  // 用户容差 mm
-    ToleranceConfig config(t, ToleranceConfig::INTERACTIVE, 10.0);
-    std::cout << "  user_t      = " << config.user_t << " mm\n"
-              << "  V_macro     = " << config.voxelMacro << " mm\n"
-              << "  K factor    = " << config.K << "\n"
-              << "  halfwidth   = " << config.halfwidth << "\n"
-              << "  baseStep    = " << config.baseStep << " mm\n"
-              << "  chordalLimit= " << config.chordalLimit << " mm\n";
-
-    // ─── IPW0 构建 ──────────────────────────────────────────────────
-    pageBreak("Phase -1: IPW0 毛坯构建");
-
-    GeometryDef geom;
-    geom.type = GeometryDef::BOX;
-    geom.origin = Vec3d(0);
-    geom.dims = Vec3d(20, 20, 20);
-
-    auto tBuild0 = std::chrono::high_resolution_clock::now();
-    IPWBuilder builder;
-    auto ipw = builder.build(geom, config);
-    auto tBuild1 = std::chrono::high_resolution_clock::now();
-
-    double msBuild = std::chrono::duration<double, std::milli>(tBuild1 - tBuild0).count();
-    openvdb::Index64 microPoints = openvdb::points::pointCount(ipw.microGrid->tree());
-
-    std::cout << "  Box: " << geom.dims << " mm\n"
-              << "  MacroGrid active voxels: " << ipw.macroGrid->activeVoxelCount() << "\n"
-              << "  MacroGrid leaf nodes:    " << ipw.macroGrid->tree().leafCount() << "\n"
-              << "  MicroGrid points:        " << microPoints << "\n"
-              << "  MicroGrid leaf nodes:    " << ipw.microGrid->tree().leafCount() << "\n"
-              << "  Build time:              " << msBuild << " ms\n";
-
-    // ─── 刀具定义 ───────────────────────────────────────────────────
-    pageBreak("Phase 0: 刀具 & 刀路");
-
-    ToolDef tool{ToolType::BALL_END, 5.0, 0.0, 30.0};
-    MoveSegment seg{Vec3d(0, 10, 18), Vec3d(20, 10, 18)};
-    ToolSweptSDF sdf(tool, seg);
-
-    double pathLen = (seg.end - seg.start).length();
-    auto bbox = sdf.boundingBox();
-
-    std::cout << "  Tool: BallEnd R=" << tool.R << "mm\n"
-              << "  Path: " << seg.start << " -> " << seg.end << "\n"
-              << "  Path length: " << pathLen << " mm\n"
-              << "  Tool BBox: " << bbox.min() << " -> " << bbox.max() << "\n"
-              << "  Tip Z (lowest): " << (seg.start.z() - tool.R) << " mm\n"
-              << "  Cut depth from top(Z=20): " << (20.0 - (seg.start.z() - tool.R)) << " mm\n";
-
-    // ─── MacroCut (Phase 0) ─────────────────────────────────────────
-    pageBreak("Phase 0: MacroCut 执行");
-
-    int activeBefore = ipw.macroGrid->activeVoxelCount();
-
-    auto tCut0 = std::chrono::high_resolution_clock::now();
-    // 保存原始毛坯grid用于Phase 2的空气过滤
-    auto billetOriginal = ipw.macroGrid->deepCopy();
-
-    MacroCut macrocut;
-    auto cls = macrocut.classifyVoxels(ipw, sdf);
-    auto tCut1 = std::chrono::high_resolution_clock::now();
-
-    double msCut = std::chrono::duration<double, std::milli>(tCut1 - tCut0).count();
-    int activeAfter = ipw.macroGrid->activeVoxelCount();
-    double V = config.voxelMacro;
-    double threshold = V * std::sqrt(3.0) / 2.0;
-
-    std::cout << "  Active voxels: " << activeBefore << " -> " << activeAfter
-              << " (delta=" << (activeAfter - activeBefore) << ")\n"
-              << "  Classification:\n"
-              << "    deleted (d):      " << cls.deleted.size() << "\n"
-              << "    cut (c):          " << cls.cut.size() << "\n"
-              << "    newBoundary (n):  " << cls.newBoundary.size() << "\n"
-              << "  Total boundary:     " << (cls.cut.size() + cls.newBoundary.size()) << "\n"
-              << "  Boundary/path_len:  " << (cls.cut.size() + cls.newBoundary.size()) / pathLen
-              << " voxels/mm\n"
-              << "  Threshold:          " << threshold << " mm\n"
-              << "  MacroCut time:      " << msCut << " ms\n";
-
-    // ─── 分类精度验证 ───────────────────────────────────────────────
-    pageBreak("Phase 0: 分类精度验证");
-
-    // deleted: SDF应 < -threshold
-    double maxDeletedSDF = -1e9;
-    for (const auto& co : cls.deleted) {
-        Vec3d wp = ipw.macroGrid->indexToWorld(co);
-        maxDeletedSDF = std::max(maxDeletedSDF, sdf.eval(wp));
+    bool init() {
+        lineShader.load(midgard::Shaders::lineVert, midgard::Shaders::lineFrag);
+        pointShader.load(midgard::Shaders::pointVert, midgard::Shaders::pointFrag);
+        triShader.load(midgard::Shaders::meshVert, midgard::Shaders::meshFrag);
+        return lineShader.id && pointShader.id && triShader.id;
     }
 
-    // boundary: |SDF| 应 <= threshold
-    double maxBoundarySDF = 0;
-    for (const auto& co : cls.cut) {
-        Vec3d wp = ipw.macroGrid->indexToWorld(co);
-        maxBoundarySDF = std::max(maxBoundarySDF, std::abs(sdf.eval(wp)));
+    void drawLines(const float* data, size_t count, uint32_t color) override {
+        lineColor_ = color;
+        lines.upload(data, count * 3 * sizeof(float), count);
     }
-    for (const auto& co : cls.newBoundary) {
-        Vec3d wp = ipw.macroGrid->indexToWorld(co);
-        maxBoundarySDF = std::max(maxBoundarySDF, std::abs(sdf.eval(wp)));
+    void drawPoints(const float* data, size_t count, uint32_t color) override {
+        pointColor_ = color;
+        points.upload(data, count * 3 * sizeof(float), count);
     }
+    void drawTriangles(const float* verts, const uint32_t* indices, size_t triCount, uint32_t color) override {
+        triColor_ = color;
+        // 从索引中找出最大顶点编号来确定正确的顶点缓冲区大小
+        int maxIdx = 0;
+        for (size_t i = 0; i < triCount * 3; ++i)
+            if (indices[i] > maxIdx) maxIdx = indices[i];
+        int vertCount = maxIdx + 1;
+        triangles.upload(verts, vertCount * 6 * sizeof(float),
+                         indices, triCount * 3 * sizeof(uint32_t), triCount * 3);
+    }
+    void clear() override { lines.cleanup(); points.cleanup(); triangles.cleanup(); }
 
-    bool deletedOK = cls.deleted.empty() || (maxDeletedSDF < -threshold + 1e-10);
-    bool boundaryOK = maxBoundarySDF <= threshold + 1e-10;
-
-    std::cout << "  deleted max SDF:   " << maxDeletedSDF
-              << (deletedOK ? " [PASS]" : " [FAIL]") << "\n"
-              << "  boundary max|SDF|: " << maxBoundarySDF
-              << (boundaryOK ? " [PASS]" : " [FAIL]") << "\n"
-              << "  threshold:         " << threshold << "\n";
-
-    // ─── Phase 2/3/4 占位 ───────────────────────────────────────────
-    pageBreak("Phase 1: 任务列表生成");
-
-    ToolSweepSurface surface(tool, seg);
-    auto tasks = macrocut.buildTaskList(cls, surface, config, ipw.macroGrid->transform());
-
-    std::cout << "  Tasks generated: " << tasks.size() << "\n"
-              << "  v1: " << surface.v1() << ", v2: " << surface.v2() << "\n";
-
-    // 打印前3个task的参数域用于调试
-    for (size_t i = 0; i < std::min((size_t)3, tasks.size()); ++i) {
-        std::cout << "  task[" << i << "] origin=" << tasks[i].origin
-                  << " u=[" << tasks[i].u_min << "," << tasks[i].u_max
-                  << "] v=[" << tasks[i].t_min << "," << tasks[i].t_max << "]\n";
+    static void unpackColor(uint32_t c, float& r, float& g, float& b, float& a) {
+        a = ((c >> 24) & 0xFF) / 255.0f;
+        r = ((c >> 16) & 0xFF) / 255.0f;
+        g = ((c >>  8) & 0xFF) / 255.0f;
+        b = ((c >>  0) & 0xFF) / 255.0f;
     }
 
-    // 统计参数域范围
-    double avgURange = 0, avgVRange = 0;
-    for (const auto& t : tasks) {
-        avgURange += (t.u_max - t.u_min);
-        avgVRange += (t.t_max - t.t_min);
-    }
-    if (!tasks.empty()) {
-        avgURange /= tasks.size();
-        avgVRange /= tasks.size();
-    }
-    std::cout << "  Avg param range: u=" << avgURange << " v=" << avgVRange << "\n";
-
-    pageBreak("Phase 2-4: 待实现 (MicroCut + Compaction)");
-
-    // Phase 2: 四叉树采样
-    MicroCut microcut;
-    auto buffers = microcut.sampleNewSurface(tasks, surface, sdf, config, ipw);
-
-    int totalNewPoints = 0;
-    for (const auto& [coord, buf] : buffers) totalNewPoints += buf.positions.size();
-
-    std::cout << "  Phase 2 results:\n"
-              << "    Voxels with new points: " << buffers.size() << "\n"
-              << "    Total new points: " << totalNewPoints << "\n";
-
-    // ─── Phase 3+4: 旧点剔除 + 重建 ────────────────────────────────
-    pageBreak("Phase 3+4: 重建 MicroGrid");
-
-    openvdb::Index64 ptsBefore = openvdb::points::pointCount(ipw.microGrid->tree());
-
-    auto tR0 = std::chrono::high_resolution_clock::now();
-    microcut.rebuildLeaves(ipw, cls, buffers, sdf, config);
-    auto tR1 = std::chrono::high_resolution_clock::now();
-
-    openvdb::Index64 ptsAfter = openvdb::points::pointCount(ipw.microGrid->tree());
-    double msRebuild = std::chrono::duration<double, std::milli>(tR1 - tR0).count();
-
-    std::cout << "  MicroGrid points: " << ptsBefore << " -> " << ptsAfter << "\n"
-              << "  Rebuild time: " << msRebuild << " ms\n";
-
-    // ─── 端到端精度验证 ─────────────────────────────────────────────
-    pageBreak("M8: 切削面精度验证");
-
-    // 只验证切削区域（cut + newBoundary voxels）内的点
-    // 这些点应该在扫掠面上（新生成的）或在刀具外部（存活旧点）
-    double maxSdfInCutZone = 0;
-    int cutZonePoints = 0;
-    std::unordered_set<int64_t> cutZoneSet;
-    auto ck = [](const openvdb::Coord& c) -> int64_t {
-        return (int64_t(c.x()) << 40) | (int64_t(c.y() & 0xFFFFF) << 20) | int64_t(c.z() & 0xFFFFF);
-    };
-    for (const auto& c : cls.cut) cutZoneSet.insert(ck(c));
-    for (const auto& c : cls.newBoundary) cutZoneSet.insert(ck(c));
-
-    for (auto leaf = ipw.microGrid->tree().cbeginLeaf(); leaf; ++leaf) {
-        auto posHandle = openvdb::points::AttributeHandle<Vec3f>::create(
-            leaf->constAttributeArray("P"));
-        for (auto it = leaf->beginIndexOn(); it; ++it) {
-            openvdb::Coord voxCoord = it.getCoord();
-            if (!cutZoneSet.count(ck(voxCoord))) continue;  // 非切削区跳过
-
-            Vec3f pos = posHandle->get(*it);
-            Vec3d wp = ipw.microGrid->transform().indexToWorld(
-                voxCoord.asVec3d() + Vec3d(pos));
-            double s = sdf.eval(wp);
-            // 新点应SDF≈0, 存活旧点应SDF≥t
-            // 最小SDF代表最深入刀具的点（不应有SDF<0）
-            if (s < 0) maxSdfInCutZone = std::max(maxSdfInCutZone, -s);
-            cutZonePoints++;
+    void render(const float mvp[16]) {
+        if (lines.count > 0) {
+            float r, g, b, a;
+            unpackColor(lineColor_, r, g, b, a);
+            lineShader.use(); lineShader.setMat4("uMVP", mvp);
+            lineShader.setVec3("uColor", r, g, b); lineShader.setFloat("uAlpha", a);
+            lines.draw();
+        }
+        if (triangles.count > 0) {
+            glDepthMask(GL_FALSE); // 透明面不写深度，避免遮挡后面绘制的点
+            float r, g, b, a;
+            unpackColor(triColor_, r, g, b, a);
+            triShader.use(); triShader.setMat4("uMVP", mvp);
+            triShader.setMat3("uNormalMat", mvp);
+            triShader.setVec3("uLightDir", 0,0,1);
+            triShader.setVec3("uColor", r, g, b); triShader.setFloat("uAlpha", a);
+            triangles.draw();
+            glDepthMask(GL_TRUE);
+        }
+        if (points.count > 0) {
+            float r, g, b, a;
+            unpackColor(pointColor_, r, g, b, a);
+            pointShader.use(); pointShader.setMat4("uMVP", mvp);
+            pointShader.setVec3("uColor", r, g, b); pointShader.setFloat("uAlpha", a);
+            pointShader.setFloat("uPointSize", 3); points.draw(3);
         }
     }
+};
 
-    std::cout << "  Cut zone points checked: " << cutZonePoints << "\n"
-              << "  Max penetration (SDF<0): " << maxSdfInCutZone << " mm\n"
-              << "  Tolerance t: " << config.user_t << " mm\n"
-              << "  " << (maxSdfInCutZone <= config.user_t ? "[PASS]" : "[WARN]")
-              << " All cut-zone points within tolerance\n";
+// ═══════════════════════════════════════════════════════════════
+int main() {
+    if (!glfwInit()) return -1;
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+#ifdef __APPLE__
+    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
+#endif
 
-    // ─── 总结 ────────────────────────────────────────────────────────
-    pageBreak("Summary");
+    GLFWwindow* window = glfwCreateWindow(1280, 720, "Yggdrasil-Midgard", nullptr, nullptr);
+    if (!window) { glfwTerminate(); return -1; }
+    glfwMakeContextCurrent(window);
+    glfwSwapInterval(1);
 
-    std::cout << "  IPW0 build:   " << msBuild << " ms\n"
-              << "  MacroCut:     " << msCut << " ms\n"
-              << "  Total:        " << (msBuild + msCut) << " ms\n"
-              << "  Status:       Phase 0 " << (deletedOK && boundaryOK ? "PASS" : "FAIL") << "\n"
-              << "\n  Debug log: " << (debugDir / "DebugInfo.txt").string() << "\n";
-
-    // ─── OBJ 导出 ───────────────────────────────────────────────────
-    pageBreak("OBJ Export");
-
-    std::filesystem::path objDir = exePath / "obj_output";
-    std::filesystem::create_directories(objDir);
-
-    // 1. 原始毛坯 mesh
-    {
-        auto pristine = IPWBuilder().build(geom, config);
-        exportMacroMesh(pristine.macroGrid, (objDir / "billet_original.obj").string());
-        std::cout << "  [1] billet_original.obj\n";
+    if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
+        glfwTerminate(); return -1;
     }
 
-    // 2. 切削后工件 mesh
-    exportMacroMesh(ipw.macroGrid, (objDir / "billet_after_cut.obj").string());
-    std::cout << "  [2] billet_after_cut.obj\n";
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    ImGui::StyleColorsDark();
 
-    // 3. 切削区点云
-    exportMicroPoints(ipw.microGrid, (objDir / "cut_surface_points.obj").string());
-    std::cout << "  [3] cut_surface_points.obj\n";
+    ImGui_ImplGlfw_InitForOpenGL(window, true);
+    ImGui_ImplOpenGL3_Init("#version 330 core");
 
-    // 4. PLY 点云 (位置+法向, 通用格式)
-    exportMicroPLY(ipw.microGrid, (objDir / "cut_surface_points.ply").string());
-    std::cout << "  [4] cut_surface_points.ply\n";
+    DebugDisplayImpl debugDisplay;
+    debugDisplay.init();
+    midgard::g_debugDisplay = &debugDisplay;
 
-    std::cout << "\n  Output: " << objDir.string() << "\n";
+    midgard::Camera camera;
+    midgard::SceneRenderer sceneRenderer;
+    sceneRenderer.init();
 
-    // 导出多刀型高精度参数面
-    auto exportHighRes = [&](const ToolDef& t, const MoveSegment& s, const std::string& name) {
-        ToolSweepSurface surf(t, s);
-        const int N = 200;
-        std::ofstream sout((objDir / (name + ".obj")).string());
-        for (int i = 0; i <= N; ++i)
-            for (int j = 0; j <= N; ++j) {
-                Vec3d p = surf.eval((double)i/N, (double)j/N);
-                sout << "v " << p.x() << " " << p.y() << " " << p.z() << "\n";
+    midgard::SettingsWindow  settingsWin;
+    midgard::SimControlWindow simControlWin;
+    midgard::OutputWindow    outputWin;
+    midgard::DebugWindow     debugWin;
+    midgard::MicroGridLabWindow microGridLabWin;
+
+    // ── 启动时不加载任何几何 — 用户通过 Settings Load Demo 或 MicroGridLab Load 触发
+    auto& st = midgard::getAppState();
+
+    ImVec2 vpPos, vpSize;
+
+    while (!glfwWindowShouldClose(window)) {
+        glfwPollEvents();
+
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+
+        int winW, winH, fbW, fbH;
+        glfwGetWindowSize(window, &winW, &winH);
+        glfwGetFramebufferSize(window, &fbW, &fbH);
+
+        // 仿真推进
+        st.tick(ImGui::GetIO().DeltaTime);
+
+        // Viewport 全屏背景
+        ImGui::SetNextWindowPos(ImVec2(0, 0));
+        ImGui::SetNextWindowSize(ImVec2((float)winW, (float)winH));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+        ImGui::Begin("Viewport", nullptr,
+            ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse |
+            ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+            ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNavFocus |
+            ImGuiWindowFlags_NoBackground);
+        ImGui::PopStyleVar(3);
+
+        vpPos  = ImGui::GetWindowPos();
+        vpSize = ImGui::GetWindowSize();
+
+        if (ImGui::IsWindowHovered()) {
+            if (ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+                ImVec2 d = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left);
+                camera.orbit(d.x, -d.y);
+                ImGui::ResetMouseDragDelta(ImGuiMouseButton_Left);
             }
-        for (int i = 0; i < N; ++i)
-            for (int j = 0; j < N; ++j) {
-                int a=i*(N+1)+j+1, b=a+1, c=a+(N+1), d=c+1;
-                sout << "f " << a << " " << b << " " << d << " " << c << "\n";
+            if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
+                ImVec2 d = ImGui::GetMouseDragDelta(ImGuiMouseButton_Middle);
+                camera.pan(d.x, d.y);
+                ImGui::ResetMouseDragDelta(ImGuiMouseButton_Middle);
             }
-        std::cout << "  [5] " << name << ".obj\n";
-    };
+            float wh = ImGui::GetIO().MouseWheel;
+            if (wh != 0) camera.zoom(wh);
+        }
 
-    exportHighRes(tool, seg, "surface_ball_end");
-    exportHighRes({ToolType::BULL_NOSE, 5.0, 2.0, 20.0}, seg, "surface_bull_nose");
-    exportHighRes({ToolType::FLAT_END, 5.0, 0.0, 20.0}, seg, "surface_flat_end");
+        if (ImGui::BeginPopupContextWindow("ViewMenu")) {
+            if (ImGui::MenuItem("Zoom All")) {
+                auto bb = billetBBox(st.billetDef);
+                camera.zoomAll(bb.first, bb.second);
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Top"))           camera.viewTop();
+            if (ImGui::MenuItem("Front"))         camera.viewFront();
+            if (ImGui::MenuItem("Right"))         camera.viewRight();
+            if (ImGui::MenuItem("Isometric"))     camera.viewIso();
+            ImGui::EndPopup();
+        }
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    return (deletedOK && boundaryOK) ? 0 : 1;
+        ImGui::End();
+
+        // Settings 左上
+        ImGui::SetNextWindowPos(ImVec2(10, 30), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(280, 400), ImGuiCond_FirstUseEver);
+        settingsWin.draw();
+
+        // SimControl 顶部中段
+        ImGui::SetNextWindowPos(ImVec2(300, 30), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(600, 80), ImGuiCond_FirstUseEver);
+        simControlWin.draw();
+
+        // Output 右侧
+        ImGui::SetNextWindowPos(ImVec2((float)winW - 310, 30), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(300, 400), ImGuiCond_FirstUseEver);
+        outputWin.draw();
+
+        // Debug 左下
+        ImGui::SetNextWindowPos(ImVec2(10, (float)winH - 220), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(280, 200), ImGuiCond_FirstUseEver);
+        debugWin.draw();
+
+        // MicroGrid Lab 右下
+        ImGui::SetNextWindowPos(ImVec2(300, 120), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(400, 500), ImGuiCond_FirstUseEver);
+        microGridLabWin.draw();
+
+        ImGui::Render();
+
+        glViewport(0, 0, fbW, fbH);
+        glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+        if (vpSize.x > 0 && vpSize.y > 0) {
+            float sx = (float)fbW / (float)winW;
+            float sy = (float)fbH / (float)winH;
+            GLint x = (GLint)(vpPos.x * sx);
+            GLint y = (GLint)(fbH - (vpPos.y + vpSize.y) * sy);
+            GLsizei w = (GLsizei)(vpSize.x * sx);
+            GLsizei h = (GLsizei)(vpSize.y * sy);
+            if (w > 0 && h > 0) {
+                glEnable(GL_SCISSOR_TEST);
+                glScissor(x, y, w, h);
+                glViewport(x, y, w, h);
+                glEnable(GL_DEPTH_TEST);
+                glDepthFunc(GL_LESS);
+                glClear(GL_DEPTH_BUFFER_BIT);
+                // ── Mesh + IPW 重建 (用户加载几何后才触发) ──
+                if (st.geometryLoaded && st.ipwDirty) {
+                    sceneRenderer.rebuildBillet(st.billetDef);
+
+                    midgard::IPWBuilder builder;
+                    st.ipw = builder.build(st.billetDef, st.ipw.config,
+                        [&st](const char* level, const char* msg) { st.addLog(level, msg); },
+                        st.ipwShowMacroGrid);
+                    st.ipwDirty = false;
+                    sceneRenderer.clearMacroMesh();
+                }
+
+                if (st.macroMeshRequested) {
+                    sceneRenderer.rebuildMacroMesh(st.ipw.macroGrid);
+                    st.macroMeshRequested = false;
+                }
+                if (st.macroMeshClear) {
+                    sceneRenderer.clearMacroMesh();
+                    st.macroMeshClear = false;
+                }
+
+                sceneRenderer.render(camera, w, h);
+
+                float mvp[16], nm[9];
+                camera.buildMVP(w, h, mvp, nm);
+                glDepthFunc(GL_ALWAYS);   // debug voxel 不受任何深度遮挡
+                debugDisplay.render(mvp);
+                glDepthFunc(GL_LESS);
+            }
+        }
+
+        glViewport(0, 0, fbW, fbH);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_SCISSOR_TEST);
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
+        glfwSwapBuffers(window);
+    }
+
+    sceneRenderer.cleanup();
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext();
+    glfwDestroyWindow(window);
+    glfwTerminate();
+    return 0;
 }
-

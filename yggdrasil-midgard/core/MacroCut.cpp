@@ -65,7 +65,8 @@ static openvdb::FloatGrid::Ptr rasterizeToolGrid(
 CutClassification MacroCut::classifyVoxels(IPWState& ipw, const ToolSweptSDF& tool) {
     auto& macroGrid = ipw.macroGrid;
     const double V = macroGrid->voxelSize()[0];
-    const double threshold = V * std::sqrt(3.0) / 2.0;
+    static constexpr double kMechEpsilon = 1e-4;  // 机械加工最小分辨率 (0.1μm)，安全余量防止浮点边界漏判
+    const double threshold = V * std::sqrt(3.0) / 2.0 + kMechEpsilon;
     const int halfwidth = 3;
 
     auto t0 = std::chrono::high_resolution_clock::now();

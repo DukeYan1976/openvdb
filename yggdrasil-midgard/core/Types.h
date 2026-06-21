@@ -40,7 +40,8 @@ struct ToolDef {
 struct MoveSegment {
     Vec3d start;
     Vec3d end;
-    Vec3d axis{0, 0, 1};   // 三轴固定Z
+    Vec3d axis{0, 0, 1};
+    int toolId = 0;         // 引用 ToolDef
     double feedRate = 0.0;  // mm/min, 仅用于时间估算
 };
 
@@ -94,7 +95,6 @@ struct IPWState {
     openvdb::FloatGrid::Ptr macroGrid;
     openvdb::points::PointDataGrid::Ptr microGrid;
     ToleranceConfig config;
-    GeometryDef billetDef; // 原始毛坯解析定义
 
     IPWState(double tolerance) : config(tolerance) {}
     IPWState(const ToleranceConfig& cfg) : config(cfg) {}
