@@ -154,31 +154,75 @@ Vec3d ToolSweptSDF::gradBallEnd(const Vec3d& p) const {
 // ============================================================
 
 double ToolSweptSDF::evalFlatEnd(const Vec3d& p) const {
-    double lam = closestLambda(p);
-    Vec3d tip = mSeg.start + lam * mLength * mDir;
-
-    if (mIsZAxis) {
+    // 三轴水平路径快速路径: axis=Z 且 mDir⊥axis
+    if (mIsZAxis && std::abs(mDir.z()) < 1e-10) {
+        double lam = closestLambda(p);
+        Vec3d tip = mSeg.start + lam * mLength * mDir;
         double dx = p.x() - tip.x(), dy = p.y() - tip.y();
         return roundedCylinderSDF(std::sqrt(dx * dx + dy * dy), p.z() - tip.z(), mTool.R, 0.01, mTool.H);
     }
 
-    Vec3d loc = toLocal(p, tip);
-    double r_p = std::sqrt(loc.x() * loc.x() + loc.y() * loc.y());
-    return roundedCylinderSDF(r_p, loc.z(), mTool.R, 0.01, mTool.H);
+    // 通用路径: 两候选 λ 取 min (对底面和圆柱面分别最优)
+    // 候选1: 刀尖轨迹投影 (对底面精确)
+    double lam1 = closestLambda(p);
+    Vec3d tip1 = mSeg.start + lam1 * mLength * mDir;
+    Vec3d loc1 = toLocal(p, tip1);
+    double r1 = std::sqrt(loc1.x() * loc1.x() + loc1.y() * loc1.y());
+    double sdf1 = roundedCylinderSDF(r1, loc1.z(), mTool.R, 0.01, mTool.H);
+
+    // 候选2: 径向距离最小化 (对圆柱面精确)
+    // 去除 axis 分量后投影到路径方向
+    double axisDotDir = mAxis.dot(mDir);
+    if (std::abs(axisDotDir) < 1e-10) return sdf1; // axis⊥mDir, 两者等价
+
+    Vec3d ap = p - mSeg.start;
+    double projAxis = ap.dot(mAxis);
+    Vec3d apFlat = ap - projAxis * mAxis;
+    Vec3d mDirFlat = mDir - axisDotDir * mAxis;
+    double mDirFlatSq = mDirFlat.dot(mDirFlat);
+    if (mDirFlatSq < 1e-15) return sdf1; // mDir ∥ axis
+
+    double lam2 = std::clamp(apFlat.dot(mDirFlat) / (mLength * mDirFlatSq), 0.0, 1.0);
+    Vec3d tip2 = mSeg.start + lam2 * mLength * mDir;
+    Vec3d loc2 = toLocal(p, tip2);
+    double r2 = std::sqrt(loc2.x() * loc2.x() + loc2.y() * loc2.y());
+    double sdf2 = roundedCylinderSDF(r2, loc2.z(), mTool.R, 0.01, mTool.H);
+
+    return std::min(sdf1, sdf2);
 }
 
 double ToolSweptSDF::evalBullNose(const Vec3d& p) const {
-    double lam = closestLambda(p);
-    Vec3d tip = mSeg.start + lam * mLength * mDir;
-
-    if (mIsZAxis) {
+    if (mIsZAxis && std::abs(mDir.z()) < 1e-10) {
+        double lam = closestLambda(p);
+        Vec3d tip = mSeg.start + lam * mLength * mDir;
         double dx = p.x() - tip.x(), dy = p.y() - tip.y();
         return roundedCylinderSDF(std::sqrt(dx * dx + dy * dy), p.z() - tip.z(), mTool.R, mTool.r, mTool.H);
     }
 
-    Vec3d loc = toLocal(p, tip);
-    double r_p = std::sqrt(loc.x() * loc.x() + loc.y() * loc.y());
-    return roundedCylinderSDF(r_p, loc.z(), mTool.R, mTool.r, mTool.H);
+    // 通用路径: 两候选 λ 取 min
+    double lam1 = closestLambda(p);
+    Vec3d tip1 = mSeg.start + lam1 * mLength * mDir;
+    Vec3d loc1 = toLocal(p, tip1);
+    double r1 = std::sqrt(loc1.x() * loc1.x() + loc1.y() * loc1.y());
+    double sdf1 = roundedCylinderSDF(r1, loc1.z(), mTool.R, mTool.r, mTool.H);
+
+    double axisDotDir = mAxis.dot(mDir);
+    if (std::abs(axisDotDir) < 1e-10) return sdf1;
+
+    Vec3d ap = p - mSeg.start;
+    double projAxis = ap.dot(mAxis);
+    Vec3d apFlat = ap - projAxis * mAxis;
+    Vec3d mDirFlat = mDir - axisDotDir * mAxis;
+    double mDirFlatSq = mDirFlat.dot(mDirFlat);
+    if (mDirFlatSq < 1e-15) return sdf1;
+
+    double lam2 = std::clamp(apFlat.dot(mDirFlat) / (mLength * mDirFlatSq), 0.0, 1.0);
+    Vec3d tip2 = mSeg.start + lam2 * mLength * mDir;
+    Vec3d loc2 = toLocal(p, tip2);
+    double r2 = std::sqrt(loc2.x() * loc2.x() + loc2.y() * loc2.y());
+    double sdf2 = roundedCylinderSDF(r2, loc2.z(), mTool.R, mTool.r, mTool.H);
+
+    return std::min(sdf1, sdf2);
 }
 
 Vec3d ToolSweptSDF::gradFlatEnd(const Vec3d& p) const {
