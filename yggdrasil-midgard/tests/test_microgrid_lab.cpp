@@ -317,7 +317,7 @@ TEST(MicroGridLab, SingleCut_FlatEndHorizontal) {
 
     CutRecord rec;
     rec.tool     = {ToolType::FLAT_END, 0.45, 0.0, 5.0};
-    rec.segment  = {Vec3d(0, 0.5, 0.5), Vec3d(1, 0.5, 0.5), Vec3d(1, 0, 0), 0};
+    rec.segment  = {Vec3d(0, 0.5, 0.5), Vec3d(1, 0.5, 0.5), Vec3d(0, 0, 1), 0};
     state.addCutRecord(rec);
 
     state.executeCut(0);
@@ -361,7 +361,7 @@ TEST(MicroGridLab, TwoCut_Incremental) {
     // 第 2 刀：平底刀从侧面切入
     CutRecord rec2;
     rec2.tool    = {ToolType::FLAT_END, 0.5, 0.0, 5.0};
-    rec2.segment = {Vec3d(-0.5, 0.5, 0.5), Vec3d(1.5, 0.5, 0.5), Vec3d(1, 0, 0), 0};
+    rec2.segment = {Vec3d(-0.5, 0.5, 0.5), Vec3d(1.5, 0.5, 0.5), Vec3d(0, 0, 1), 0};
     state.addCutRecord(rec2);
     state.executeCut(1);
 
@@ -521,7 +521,7 @@ TEST(MicroGridLab, M3_SurfacePointsAfterCut) {
 
     CutRecord rec;
     rec.tool     = {ToolType::FLAT_END, 0.45, 0.0, 5.0};
-    rec.segment  = {Vec3d(0, 0.5, 0.5), Vec3d(1, 0.5, 0.5), Vec3d(1, 0, 0), 0};
+    rec.segment  = {Vec3d(0, 0.5, 0.5), Vec3d(1, 0.5, 0.5), Vec3d(0, 0, 1), 0};
     state.addCutRecord(rec);
 
     state.executeCut(0);

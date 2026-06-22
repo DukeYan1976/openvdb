@@ -31,15 +31,23 @@ private:
     double evalBullNose(const Vec3d& p) const;
     Vec3d gradBallEnd(const Vec3d& p) const;
     Vec3d gradFlatEnd(const Vec3d& p) const;
-    // TODO M2: BULL_NOSE 三段构造 (evalCylinder + evalTorus + evalDisc)
 
     /// 点p到线段AB的最近参数λ∈[0,1]和最近点
     double closestLambda(const Vec3d& p) const;
 
+    /// 将世界点变换到刀轴局部坐标系 (radial1, radial2, axial)
+    Vec3d toLocal(const Vec3d& p, const Vec3d& origin) const;
+
     ToolDef mTool;
     MoveSegment mSeg;
-    Vec3d mDir;       // 归一化方向 (或零向量)
+    Vec3d mDir;       // 归一化路径方向 (或零向量)
     double mLength;   // 刀路段长度
+
+    // 刀轴坐标系
+    Vec3d mAxis;      // 归一化刀轴方向
+    Vec3d mE1;        // 径向基1 (⊥ mAxis)
+    Vec3d mE2;        // 径向基2 (⊥ mAxis, ⊥ mE1)
+    bool mIsZAxis;    // 三轴快速路径标志
 };
 
 } // namespace midgard

@@ -157,6 +157,7 @@ if(MIDGARD_TESTS)
     add_executable(midgard_tests
         tests/test_sim_engine.cpp
         tests/test_microgrid_lab.cpp
+        tests/test_toolsweep_surface.cpp
     )
     target_link_libraries(midgard_tests PRIVATE
         midgard-core GTest::gtest GTest::gtest_main

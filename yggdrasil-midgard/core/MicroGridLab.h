@@ -119,12 +119,13 @@ struct MicroGridLabState {
     void ensureInit();
 
     // ── 方法 ──
-    void init();
+    void init();                          // 重建网格（保留 cutHistory）
+    void reset();                         // 重置网格（保留 cutHistory）= init()
+    void rebuild();                       // init() + 重放所有 cutHistory
     int  voxelCount() const;              // (cubeSize/voxelSize)³
     int  perDim() const;                  // cubeSize/voxelSize (每维度体素数)
     int  maxOctreeDepth() const;          // ceil(log2(voxelSize/8 / precision))
     void addCutRecord(const CutRecord& rec);
-    void reset();
 
     // ── M2: 切削执行 ──
     /// 对 cutHistory[cutIdx] 执行粗筛分类

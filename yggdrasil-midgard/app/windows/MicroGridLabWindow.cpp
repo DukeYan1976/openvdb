@@ -28,6 +28,15 @@ void MicroGridLabWindow::drawParams() {
     ImGui::InputDouble("Cube Size", &state_.cubeSize, 0.1, 1.0, "%.1f mm");
     ImGui::InputDouble("Voxel Size", &state_.voxelSize, 0.1, 1.0, "%.2f mm");
 
+    // 检测参数变化 → 自动重建
+    static double prevCubeSize = state_.cubeSize;
+    static double prevVoxelSize = state_.voxelSize;
+    if (state_.cubeSize != prevCubeSize || state_.voxelSize != prevVoxelSize) {
+        prevCubeSize = state_.cubeSize;
+        prevVoxelSize = state_.voxelSize;
+        state_.rebuild();
+    }
+
     // 三档精度
     static const double precisions[] = {0.1, 0.01, 0.001};
     ImGui::Text("Precision:");
@@ -212,13 +221,11 @@ void MicroGridLabWindow::drawActions() {
 
     ImGui::SameLine();
     if (ImGui::Button("Reset")) {
-        state_.reset();
+        state_.cutHistory.clear();
+        state_.init();
         nextCutIdx = 0;
         auto& st = getAppState();
-        char buf[128];
-        snprintf(buf, sizeof(buf), "── Reset (%zu cuts kept) ──", state_.cutHistory.size());
-        st.addLog("MicroGrid", buf);
-        st.addLog("MicroGrid", "All voxels reinitialized to solid-state — ready to re-execute");
+        st.addLog("MicroGrid", "── Full reset: voxels + cut history cleared ──");
         pushToViewport();
         logStats();
     }

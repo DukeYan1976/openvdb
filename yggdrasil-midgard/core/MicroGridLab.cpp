@@ -240,17 +240,22 @@ MicroGridCell::updateCeFromToolSDF(int ceIdx, float toolSDF,
 // ═══════════════════════════════════════════════════════════════
 
 void MicroGridLabState::init() {
+    // 重建 voxel 网格（按当前 cubeSize/voxelSize），不清 cutHistory
     int total = voxelCount();
     voxels.clear();
     voxels.resize(total);
     for (auto& v : voxels)
         v.setAllSolid();
 
-    cutHistory.clear();
+    surfacePoints.clear();
     totalSurfacePoints = 0;
     lastCutMs          = 0.0;
     maxChordalError    = 0.0;
+    totalRefineEvals   = 0;
+    deepestRefineDepth = 0;
     lastCutLog         = {};
+    lastDelta          = {};
+    executeLog.clear();
 }
 
 void MicroGridLabState::ensureInit() {
@@ -285,21 +290,14 @@ void MicroGridLabState::addCutRecord(const CutRecord& rec) {
 }
 
 void MicroGridLabState::reset() {
-    // 保留 cutHistory — 仅清空执行结果，让用户重新 Execute
-    surfacePoints.clear();
-    totalSurfacePoints  = 0;
-    lastCutMs           = 0.0;
-    maxChordalError     = 0.0;
-    totalRefineEvals    = 0;
-    deepestRefineDepth  = 0;
-    lastCutLog          = {};
-    lastDelta           = {};
-    executeLog.clear();
+    // 保留 cutHistory，重置网格和状态
+    init();
+}
 
-    // 重设 voxels 为全 SOLID（不 touch cutHistory）
-    if (!voxels.empty()) {
-        for (auto& v : voxels) v.setAllSolid();
-    }
+void MicroGridLabState::rebuild() {
+    init();
+    for (size_t i = 0; i < cutHistory.size(); ++i)
+        executeCut(i);
 }
 
 void MicroGridLabState::clampSurfacePoints() {

@@ -54,11 +54,29 @@ private:
     double mV3;      // v 分界 3 (Right-Mid / Back-Cap), =1.0 when !closedLoop
 
     // 几何常量
-    double mPhiGrazingL; // 左侧擦掠角
-    double mPhiGrazingR; // 右侧擦掠角
+    double mPhiGrazingL; // 左侧擦掠角 (仅用于 caps)
+    double mPhiGrazingR; // 右侧擦掠角 (仅用于 caps)
     double mHflat;       // 底平段弧长
     double mHarc;        // 圆角段弧长
     double mHcyl;        // 圆柱段弧长
+
+    // ── 斜坡路径擦掠修正 (mDir.z ≠ 0) ──
+    double m_r_xy;          // |mDir| in xy-plane
+    double mGrazCosL, mGrazSinL;   // 圆柱段 Left-Mid 擦掠 cos/sin φ
+    double mGrazCosR, mGrazSinR;   // 圆柱段 Right-Mid 擦掠 cos/sin φ
+    double mE1_x, mE1_y;       // 擦掠大圆基 e1 = mDir×ẑ 归一化 (z=0)
+    double mE2_x, mE2_y, mE2_z;   // 擦掠大圆基 e2 = mDir×e1
+    double mBlendEps;           // 球底→圆柱衔接 blend 半宽
+
+    // ── 圆角弧参数 (按刀型预计算) ──
+    double mCornerCx, mCornerCz;  // 圆角弧中心 (工具坐标系)
+    double mCornerRad;            // 圆角弧半径
+
+    // ── 刀轴坐标系 (支持非Z刀轴) ──
+    Vec3d mAxis;        // 归一化刀轴方向
+    Vec3d mAxE1;        // 径向基1 (⊥ mAxis)
+    Vec3d mAxE2;        // 径向基2 (⊥ mAxis, ⊥ mAxE1)
+    bool mIsZAxis;      // 三轴快速路径标志
 };
 
 } // namespace midgard
