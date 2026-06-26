@@ -73,6 +73,10 @@ add_library(midgard-core STATIC
     debug/RtDebugSys.cpp
 )
 target_compile_definitions(midgard-core PRIVATE MIDGARD_DEV)
+if(MSVC)
+    target_compile_definitions(midgard-core PUBLIC _USE_MATH_DEFINES)
+    target_compile_options(midgard-core PRIVATE /bigobj)
+endif()
 target_include_directories(midgard-core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(midgard-core PUBLIC ${OVDB_INC} ${TBB_INC})
 # (link dirs handled by targets/find_library; empty on config)
@@ -88,8 +92,8 @@ if(MIDGARD_APP)
         set(GLFW_LIBS glfw)
     else()
         find_library(GLFW_LIB glfw3 glfw
-            PATHS /opt/homebrew/opt/glfw/lib
-                  /Users/y/openclaw/workspace/myGHDevelop/openvdb/yggdrasil/app/build/_deps/glfw-build/src
+            PATHS ${CMAKE_CURRENT_SOURCE_DIR}/../yggdrasil/app/build/_deps/glfw-build/src
+                  /opt/homebrew/opt/glfw/lib
                   /usr/local/lib /usr/lib)
         if(GLFW_LIB)
             set(GLFW_LIBS ${GLFW_LIB})
@@ -101,8 +105,12 @@ if(MIDGARD_APP)
         CACHE PATH "IMGUI include directory")
     set(IMGUI_BE  "${CMAKE_CURRENT_SOURCE_DIR}/../yggdrasil/app/build/_deps/imgui-src/backends"
         CACHE PATH "IMGUI backends directory")
-    set(IMGUI_LIB "${CMAKE_CURRENT_SOURCE_DIR}/../yggdrasil/app/build/libimgui_impl.a"
-        CACHE FILEPATH "IMGUI impl library")
+    if(WIN32)
+        set(_IMGUI_LIB_DEFAULT "${CMAKE_CURRENT_SOURCE_DIR}/../yggdrasil/app/build/imgui_impl.lib")
+    else()
+        set(_IMGUI_LIB_DEFAULT "${CMAKE_CURRENT_SOURCE_DIR}/../yggdrasil/app/build/libimgui_impl.a")
+    endif()
+    set(IMGUI_LIB "${_IMGUI_LIB_DEFAULT}" CACHE FILEPATH "IMGUI impl library")
 
     # glad — project-local
     set(GLAD_INC "${CMAKE_CURRENT_SOURCE_DIR}/third_party/glad/include")
@@ -126,6 +134,9 @@ if(MIDGARD_APP)
             ${GLAD_SRC}
         )
         target_compile_definitions(midgard-app PRIVATE MIDGARD_DEV)
+        if(MSVC)
+            target_compile_options(midgard-app PRIVATE /bigobj)
+        endif()
         target_include_directories(midgard-app PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/app
             ${CMAKE_CURRENT_SOURCE_DIR}/app/windows

@@ -114,9 +114,34 @@ void Camera::zoomAll(const Vec3d& bo, const Vec3d& bd) {
     dist = orthoSize * 3.0f;
 }
 
-void Camera::viewTop()    { yaw = 0;   pitch = 90; }
-void Camera::viewFront()  { yaw = 0;   pitch = 0;  }
-void Camera::viewRight()  { yaw = 90;  pitch = 0;  }
-void Camera::viewIso()    { yaw = 45;  pitch = 30; }
+void Camera::viewTop()    { yaw = 0;   pitch = 90;  }
+void Camera::viewBottom() { yaw = 0;   pitch = -90; }
+void Camera::viewFront()  { yaw = 0;   pitch = 0;   }
+void Camera::viewRight()  { yaw = 90;  pitch = 0;   }
+void Camera::viewIso()    { yaw = 45;  pitch = 30;  }
+
+void Camera::zoomToRect(float x0, float y0, float x1, float y1, int vpW, int vpH) {
+    // x0,y0,x1,y1 in screen pixels relative to viewport; origin top-left
+    float cx = (x0 + x1) * 0.5f;
+    float cy = (y0 + y1) * 0.5f;
+    float dx = cx - vpW * 0.5f;
+    float dy = -(cy - vpH * 0.5f); // flip Y
+
+    // Pan target by screen offset
+    float rx, ry, rz, ux, uy, uz, fx, fy, fz;
+    getAxes(rx, ry, rz, ux, uy, uz, fx, fy, fz);
+    float pixScale = orthoSize * 2.0f / (float)vpH;
+    tx += (rx * dx + ux * dy) * pixScale;
+    ty += (ry * dx + uy * dy) * pixScale;
+    tz += (rz * dx + uz * dy) * pixScale;
+
+    // Zoom to fit the rect
+    float rw = std::abs(x1 - x0);
+    float rh = std::abs(y1 - y0);
+    float asp = (float)vpW / (float)vpH;
+    float newSize = std::max(rh * 0.5f, rw * 0.5f / asp) * pixScale;
+    orthoSize = std::max(1.0f, newSize);
+    dist = orthoSize * 3.0f;
+}
 
 } // namespace midgard

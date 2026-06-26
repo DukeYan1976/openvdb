@@ -131,7 +131,19 @@ int main() {
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    io.IniFilename = "midgard_layout.ini";
     ImGui::StyleColorsDark();
+#ifdef _WIN32
+    {
+        float xscale = 1.0f, yscale = 1.0f;
+        glfwGetMonitorContentScale(glfwGetPrimaryMonitor(), &xscale, &yscale);
+        ImFontConfig cfg;
+        cfg.SizePixels = 16.0f * xscale; // 16px base, scaled by system DPI
+        cfg.OversampleH = 2;
+        cfg.OversampleV = 2;
+        io.Fonts->AddFontDefault(&cfg);
+    }
+#endif
 
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init("#version 330 core");
@@ -154,6 +166,10 @@ int main() {
     auto& st = midgard::getAppState();
 
     ImVec2 vpPos, vpSize;
+
+    // Box zoom state
+    bool boxZooming = false;
+    ImVec2 boxStart, boxEnd;
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
@@ -186,7 +202,27 @@ int main() {
         vpSize = ImGui::GetWindowSize();
 
         if (ImGui::IsWindowHovered()) {
-            if (ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+            bool ctrl = ImGui::GetIO().KeyCtrl;
+            if (ctrl && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                boxZooming = true;
+                boxStart = ImGui::GetMousePos();
+                boxEnd = boxStart;
+            }
+            if (boxZooming) {
+                boxEnd = ImGui::GetMousePos();
+                if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                    boxZooming = false;
+                    float w = std::abs(boxEnd.x - boxStart.x);
+                    float h = std::abs(boxEnd.y - boxStart.y);
+                    if (w > 5 && h > 5) {
+                        camera.zoomToRect(
+                            boxStart.x - vpPos.x, boxStart.y - vpPos.y,
+                            boxEnd.x - vpPos.x, boxEnd.y - vpPos.y,
+                            (int)vpSize.x, (int)vpSize.y);
+                    }
+                }
+            }
+            if (!ctrl && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
                 ImVec2 d = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left);
                 camera.orbit(d.x, -d.y);
                 ImGui::ResetMouseDragDelta(ImGuiMouseButton_Left);
@@ -207,10 +243,16 @@ int main() {
             }
             ImGui::Separator();
             if (ImGui::MenuItem("Top"))           camera.viewTop();
+            if (ImGui::MenuItem("Bottom"))        camera.viewBottom();
             if (ImGui::MenuItem("Front"))         camera.viewFront();
             if (ImGui::MenuItem("Right"))         camera.viewRight();
             if (ImGui::MenuItem("Isometric"))     camera.viewIso();
             ImGui::EndPopup();
+        }
+
+        // Draw box zoom rectangle overlay
+        if (boxZooming) {
+            ImGui::GetForegroundDrawList()->AddRect(boxStart, boxEnd, IM_COL32(255,255,0,200), 0, 0, 2.0f);
         }
 
         ImGui::End();

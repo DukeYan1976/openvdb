@@ -22,9 +22,11 @@ struct Camera {
     // ─── 视图快捷操作 ───
     void zoomAll(const Vec3d& billetOrigin, const Vec3d& billetDims);
     void viewTop();
+    void viewBottom();
     void viewFront();
     void viewRight();
     void viewIso();
+    void zoomToRect(float x0, float y0, float x1, float y1, int vpW, int vpH);
 
 private:
     void getAxes(float& rx, float& ry, float& rz,

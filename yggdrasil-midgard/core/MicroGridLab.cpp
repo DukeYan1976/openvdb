@@ -7,6 +7,13 @@
 #include <cstring>
 #include <unordered_set>
 
+#ifdef _MSC_VER
+#include <intrin.h>
+#define POPCNT64(x) __popcnt64(x)
+#else
+#define POPCNT64(x) POPCNT64(x)
+#endif
+
 // TBB 并行化
 #include <tbb/parallel_for.h>
 #include <tbb/blocked_range.h>
@@ -26,10 +33,10 @@ int popcountBefore(const uint64_t mask[8], int idx) {
     int count  = 0;
     // 前面整 slot 的全部
     for (int s = 0; s < slot; ++s)
-        count += __builtin_popcountll(mask[s]);
+        count += POPCNT64(mask[s]);
     // 当前 slot 内 bit 之前的位
     if (bit > 0)
-        count += __builtin_popcountll(mask[slot] & ((1ULL << bit) - 1));
+        count += POPCNT64(mask[slot] & ((1ULL << bit) - 1));
     return count;
 }
 
@@ -57,7 +64,7 @@ inline int ceIndex(int ix, int iy, int iz) {
 int MicroGridCell::activeCount() const {
     int n = 0;
     for (int i = 0; i < 8; ++i)
-        n += __builtin_popcountll(activeMask[i]);
+        n += POPCNT64(activeMask[i]);
     return n;
 }
 
@@ -98,7 +105,7 @@ void MicroGridCell::setSignBit(int idx, bool v) {
 int MicroGridCell::solidCount() const {
     int n = 0;
     for (int i = 0; i < 8; ++i)
-        n += __builtin_popcountll(signMask[i]);
+        n += POPCNT64(signMask[i]);
     return n;
 }
 
