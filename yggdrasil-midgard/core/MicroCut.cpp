@@ -25,20 +25,35 @@ std::unordered_map<openvdb::Coord, PointBuffer>
 MicroCut::primeBilletBoundaries(
     const std::vector<VoxelTask>& tasks,
     const GeometryDef& billetDef,
-    const ToleranceConfig& config)
+    const ToleranceConfig& config,
+    const openvdb::points::PointDataGrid::Ptr& microGrid)
 {
     tbb::concurrent_unordered_map<openvdb::Coord, PointBuffer, SimpleCoordHash> concurrentBuffers;
+    const auto* tree = microGrid ? &microGrid->tree() : nullptr;
 
     tbb::parallel_for(tbb::blocked_range<size_t>(0, tasks.size()),
         [&](const tbb::blocked_range<size_t>& range) {
-            for (size_t i = range.begin(); i != range.end(); ++i) {
+            for (size_t i = range.begin(); i < range.end(); ++i) {
                 const auto& task = tasks[i];
-                if (task.classification != VoxelClass::NEW_BOUNDARY) continue;
+                if (task.classification != VoxelClass::NEW_BOUNDARY &&
+                    task.classification != VoxelClass::CUT) continue;
 
-                // 直接调用 IPW0 标准服务进行高精度采样
-                PointBuffer buf = IPWBuilder::sampleBoundary(billetDef, task.aabb);
-                if (!buf.positions.empty()) {
-                    concurrentBuffers[task.origin] = std::move(buf);
+                // 1. 判断该体素在历史上是否被切过（如果已经被切过，属于情况 B，绝不能重新引回原始毛坯表面）
+                bool hasHistory = false;
+                if (tree) {
+                    openvdb::Coord leafOrigin(task.origin.x() & ~7, task.origin.y() & ~7, task.origin.z() & ~7);
+                    auto* leaf = tree->probeConstLeaf(leafOrigin);
+                    if (leaf && leaf->isValueOn(task.origin)) {
+                        hasHistory = true;
+                    }
+                }
+
+                // 2. 只有在没有历史点云时（情况 A），才进行毛坯表面采样（sampleBoundary 自动求交过滤 A1 / A2）
+                if (!hasHistory) {
+                    PointBuffer buf = IPWBuilder::sampleBoundary(billetDef, task.aabb);
+                    if (!buf.positions.empty()) {
+                        concurrentBuffers[task.origin] = std::move(buf);
+                    }
                 }
             }
         });
@@ -146,7 +161,8 @@ MicroCut::sampleNewSurface(
     const ToolSweepSurface& surface,
     const ToolSweptSDF& sdf,
     const ToleranceConfig& config,
-    const IPWState& ipw)
+    const IPWState& ipw,
+    const GeometryDef& billetDef)
 {
     auto t0 = std::chrono::high_resolution_clock::now();
 
@@ -161,14 +177,11 @@ MicroCut::sampleNewSurface(
         billetXform = &billetGrid->transform();
     }
 
-    // TODO: billetDef 已移出 IPWState，需要从外部传入
-    // auto primedBuffers = primeBilletBoundaries(tasks, billetDef, config);
-    std::unordered_map<openvdb::Coord, PointBuffer> primedBuffers;
+    // 1. 找回并采样毛坯边界（情况一：冷启动且触碰外壁）
+    auto primedBuffers = primeBilletBoundaries(tasks, billetDef, config, ipw.microGrid);
 
     std::vector<PointBuffer> taskBuffers(tasks.size());
 
-    // 提前构建需要去查询 MicroGrid 的 leaf 分组
-    // 或者每个任务独立探查 MicroGrid。MicroGrid 是并发可读的。
     const auto* microGridTree = ipw.microGrid ? &ipw.microGrid->tree() : nullptr;
     const auto* microGridXform = ipw.microGrid ? &ipw.microGrid->transform() : nullptr;
 
@@ -179,16 +192,13 @@ MicroCut::sampleNewSurface(
                 PointBuffer localExistingData;
                 const PointBuffer* existingDataPtr = nullptr;
 
-                if (task.classification == VoxelClass::NEW_BOUNDARY) {
-                    // NEW_BOUNDARY 不使用 existingData 过滤:
-                    // primeBilletBoundaries 数据仅用于 rebuildLeaves 的初始点集,
-                    // 不应作为 LocalSurfaceEngine 的凸脊保护输入
-                    existingDataPtr = nullptr;
-                } else if (task.classification == VoxelClass::CUT && microGridTree) {
-                    // 从 MicroGrid 中提取该 Voxel 的所有点
+                // 2. 优先找回：情况二（找回前次或上次切削产生并保存在 microGrid 中的历史切断面点云）
+                bool hasHistory = false;
+                if ((task.classification == VoxelClass::CUT || task.classification == VoxelClass::NEW_BOUNDARY) && microGridTree) {
                     openvdb::Coord leafOrigin(task.origin.x() & ~7, task.origin.y() & ~7, task.origin.z() & ~7);
                     auto* leaf = microGridTree->probeConstLeaf(leafOrigin);
                     if (leaf && leaf->isValueOn(task.origin)) {
+                        hasHistory = true;
                         auto posHandle = openvdb::points::AttributeHandle<Vec3f>::create(leaf->constAttributeArray("P"));
                         auto nrmHandle = openvdb::points::AttributeHandle<Vec3f>::create(leaf->constAttributeArray("N"));
                         
@@ -202,6 +212,14 @@ MicroCut::sampleNewSurface(
                         if (!localExistingData.positions.empty()) {
                             existingDataPtr = &localExistingData;
                         }
+                    }
+                }
+
+                // 3. 备选找回：情况一（无历史，但有冷启动毛坯表面点云，作为 existingData 传入，保护凸脊与外壁边界）
+                if (!hasHistory) {
+                    auto it = primedBuffers.find(task.origin);
+                    if (it != primedBuffers.end()) {
+                        existingDataPtr = &(it->second);
                     }
                 }
 
@@ -380,7 +398,9 @@ void MicroCut::rebuildLeaves(
         }
 
         // 移除旧节点
-        microGrid->tree().stealNode<LeafNodeType>(leafOrigin, 0, false);
+        if (oldLeaf) {
+            microGrid->tree().stealNode<LeafNodeType>(leafOrigin, 0, false);
+        }
     }
 
     // 批量构建新 Grid 并 Merge

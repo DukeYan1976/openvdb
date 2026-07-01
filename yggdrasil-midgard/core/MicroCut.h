@@ -20,14 +20,16 @@ public:
         const ToolSweepSurface& surface,
         const ToolSweptSDF& sdf,
         const ToleranceConfig& config,
-        const IPWState& ipw);
+        const IPWState& ipw,
+        const GeometryDef& billetDef); // 传入毛坯几何定义
 
     /// Phase 1.5: 对缺失点云的 NEW_BOUNDARY 体素，动态进行毛坯表面采样（冷启动）
     std::unordered_map<openvdb::Coord, PointBuffer>
     primeBilletBoundaries(
         const std::vector<VoxelTask>& tasks,
         const GeometryDef& billetDef,
-        const ToleranceConfig& config);
+        const ToleranceConfig& config,
+        const openvdb::points::PointDataGrid::Ptr& microGrid); // 传入 microGrid 用于历史探查
 
     /// Phase 3+4: 旧点剔除 + per-leaf 重建 MicroGrid
     /// deleted voxels: 全部点删除

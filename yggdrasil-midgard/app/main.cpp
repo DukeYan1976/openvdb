@@ -1,4 +1,5 @@
 #include "AppState.h"
+#include "debug/RtDebugSys.h"
 #include "windows/SettingsWindow.h"
 #include "windows/SimControlWindow.h"
 #include "windows/OutputWindow.h"
@@ -10,6 +11,7 @@
 #include "renderers/ShaderProgram.h"
 #include "core/IDebugDisplay.h"
 #include "core/IPWBuilder.h"
+#include <openvdb/points/PointDataGrid.h>
 #include <cmath>
 
 namespace {
@@ -110,6 +112,8 @@ public:
 
 // ═══════════════════════════════════════════════════════════════
 int main() {
+    openvdb::initialize();
+
     if (!glfwInit()) return -1;
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
@@ -165,6 +169,10 @@ int main() {
     // ── 启动时不加载任何几何 — 用户通过 Settings Load Demo 或 MicroGridLab Load 触发
     auto& st = midgard::getAppState();
 
+    // ── 初始化 RtDebugSys 运行时诊断系统 ──
+    RtDebugSys::Debugger::GetInstance().SetWorkspace(".");
+    RtDebugSys::Debugger::GetInstance().Activate(1);
+
     ImVec2 vpPos, vpSize;
 
     // Box zoom state
@@ -184,6 +192,12 @@ int main() {
 
         // 仿真推进
         st.tick(ImGui::GetIO().DeltaTime);
+
+        // 如果检测到微网格切削产生的数据变化，自动重载并更新视口，保持单向数据流动 (MVC)
+        if (st.microGridVisualsDirty) {
+            microGridLabWin.pushToViewport();
+            st.microGridVisualsDirty = false;
+        }
 
         // Viewport 全屏背景
         ImGui::SetNextWindowPos(ImVec2(0, 0));
@@ -282,6 +296,51 @@ int main() {
         ImGui::SetNextWindowSize(ImVec2(400, 500), ImGuiCond_FirstUseEver);
         microGridLabWin.draw();
 
+        // ─── 绘制 CAD 风格底部状态栏 ─────────────────────────────
+        ImGui::SetNextWindowPos(ImVec2(0, (float)winH - 22));
+        ImGui::SetNextWindowSize(ImVec2((float)winW, 22));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10, 3));
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImGui::GetColorU32(ImGuiCol_MenuBarBg)); // 与菜单栏配色一致
+
+        if (ImGui::Begin("StatusBar", nullptr, 
+            ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse | 
+            ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | 
+            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings)) {
+            
+            bool showPerformance = false;
+            // 使用 RtDebugSys 的统一 Tag 体系控制显示内容
+            DEBUG_SECTION(MicroGridLab_Performance) {
+                showPerformance = true;
+            }
+            
+            if (showPerformance && st.geometryLoaded && !st.microGridLab.voxels.empty()) {
+                // 动态统计当前活跃（包含边界）的 Voxel 数量
+                int activeVox = 0;
+                for (const auto& v : st.microGridLab.voxels) {
+                    if (v.activeCount() > 0) ++activeVox;
+                }
+                
+                ImGui::Text("DEBUG MODE | MicroGrid: Total Voxels: %d | Active: %d | Last Cut: %.3f ms | Refining Evals: %d | Pts: %d",
+                    (int)st.microGridLab.voxels.size(), activeVox, st.microGridLab.lastCutMs,
+                    st.microGridLab.totalRefineEvals, st.microGridLab.totalSurfacePoints);
+            } else {
+                // 正常发布版显示
+                if (st.simState == midgard::AppState::RUNNING) {
+                    ImGui::Text("Simulation RUNNING | Segment: %d/%d (%.1f%%) | Speed: %.1fx", 
+                        st.currentSegment + 1, st.totalSegments, st.segmentProgress * 100.0f, st.speedMultiplier);
+                } else if (st.simState == midgard::AppState::PAUSED) {
+                    ImGui::Text("Simulation PAUSED | Segment: %d/%d", st.currentSegment + 1, st.totalSegments);
+                } else {
+                    ImGui::Text("Ready");
+                }
+            }
+        }
+        ImGui::End();
+        ImGui::PopStyleColor();
+        ImGui::PopStyleVar(3);
+
         ImGui::Render();
 
         glViewport(0, 0, fbW, fbH);
@@ -312,11 +371,63 @@ int main() {
                         st.ipwShowMacroGrid);
                     st.ipwDirty = false;
                     sceneRenderer.clearMacroMesh();
+                    
+                    st.macroMeshRequested = true; // 确保触发一次初始点云和边界渲染
                 }
 
                 if (st.macroMeshRequested) {
                     sceneRenderer.rebuildMacroMesh(st.ipw.macroGrid);
                     st.macroMeshRequested = false;
+
+                    // ── 提取生产级 IPW 的边界 Voxel 与高精度点云，推入 GPU ──
+                    if (midgard::g_debugDisplay && st.ipw.microGrid && st.ipw.macroGrid) {
+                        midgard::g_debugDisplay->clear();
+
+                        // 1. 提取 IPW 边界 voxel 的 3D 线框
+                        const auto& xform = st.ipw.macroGrid->transform();
+                        double vs = xform.voxelSize()[0];
+                        double hv = vs * 0.5;
+                        double threshold = vs * std::sqrt(3.0) / 2.0 + 1e-4;
+
+                        std::vector<float> lines;
+                        for (auto it = st.ipw.macroGrid->cbeginValueOn(); it; ++it) {
+                            if (std::abs(*it) > threshold) continue;
+                            auto w = xform.indexToWorld(it.getCoord());
+                            float x0 = (float)(w.x() - hv), x1 = (float)(w.x() + hv);
+                            float y0 = (float)(w.y() - hv), y1 = (float)(w.y() + hv);
+                            float z0 = (float)(w.z() - hv), z1 = (float)(w.z() + hv);
+                            float e[] = {
+                                x0,y0,z0, x1,y0,z0,  x1,y0,z0, x1,y1,z0,
+                                x1,y1,z0, x0,y1,z0,  x0,y1,z0, x0,y0,z0,
+                                x0,y0,z1, x1,y0,z1,  x1,y0,z1, x1,y1,z1,
+                                x1,y1,z1, x0,y1,z1,  x0,y1,z1, x0,y0,z1,
+                                x0,y0,z0, x0,y0,z1,  x1,y0,z0, x1,y0,z1,
+                                x1,y1,z0, x1,y1,z1,  x0,y1,z0, x0,y1,z1,
+                            };
+                            lines.insert(lines.end(), e, e + 72);
+                        }
+                        if (!lines.empty()) {
+                            midgard::g_debugDisplay->drawLines(lines.data(), lines.size() / 3, 0xCC00FF00); // 绿线边界
+                        }
+
+                        // 2. 提取 IPW 高精度表面点云
+                        std::vector<float> pts;
+                        for (auto leaf = st.ipw.microGrid->tree().cbeginLeaf(); leaf; ++leaf) {
+                            auto posHandle = openvdb::points::AttributeHandle<openvdb::Vec3f>::create(
+                                leaf->constAttributeArray("P"));
+                            for (auto voxIt = leaf->cbeginValueOn(); voxIt; ++voxIt) {
+                                openvdb::Coord voxCoord = voxIt.getCoord();
+                                for (auto it = leaf->beginIndexVoxel(voxCoord); it; ++it) {
+                                    openvdb::Vec3f pos = posHandle->get(*it);
+                                    openvdb::Vec3d worldPos = xform.indexToWorld(voxCoord.asVec3d() + openvdb::Vec3d(pos));
+                                    pts.insert(pts.end(), {(float)worldPos.x(), (float)worldPos.y(), (float)worldPos.z()});
+                                }
+                            }
+                        }
+                        if (!pts.empty()) {
+                            midgard::g_debugDisplay->drawPoints(pts.data(), pts.size() / 3, 0xFFFF4400); // 实色橙红表面点
+                        }
+                    }
                 }
                 if (st.macroMeshClear) {
                     sceneRenderer.clearMacroMesh();

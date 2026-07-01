@@ -8,6 +8,7 @@ namespace midgard {
 class MicroGridLabWindow {
 public:
     void draw();
+    void pushToViewport();
 
 private:
     void drawParams();
@@ -15,9 +16,6 @@ private:
     void drawCutHistory();
     void drawActions();
     void logStats();
-    void pushToViewport();
-
-    MicroGridLabState state_;
 
     // 三档精度选项
     int precisionIndex_ = 1;  // 0=0.1, 1=0.01, 2=0.001

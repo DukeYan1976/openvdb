@@ -22,6 +22,7 @@ void MicroGridLabWindow::draw() {
 
 // ─── 参数设置 ────────────────────────────────────────────────
 void MicroGridLabWindow::drawParams() {
+    auto& state_ = getAppState().microGridLab;
     auto& st = getAppState();
     ImGui::Text("── Parameters ──");
 
@@ -60,7 +61,6 @@ void MicroGridLabWindow::drawParams() {
     ImGui::Text("Bnd thresh: %.4f mm  NB halfwidth: %.3f mm",
         state_.voxelSize / 8.0 * 0.866, 3.0 * state_.voxelSize / 8.0);
 
-    static bool prevSweep = true;
     if (ImGui::Checkbox("Show Sweep Body", &st.showSweepBody)) {
         pushToViewport();  // 即时刷新视口
     }
@@ -72,6 +72,7 @@ void MicroGridLabWindow::drawParams() {
 
 // ─── 刀具设定 ────────────────────────────────────────────────
 void MicroGridLabWindow::drawToolSetup() {
+    auto& state_ = getAppState().microGridLab;
     ImGui::Text("── Tool ──");
 
     static const char* toolTypes[] = {"Ball End", "Flat End", "Bull Nose"};
@@ -103,6 +104,7 @@ void MicroGridLabWindow::drawToolSetup() {
 
 // ─── 切削记录列表 ────────────────────────────────────────────
 void MicroGridLabWindow::drawCutHistory() {
+    auto& state_ = getAppState().microGridLab;
     ImGui::Text("── CutHistory (%zu records) ──", state_.cutHistory.size());
 
     for (auto& rec : state_.cutHistory) {
@@ -125,6 +127,7 @@ void MicroGridLabWindow::drawCutHistory() {
 
 // ─── 操作按钮 ────────────────────────────────────────────────
 void MicroGridLabWindow::drawActions() {
+    auto& state_ = getAppState().microGridLab;
     ImGui::Text("── Actions ──");
 
     // ── Load to Viewport: 将 MicroGridLab 结果推入主视图 ──
@@ -244,6 +247,7 @@ void MicroGridLabWindow::drawActions() {
 
 // ─── 统计日志 → Output 窗口 ─────────────────────────────────
 void MicroGridLabWindow::logStats() {
+    auto& state_ = getAppState().microGridLab;
     auto& st = getAppState();
     char buf[512];
 
@@ -324,10 +328,11 @@ void MicroGridLabWindow::logStats() {
 
 // ─── 推送到视口 ─────────────────────────────────────────────
 void MicroGridLabWindow::pushToViewport() {
+    auto& state_ = getAppState().microGridLab;
     auto& st = getAppState();
     state_.ensureInit();
 
-    // 毛坯
+    // 1. 同步局部毛坯包围盒
     st.billetDef.type = GeometryDef::BOX;
     st.billetDef.origin = Vec3d(0, 0, 0);
     st.billetDef.dims = Vec3d(state_.cubeSize, state_.cubeSize, state_.cubeSize);
@@ -336,6 +341,28 @@ void MicroGridLabWindow::pushToViewport() {
     st.showBillet = true;
     st.showToolPath = true;
     st.showTool = false;
+
+    // 2. 将 MicroGridLab 的 cutHistory 向上同步至 st.pathSegments，实现时间轴路径完全复合
+    st.pathSegments.clear();
+    for (const auto& rec : state_.cutHistory) {
+        MoveSegment seg = rec.segment;
+        int toolId = -1;
+        for (auto& t : st.toolLibrary) {
+            if (t.def.type == rec.tool.type && t.def.R == rec.tool.R && t.def.H == rec.tool.H) {
+                toolId = t.id;
+                break;
+            }
+        }
+        if (toolId == -1) {
+            toolId = (int)st.toolLibrary.size();
+            st.toolLibrary.push_back({toolId, rec.tool});
+        }
+        seg.toolId = toolId;
+        st.pathSegments.push_back(seg);
+    }
+    st.totalSegments = (int)st.pathSegments.size();
+    st.currentSegment = 0;
+    st.segmentProgress = 0.0f;
 
     if (!g_debugDisplay) return;
 

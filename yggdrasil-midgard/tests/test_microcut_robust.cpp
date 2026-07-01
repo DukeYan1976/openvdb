@@ -57,9 +57,9 @@ TEST_F(MicroCutRobustTest, CASE1_BilletBoundaryStitching) {
     EXPECT_TRUE(foundSurface) << "Should find a point exactly on the Z=9.75 plane";
 
     // ---------------------------------------------------------
-    // 执行 Phase 2: 采样 (目前尚未修改 sampleNewSurface 接口)
+    // 执行 Phase 2: 采样 (目前已修改为接受 geom 参数)
     // ---------------------------------------------------------
-    auto buffers = microcut.sampleNewSurface(tasks, surface, sdf, config, ipw);
+    auto buffers = microcut.sampleNewSurface(tasks, surface, sdf, config, ipw, geom);
     // ...
     }
 

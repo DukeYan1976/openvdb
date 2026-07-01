@@ -29,7 +29,7 @@ TEST_F(Phase34Test, RebuildLeaves_PointCountChanges) {
     auto tasks = macrocut.buildTaskList(cls, surf, config, ipw.macroGrid->transform());
 
     MicroCut microcut;
-    auto newBuffers = microcut.sampleNewSurface(tasks, surf, sdf, config, ipw);
+    auto newBuffers = microcut.sampleNewSurface(tasks, surf, sdf, config, ipw, geom);
 
     // Phase 3+4: 重建
     microcut.rebuildLeaves(ipw, cls, newBuffers, sdf, config);
@@ -56,7 +56,7 @@ TEST_F(Phase34Test, DeletedVoxels_NoPoints) {
     auto tasks = macrocut.buildTaskList(cls, surf, config, ipw.macroGrid->transform());
 
     MicroCut microcut;
-    auto newBuffers = microcut.sampleNewSurface(tasks, surf, sdf, config, ipw);
+    auto newBuffers = microcut.sampleNewSurface(tasks, surf, sdf, config, ipw, geom);
     microcut.rebuildLeaves(ipw, cls, newBuffers, sdf, config);
 
     // deleted voxels 不应有点
@@ -87,7 +87,7 @@ TEST_F(Phase34Test, CutVoxels_OldPointsCulled) {
     auto tasks = macrocut.buildTaskList(cls, surf, config, ipw.macroGrid->transform());
 
     MicroCut microcut;
-    auto newBuffers = microcut.sampleNewSurface(tasks, surf, sdf, config, ipw);
+    auto newBuffers = microcut.sampleNewSurface(tasks, surf, sdf, config, ipw, geom);
     microcut.rebuildLeaves(ipw, cls, newBuffers, sdf, config);
 
     // cut voxels中剩余的点：旧点SDF≥t应保留，SDF<t应被删

@@ -80,7 +80,7 @@ TEST_F(DualTrackConsistencyTest, AfterCut_StillConsistent) {
     auto tasks = macrocut.buildTaskList(cls, surf, config, ipw.macroGrid->transform());
 
     MicroCut microcut;
-    auto buffers = microcut.sampleNewSurface(tasks, surf, sdf, config, ipw);
+    auto buffers = microcut.sampleNewSurface(tasks, surf, sdf, config, ipw, geom);
     microcut.rebuildLeaves(ipw, cls, buffers, sdf, config);
 
     // 切削后验证
@@ -108,7 +108,7 @@ TEST_F(DualTrackConsistencyTest, AfterCut_NoPointsInsideTool) {
     auto tasks = macrocut.buildTaskList(cls, surf, config, ipw.macroGrid->transform());
 
     MicroCut microcut;
-    auto buffers = microcut.sampleNewSurface(tasks, surf, sdf, config, ipw);
+    auto buffers = microcut.sampleNewSurface(tasks, surf, sdf, config, ipw, geom);
     microcut.rebuildLeaves(ipw, cls, buffers, sdf, config);
 
     // 所有MicroGrid点的SDF应≥-t (不深入刀具超过容差)

@@ -30,7 +30,7 @@ TEST_F(MicroCutTest, SinglePoint_AllPointsOnSDF_Zero) {
 
     // Phase 2: 采样
     MicroCut microcut;
-    auto buffers = microcut.sampleNewSurface(tasks, surf, sdf, config, ipw);
+    auto buffers = microcut.sampleNewSurface(tasks, surf, sdf, config, ipw, geom);
 
     // 验证: 所有采样点的SDF值应≈0
     double maxAbsSDF = 0;
@@ -63,7 +63,7 @@ TEST_F(MicroCutTest, SinglePoint_PointsInsideVoxel) {
     auto tasks = macrocut.buildTaskList(cls, surf, config, ipw.macroGrid->transform());
 
     MicroCut microcut;
-    auto buffers = microcut.sampleNewSurface(tasks, surf, sdf, config, ipw);
+    auto buffers = microcut.sampleNewSurface(tasks, surf, sdf, config, ipw, geom);
 
     // 验证: 每个buffer的点都在对应task的voxel AABB附近
     // 四叉树精确采样的点在AABB内(浮点误差)
@@ -95,7 +95,7 @@ TEST_F(MicroCutTest, SinglePoint_NormalsAreUnit) {
     auto tasks = macrocut.buildTaskList(cls, surf, config, ipw.macroGrid->transform());
 
     MicroCut microcut;
-    auto buffers = microcut.sampleNewSurface(tasks, surf, sdf, config, ipw);
+    auto buffers = microcut.sampleNewSurface(tasks, surf, sdf, config, ipw, geom);
 
     for (const auto& [coord, buf] : buffers) {
         for (const auto& n : buf.normals) {

@@ -1,5 +1,6 @@
 #pragma once
 #include "core/Types.h"
+#include "core/MicroGridLab.h"
 #include <vector>
 #include <string>
 #include <chrono>
@@ -60,6 +61,10 @@ struct AppState {
 
     // ── 刀路数据 ──
     std::vector<MoveSegment> pathSegments;
+
+    // ── MicroGrid Lab 状态 ──
+    MicroGridLabState microGridLab;
+    bool microGridVisualsDirty = false;
 
     // ── 统计 ──
     int activeVoxels = 0;
