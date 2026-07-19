@@ -1,6 +1,7 @@
 #pragma once
 #include "core/Types.h"
 #include "core/MicroGridLab.h"
+#include "core/SurfaceMesher.h"
 #include <vector>
 #include <string>
 #include <chrono>
@@ -64,7 +65,9 @@ struct AppState {
 
     // ── MicroGrid Lab 状态 ──
     MicroGridLabState microGridLab;
+    TriMesh lastSurfaceMesh;
     bool microGridVisualsDirty = false;
+    bool billetMeshDirty = false;  // 仅重建 cube 网格，不触发 IPW build
 
     // ── 统计 ──
     int activeVoxels = 0;

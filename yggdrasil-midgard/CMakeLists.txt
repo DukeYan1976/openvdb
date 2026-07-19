@@ -70,6 +70,7 @@ add_library(midgard-core STATIC
     core/ToolSweepSurface.cpp
     core/LocalSurfaceEngine.cpp
     core/SimEngine.cpp
+    core/SurfaceMesher.cpp
     debug/RtDebugSys.cpp
 )
 target_compile_definitions(midgard-core PRIVATE MIDGARD_DEV)
@@ -169,6 +170,7 @@ if(MIDGARD_TESTS)
         tests/test_sim_engine.cpp
         tests/test_microgrid_lab.cpp
         tests/test_toolsweep_surface.cpp
+        tests/test_surfacemesher.cpp
     )
     target_link_libraries(midgard_tests PRIVATE
         midgard-core GTest::gtest GTest::gtest_main

@@ -65,12 +65,6 @@ void AppState::startSimulation() {
         segmentProgress = 0.0f;
         simTime = 0.0;
         addLog("Info", "Simulation started");
-        
-        // 重置 MicroGridLab Voxel 网格状态（使其回到全实心 Solid，保留其 cutHistory）
-        if (!microGridLab.voxels.empty()) {
-            microGridLab.init();
-            microGridVisualsDirty = true;
-        }
     } else if (simState == PAUSED) {
         simState = RUNNING;
         addLog("Info", "Simulation resumed");
@@ -91,12 +85,6 @@ void AppState::stopSimulation() {
     simTime = 0.0;
     cancelled = true;
     addLog("Info", "Simulation stopped");
-
-    // 重置 MicroGridLab Voxel 网格状态
-    if (!microGridLab.voxels.empty()) {
-        microGridLab.init();
-        microGridVisualsDirty = true;
-    }
 }
 
 void AppState::stepForward() {
@@ -109,12 +97,6 @@ void AppState::stepForward() {
         SimEngine engine;
         engine.cutSegment(ipw, seg, toolDef, billetDef, ipw.config);
         macroMeshRequested = true;
-
-        // 在前进之前，对当前段执行增量切削 (Lab)
-        if (currentSegment < (int)microGridLab.cutHistory.size()) {
-            microGridLab.executeCutIncremental(currentSegment);
-            microGridVisualsDirty = true;
-        }
 
         ++currentSegment;
         if (currentSegment >= totalSegments) {
@@ -163,7 +145,7 @@ void AppState::tick(float dt) {
     if (segmentProgress >= 1.0f) {
         segmentProgress = 0.0f;
 
-        // 【生产级切削】：对刚刚完成的段执行增量切削
+        // 【生产级切削】：对刚刚完成的段执行切削
         if (currentSegment < totalSegments) {
             auto& seg = pathSegments[currentSegment];
             auto& toolDef = toolLibrary[seg.toolId].def;
@@ -172,14 +154,7 @@ void AppState::tick(float dt) {
             macroMeshRequested = true;
         }
 
-        // 【核心驱动点】：在增加 currentSegment 索引前，对完成的段执行增量切削 (Lab)
-        if (currentSegment < (int)microGridLab.cutHistory.size()) {
-            microGridLab.executeCutIncremental(currentSegment);
-            microGridVisualsDirty = true;
-        }
-
         ++currentSegment;
-        // ipwDirty = false; // 千万不可设为 true! 否则会重建初始未切削毛坯
 
         if (currentSegment >= totalSegments) {
             simState = IDLE;

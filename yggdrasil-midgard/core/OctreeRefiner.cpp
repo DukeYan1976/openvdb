@@ -138,7 +138,8 @@ void refineOctant(const openvdb::BBoxd& bbox,
                    const OctreeConfig& config,
                    std::vector<SurfaceSample>& out,
                    std::unordered_set<uint64_t>& edgeHash,
-                   int& evalCount) {
+                   int& evalCount,
+                   bool skipClassify = false) {
     // 求 8 角点 SDF
     float sdf[8];
     for (int i = 0; i < 8; ++i) {
@@ -147,12 +148,14 @@ void refineOctant(const openvdb::BBoxd& bbox,
     }
     evalCount += 8;
 
-    // 分类
-    double eps = 1e-9;  // 数值容差
-    CellState state = classifyCorners(sdf, eps);
+    // 分类（depth==0 时跳过：调用方已通过粗筛确认此 CE 有表面穿越）
+    if (!skipClassify) {
+        double eps = 1e-9;  // 数值容差
+        CellState state = classifyCorners(sdf, eps);
 
-    if (state == CellState::ALL_POS || state == CellState::ALL_NEG)
-        return;  // 完全在刀外/内 → 无表面
+        if (state == CellState::ALL_POS || state == CellState::ALL_NEG)
+            return;  // 完全在刀外/内 → 无表面
+    }
 
     // 检查终止条件
     double diag = bbox.extents().length();
@@ -208,7 +211,8 @@ std::vector<SurfaceSample> extractSurface(
     std::unordered_set<uint64_t> edgeHash;
     config.evalCount = 0;
 
-    refineOctant(ceBbox, 0, toolSDF, config, points, edgeHash, config.evalCount);
+    // skipClassify=true: 调用方（MicroGridLab）已通过粗筛确认此 CE 包含表面
+    refineOctant(ceBbox, 0, toolSDF, config, points, edgeHash, config.evalCount, /*skipClassify=*/true);
 
     return points;
 }

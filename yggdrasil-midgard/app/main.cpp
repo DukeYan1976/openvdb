@@ -361,6 +361,11 @@ int main() {
                 glEnable(GL_DEPTH_TEST);
                 glDepthFunc(GL_LESS);
                 glClear(GL_DEPTH_BUFFER_BIT);
+                // ── Billet mesh 重建（仅几何，不触发 IPW）──
+                if (st.billetMeshDirty) {
+                    sceneRenderer.rebuildBillet(st.billetDef);
+                    st.billetMeshDirty = false;
+                }
                 // ── Mesh + IPW 重建 (用户加载几何后才触发) ──
                 if (st.geometryLoaded && st.ipwDirty) {
                     sceneRenderer.rebuildBillet(st.billetDef);

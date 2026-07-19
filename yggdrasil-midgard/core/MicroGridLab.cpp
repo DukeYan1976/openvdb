@@ -11,7 +11,7 @@
 #include <intrin.h>
 #define POPCNT64(x) __popcnt64(x)
 #else
-#define POPCNT64(x) POPCNT64(x)
+#define POPCNT64(x) __builtin_popcountll(x)
 #endif
 
 // TBB 并行化

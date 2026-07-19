@@ -1,12 +1,43 @@
 #include "MicroGridLabWindow.h"
 #include "AppState.h"
 #include "core/IDebugDisplay.h"
+#include "core/SurfaceMesher.h"
 #include "core/ToolSweepSurface.h"
 #include <imgui.h>
 #include <cmath>
 #include <cstdio>
+#include <fstream>
+#include <string>
 
 namespace midgard {
+
+static bool exportTriMeshToOBJ(const TriMesh& mesh, const std::string& path) {
+    std::ofstream out(path);
+    if (!out) return false;
+    out << "# Surface mesh exported from yggdrasil-midgard\n";
+    out << "# " << mesh.vertexCount() << " vertices, " << mesh.triangleCount() << " triangles\n";
+    const int n = mesh.vertexCount();
+    for (int i = 0; i < n; ++i) {
+        out << "v " << mesh.vertices[i * 6 + 0] << " "
+            << mesh.vertices[i * 6 + 1] << " "
+            << mesh.vertices[i * 6 + 2] << "\n";
+    }
+    for (int i = 0; i < n; ++i) {
+        out << "vn " << mesh.vertices[i * 6 + 3] << " "
+            << mesh.vertices[i * 6 + 4] << " "
+            << mesh.vertices[i * 6 + 5] << "\n";
+    }
+    const int nt = mesh.triangleCount();
+    for (int i = 0; i < nt; ++i) {
+        uint32_t a = mesh.indices[i * 3 + 0] + 1;
+        uint32_t b = mesh.indices[i * 3 + 1] + 1;
+        uint32_t c = mesh.indices[i * 3 + 2] + 1;
+        out << "f " << a << "//" << a << " "
+            << b << "//" << b << " "
+            << c << "//" << c << "\n";
+    }
+    return true;
+}
 
 void MicroGridLabWindow::draw() {
     ImGui::Begin("MicroGrid Lab");
@@ -29,13 +60,18 @@ void MicroGridLabWindow::drawParams() {
     ImGui::InputDouble("Cube Size", &state_.cubeSize, 0.1, 1.0, "%.1f mm");
     ImGui::InputDouble("Voxel Size", &state_.voxelSize, 0.1, 1.0, "%.2f mm");
 
-    // 检测参数变化 → 自动重建
+    // 检测参数变化 → 重置网格（不执行切削，由 Execute 触发）
     static double prevCubeSize = state_.cubeSize;
     static double prevVoxelSize = state_.voxelSize;
     if (state_.cubeSize != prevCubeSize || state_.voxelSize != prevVoxelSize) {
         prevCubeSize = state_.cubeSize;
         prevVoxelSize = state_.voxelSize;
-        state_.rebuild();
+        if (!state_.voxels.empty()) {
+            state_.init();  // 只重置网格为全 Solid，保留 cutHistory
+        }
+        // 同步视口中的 cube 尺寸
+        st.billetDef.dims = Vec3d(state_.cubeSize, state_.cubeSize, state_.cubeSize);
+        st.billetMeshDirty = true;
     }
 
     // 三档精度
@@ -140,6 +176,57 @@ void MicroGridLabWindow::drawActions() {
         logStats();
     }
 
+    ImGui::Separator();
+
+    // ── Cut Surface Mesh: reconstruct triangle mesh from surface points ──
+    ImGui::BeginDisabled(state_.surfacePoints.empty());
+    if (ImGui::Button("Cut Surface Mesh")) {
+        std::vector<double> pos, nrm;
+        pos.reserve(state_.surfacePoints.size() * 3);
+        nrm.reserve(state_.surfacePoints.size() * 3);
+        for (const auto& sp : state_.surfacePoints) {
+            pos.push_back(sp.position[0]);
+            pos.push_back(sp.position[1]);
+            pos.push_back(sp.position[2]);
+            nrm.push_back(sp.normal[0]);
+            nrm.push_back(sp.normal[1]);
+            nrm.push_back(sp.normal[2]);
+        }
+        auto mesh = buildSurfaceMesh(pos.data(), nrm.data(), state_.surfacePoints.size());
+        auto& st = getAppState();
+        st.lastSurfaceMesh = mesh;
+        if (!mesh.empty() && g_debugDisplay) {
+            g_debugDisplay->drawTriangles(mesh.vertices.data(), mesh.indices.data(),
+                                           mesh.triangleCount(), 0x88FF6600);
+        }
+        char buf[128];
+        snprintf(buf, sizeof(buf), "Surface Mesh: %d verts, %d tris",
+            mesh.vertexCount(), mesh.triangleCount());
+        st.addLog("MicroGrid", buf);
+    }
+    ImGui::EndDisabled();
+    ImGui::Separator();
+
+    // ── Output Mesh: export last generated surface mesh to OBJ ──
+    {
+        auto& st = getAppState();
+        static char exportPath[256] = "surface_mesh.obj";
+        ImGui::InputText("Export path", exportPath, sizeof(exportPath));
+        ImGui::BeginDisabled(st.lastSurfaceMesh.empty());
+        if (ImGui::Button("Output Mesh")) {
+            if (exportTriMeshToOBJ(st.lastSurfaceMesh, exportPath)) {
+                char buf[256];
+                snprintf(buf, sizeof(buf), "Exported mesh to %s (%d verts, %d tris)",
+                    exportPath, st.lastSurfaceMesh.vertexCount(), st.lastSurfaceMesh.triangleCount());
+                st.addLog("MicroGrid", buf);
+            } else {
+                char buf[256];
+                snprintf(buf, sizeof(buf), "Failed to export mesh to %s", exportPath);
+                st.addLog("MicroGrid", buf);
+            }
+        }
+        ImGui::EndDisabled();
+    }
     ImGui::Separator();
 
     // ── 切削执行 — Execute Next / Execute All ──
@@ -332,37 +419,16 @@ void MicroGridLabWindow::pushToViewport() {
     auto& st = getAppState();
     state_.ensureInit();
 
-    // 1. 同步局部毛坯包围盒
+    // 同步局部毛坯包围盒（仅视觉用途）
     st.billetDef.type = GeometryDef::BOX;
     st.billetDef.origin = Vec3d(0, 0, 0);
     st.billetDef.dims = Vec3d(state_.cubeSize, state_.cubeSize, state_.cubeSize);
     st.geometryLoaded = true;
-    st.ipwDirty = true;
+    st.billetMeshDirty = true;   // 重建 cube 网格
+    st.macroMeshClear = true;    // 清除 macroMesh，让 billet 可见
     st.showBillet = true;
     st.showToolPath = true;
     st.showTool = false;
-
-    // 2. 将 MicroGridLab 的 cutHistory 向上同步至 st.pathSegments，实现时间轴路径完全复合
-    st.pathSegments.clear();
-    for (const auto& rec : state_.cutHistory) {
-        MoveSegment seg = rec.segment;
-        int toolId = -1;
-        for (auto& t : st.toolLibrary) {
-            if (t.def.type == rec.tool.type && t.def.R == rec.tool.R && t.def.H == rec.tool.H) {
-                toolId = t.id;
-                break;
-            }
-        }
-        if (toolId == -1) {
-            toolId = (int)st.toolLibrary.size();
-            st.toolLibrary.push_back({toolId, rec.tool});
-        }
-        seg.toolId = toolId;
-        st.pathSegments.push_back(seg);
-    }
-    st.totalSegments = (int)st.pathSegments.size();
-    st.currentSegment = 0;
-    st.segmentProgress = 0.0f;
 
     if (!g_debugDisplay) return;
 
@@ -375,8 +441,21 @@ void MicroGridLabWindow::pushToViewport() {
     if (st.showSweepBody) {
     const int uSegs = 40;   // 剖面方向 (工具底部→柄部，沿弧长均匀采样)
     const int vSegs = 80;   // 环向 (Left-Mid → Front-Cap → Right-Mid → Back-Cap)
-    for (auto& rec : state_.cutHistory) {
-        ToolSweepSurface sweep(rec.tool, rec.segment, true);
+
+    // 收集所有需要显示的扫掠体：cutHistory + 当前编辑中的刀具
+    std::vector<std::pair<ToolDef, MoveSegment>> sweepItems;
+    for (auto& rec : state_.cutHistory)
+        sweepItems.push_back({rec.tool, rec.segment});
+    // 当前编辑的刀具（segment 长度 > 0 才有意义）
+    {
+        Vec3d d = state_.currentSegment.end - state_.currentSegment.start;
+        double len2 = d[0]*d[0] + d[1]*d[1] + d[2]*d[2];
+        if (len2 > 1e-12)
+            sweepItems.push_back({state_.currentTool, state_.currentSegment});
+    }
+
+    for (auto& [tool, seg] : sweepItems) {
+        ToolSweepSurface sweep(tool, seg, true);
         bool isClosed = sweep.isClosedLoop();
 
         int nU = uSegs + 1;                             // u 采样点 (含端点)
@@ -412,11 +491,11 @@ void MicroGridLabWindow::pushToViewport() {
         }
 
         // ── 端面线圈 (示意刀轴方向) ──
-        double R = rec.tool.R;
+        double R = tool.R;
         pathLines.insert(pathLines.end(), {
-            (float)rec.segment.start[0], (float)rec.segment.start[1], (float)rec.segment.start[2],
-            (float)rec.segment.end[0],   (float)rec.segment.end[1],   (float)rec.segment.end[2]});
-        Vec3d axis = rec.segment.axis;
+            (float)seg.start[0], (float)seg.start[1], (float)seg.start[2],
+            (float)seg.end[0],   (float)seg.end[1],   (float)seg.end[2]});
+        Vec3d axis = seg.axis;
         double alen2 = sqrt(axis[0]*axis[0]+axis[1]*axis[1]+axis[2]*axis[2]);
         if (alen2<1e-6){alen2=1.0;axis=Vec3d(0,0,1);}
         Vec3d adir(axis[0]/alen2,axis[1]/alen2,axis[2]/alen2);
@@ -428,7 +507,7 @@ void MicroGridLabWindow::pushToViewport() {
         uVec=Vec3d(uVec[0]/ul,uVec[1]/ul,uVec[2]/ul);
         vVec=Vec3d(adir[1]*uVec[2]-adir[2]*uVec[1],adir[2]*uVec[0]-adir[0]*uVec[2],adir[0]*uVec[1]-adir[1]*uVec[0]);
         const int nAng=8;
-        for(auto pos:{rec.segment.start,rec.segment.end})
+        for(auto pos:{seg.start,seg.end})
             for(int a=0;a<nAng;++a){
                 double ang=a*2.0*M_PI/nAng,ca=cos(ang),sa=sin(ang);
                 Vec3d pt(pos[0]+R*(ca*uVec[0]+sa*vVec[0]),pos[1]+R*(ca*uVec[1]+sa*vVec[1]),pos[2]+R*(ca*uVec[2]+sa*vVec[2]));
