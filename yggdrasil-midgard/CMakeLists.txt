@@ -47,13 +47,16 @@ else()
     set(TBB_LIBS ${TBB_LIB})
 endif()
 
-# -- GTest --
+# -- GTest (FetchContent, 避免系统多版本冲突) --
 if(MIDGARD_TESTS)
-    find_package(GTest QUIET)
-    if(NOT GTest_FOUND)
-        message(WARNING "GTest not found — tests disabled")
-        set(MIDGARD_TESTS OFF)
-    endif()
+    include(FetchContent)
+    FetchContent_Declare(
+        googletest
+        GIT_REPOSITORY https://github.com/google/googletest.git
+        GIT_TAG        v1.14.0
+    )
+    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(googletest)
 endif()
 
 # ═══════════════════════════════════════════════════════════════
@@ -79,7 +82,7 @@ if(MSVC)
     target_compile_options(midgard-core PRIVATE /bigobj)
 endif()
 target_include_directories(midgard-core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_include_directories(midgard-core PUBLIC ${OVDB_INC} ${TBB_INC})
+target_include_directories(midgard-core SYSTEM PUBLIC ${OVDB_INC} ${TBB_INC})
 # (link dirs handled by targets/find_library; empty on config)
 target_link_libraries(midgard-core PUBLIC ${OVDB_LIBS} ${TBB_LIBS})
 
@@ -174,6 +177,10 @@ if(MIDGARD_TESTS)
     )
     target_link_libraries(midgard_tests PRIVATE
         midgard-core GTest::gtest GTest::gtest_main
+    )
+    # 确保 FetchContent 的 gtest header 优先于 /opt/homebrew/include 下的系统版本
+    target_include_directories(midgard_tests BEFORE PRIVATE
+        ${googletest_SOURCE_DIR}/googletest/include
     )
     add_test(NAME midgard_tests_run COMMAND midgard_tests)
 endif()
